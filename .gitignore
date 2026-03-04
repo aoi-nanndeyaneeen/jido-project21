@@ -1,0 +1,17 @@
+# PlatformIOのビルドファイル（絶対同期してはいけない）(ずっとしてた)
+**/.pio/
+**/.vscode/
+
+# Pythonのキャッシュや仮想環境
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ログファイルやデータ（PCごとに違うため同期しない）
+**/logs/
+*.csv
+
+# OSのシステムファイル
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "flight_controller"
+		},
+		{
+			"path": "ground_receiver"
+		},
+		{
+			"path": "position_estimator"
+		}
+	],
+	"settings": {}
+}
