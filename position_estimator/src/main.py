@@ -1,135 +1,135 @@
 import cv2
 import numpy as np
 import threading
-import os
+import datetime
+import time
 
-# 分離した自作モジュールのインポート
+from config import (CAMERA_ID, CAMERA_W, CAMERA_H,
+                    SERIAL_PORT, SERIAL_BAUD,
+                    FIELD_POINTS, LOG_DIR)
 from camera import CameraTracker
 from communication import SerialReceiver
+from tracker import camera_thread_func
 from visualizer import Visualizer3D
 
-# ==========================================
-# 設定
-# ==========================================
-FIELD_POINTS = np.array([
-    [0.0,  0.0,  0.0],
-    [16.0, 0.0,  0.0],
-    [16.0, 16.0, 0.0],
-    [0.0,  16.0, 0.0]
-], dtype=np.float32)
-
-# 外れ値フィルタ：この範囲外の検知は無視する（フィールドより少し広め）
-VALID_X_MIN, VALID_X_MAX = -5.0, 21.0
-VALID_Y_MIN, VALID_Y_MAX = -5.0, 21.0
-VALID_Z_MIN, VALID_Z_MAX = -1.0, 20.0
-
-# スレッド間共有データ
+# スレッド間共有
 plot_lock = threading.Lock()
-plot_data = {
-    "P": None, "O": None,
-    "roll": 0.0, "pitch": 0.0, "current_z": 0.0,
-    "updated": False,
-}
+plot_data = {"P": None, "O": None, "roll": 0.0,
+             "pitch": 0.0, "current_z": 0.0, "updated": False}
 
-# ==========================================
-# 計算関数
-# ==========================================
-def get_ray(u, v, K, R, tvec):
-    pt_2d = np.array([[[u, v]]], dtype=np.float32)
-    undistorted = cv2.undistortPoints(pt_2d, K, None)
-    dir_cam = np.array([undistorted[0][0][0], undistorted[0][0][1], 1.0])
-    cam_pos = -R.T.dot(tvec).flatten()
-    dir_world = R.T.dot(dir_cam)
-    dir_world /= np.linalg.norm(dir_world)
-    return cam_pos, dir_world.flatten()
 
-def accel_to_angles(accel):
-    ax_, ay, az = accel
-    norm = np.sqrt(ax_**2 + ay**2 + az**2)
-    if norm < 1e-6:
-        return 0.0, 0.0
-    ax_, ay, az = ax_/norm, ay/norm, az/norm
-    pitch = np.degrees(np.arctan2(-ax_, np.sqrt(ay**2 + az**2)))
-    roll  = np.degrees(np.arctan2(ay, az))
-    return roll, pitch
-
-def calc_tilt(accel, ref_roll, ref_pitch):
-    roll, pitch = accel_to_angles(accel)
-    return roll - ref_roll, pitch - ref_pitch
-
-def is_valid_position(P):
-    return (VALID_X_MIN <= P[0] <= VALID_X_MAX and
-            VALID_Y_MIN <= P[1] <= VALID_Y_MAX and
-            VALID_Z_MIN <= P[2] <= VALID_Z_MAX)
-
-# ==========================================
-# OpenCVスレッド（カメラ・検知・ログ）
-# ==========================================
-# ※以前の main.py にあった camera_thread_func の中身と draw_horizon はここに入ります。
-# （長くなるため中略しますが、前回のコードのまま変更不要です。ログの保存先パスだけ渡す時に変えます）
-# ... (camera_thread_func の実装) ...
-
-# ==========================================
-# エントリポイント
-# ==========================================
-if __name__ == "__main__":
-    print("システムを起動中...")
-
-    # ログフォルダがなければ作成
-    if not os.path.exists("logs"):
-        os.makedirs("logs")
-
-    cam        = CameraTracker(camera_id=0, width=1920, height=1080)
-    alt_sensor = SerialReceiver(port="COM7", baudrate=115200)
-    K          = cam.get_approx_camera_matrix()
-
-    shared = {
-        "points_2d":  [],
-        "alt_offset": 0.0,
-        "pos_offset": np.zeros(3),
-        "ref_roll":   0.0,
-        "ref_pitch":  0.0,
-        "do_calib":   False,
-        "do_bg_reset":False,
-        "quit":       False,
-    }
-
-    # --- 基準点クリック ---
+def run_calibration(cam):
+    """基準点4点のクリックを受け付け、solvePnP の結果を返す"""
+    points_2d = []
     cv2.namedWindow("Camera", cv2.WINDOW_NORMAL)
-    def on_click_init(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN and len(shared["points_2d"]) < 4:
-            shared["points_2d"].append([x, y])
-    cv2.setMouseCallback("Camera", on_click_init)
+
+    def on_click(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(points_2d) < 4:
+            points_2d.append([x, y])
+
+    cv2.setMouseCallback("Camera", on_click)
     print("【準備】基準点4箇所（左下→右下→右上→左上）をクリックしてください。")
 
     while True:
         ret, frame = cam.cap.read()
-        if not ret: continue
+        if not ret:
+            continue
         disp = frame.copy()
-        for i, p in enumerate(shared["points_2d"]):
-            cv2.circle(disp, tuple(p), 5, (0,0,255), -1)
-            cv2.putText(disp, str(i+1), (p[0]+10,p[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+        for i, p in enumerate(points_2d):
+            cv2.circle(disp, tuple(p), 5, (0, 0, 255), -1)
+            cv2.putText(disp, str(i+1), (p[0]+10, p[1]-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         cv2.imshow("Camera", disp)
-        if cv2.waitKey(1) == 13 and len(shared["points_2d"]) == 4:
+        if cv2.waitKey(1) == 13 and len(points_2d) == 4:
             break
 
-    success, rvec, tvec = cv2.solvePnP(FIELD_POINTS, np.array(shared["points_2d"], dtype=np.float32), K, None)
+    K = cam.get_approx_camera_matrix()
+    _, rvec, tvec = cv2.solvePnP(
+        FIELD_POINTS, np.array(points_2d, dtype=np.float32), K, None)
     R, _ = cv2.Rodrigues(rvec)
     cv2.destroyAllWindows()
+    return K, R, tvec
 
-    print("【開始】トラッキング開始！")
 
-    # スレッド起動（ログの保存先を logs/ 内に変更）
-    log_file_path = os.path.join("logs", "3d_tracking_log.csv")
+def main():
+    print()
+    print("=" * 52)
+    print("   POSITION ESTIMATOR  -  STARTUP SEQUENCE")
+    print("=" * 52)
+    time.sleep(0.3)
+
+    # ── カメラ初期化 ──────────────────────────────
+    print("\n[INIT 1/4]  カメラ起動中...")
+    cam = CameraTracker(camera_id=CAMERA_ID, width=CAMERA_W, height=CAMERA_H)
+    ret, test_frame = cam.cap.read()
+    if not ret or test_frame is None:
+        print("  [ERROR]  カメラ映像の取得に失敗しました。接続を確認してください。")
+        return
+    h, w = test_frame.shape[:2]
+    print(f"  [OK]     解像度: {w} x {h}  /  カメラID: {CAMERA_ID}")
+    time.sleep(0.2)
+
+    # ── シリアル（センサ）初期化 ──────────────────
+    print(f"\n[INIT 2/4]  センサ受信モジュール起動中...  ({SERIAL_PORT} @ {SERIAL_BAUD}bps)")
+    alt_sensor = SerialReceiver(port=SERIAL_PORT, baudrate=SERIAL_BAUD)
+    time.sleep(0.5)  # 最初のデータが来るまで少し待つ
+
+    alt  = alt_sensor.get_altitude()
+    acc  = alt_sensor.get_accel()
+    if acc == (0.0, 0.0, 0.0) and alt == 0.0:
+        print(f"  [WARN]   センサデータ未受信（ケーブル・COMポートを確認）")
+    else:
+        print(f"  [OK]     高度     : {alt:.2f} m")
+        print(f"  [OK]     加速度   : Ax={acc[0]:.2f}  Ay={acc[1]:.2f}  Az={acc[2]:.2f}  [m/s²]")
+    time.sleep(0.2)
+
+    # ── 行列・ログ準備 ────────────────────────────
+    print("\n[INIT 3/4]  カメラ行列・ログファイル準備中...")
+    K = cam.get_approx_camera_matrix()
+    print(f"  [OK]     焦点距離(近似): {K[0,0]:.0f} px")
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"flight_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    print(f"  [OK]     ログ保存先: {log_path}")
+    time.sleep(0.2)
+
+    # ── フィールドキャリブレーション ─────────────
+    print("\n[INIT 4/4]  フィールドキャリブレーション待機中...")
+    print("  [INFO]   カメラウィンドウで基準点4箇所をクリックしてください。")
+    K, R, tvec = run_calibration(cam)
+    print("  [OK]     solvePnP 完了 → カメラ姿勢を推定しました。")
+    time.sleep(0.2)
+
+    print()
+    print("=" * 52)
+    print("   ALL SYSTEMS GO  -  TRACKING STARTED")
+    print("=" * 52)
+    print()
+    print("  [SPACE] キャリブレーション")
+    print("  [B]     背景リセット")
+    print("  [Q]     終了")
+    print()
+
+    # スレッド間共有状態
+    shared = {
+        "alt_offset":  0.0,
+        "pos_offset":  np.zeros(3),
+        "ref_roll":    0.0,
+        "ref_pitch":   0.0,
+        "do_calib":    False,
+        "do_bg_reset": False,
+        "quit":        False,
+    }
+
+    # カメラスレッド起動
     cam_thread = threading.Thread(
-        target=camera_thread_func, # 上部で定義した関数
-        args=(cam, alt_sensor, K, R, tvec, log_file_path, shared),
+        target=camera_thread_func,
+        args=(cam, alt_sensor, K, R, tvec, log_path, shared, plot_lock, plot_data),
         daemon=True)
     cam_thread.start()
 
-    # --- ここからが Visualizer クラスを使ったスッキリしたループ ---
+    # 3D描画（メインスレッド）
     viz = Visualizer3D(FIELD_POINTS)
-
     while not shared.get("quit", False):
         with plot_lock:
             updated   = plot_data["updated"]
@@ -143,7 +143,15 @@ if __name__ == "__main__":
 
         if updated and O is not None:
             viz.update(P, O, roll, pitch, current_z)
+        else:
+            try:
+                viz.fig.canvas.flush_events()
+            except Exception:
+                pass
 
-    # 終了処理
     alt_sensor.stop()
     viz.close()
+
+
+if __name__ == "__main__":
+    main()

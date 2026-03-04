@@ -1,3 +1,5 @@
+#シリアル通信
+
 import serial
 import threading
 import time
