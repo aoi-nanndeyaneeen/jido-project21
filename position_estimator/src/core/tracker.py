@@ -117,15 +117,15 @@ def camera_thread_func(cam, alt_sensor, K, R, tvec, log_path: Path,
 
             # --- plot_data 更新 ---
             with plot_lock:
-                plot_data.update({"P": P_vec, "O": O_fixed,
-                                  "roll": roll, "pitch": pitch,
-                                  "current_z": current_z, "updated": True})
+                plot_data["P"]         = P_vec
+                plot_data["O"]         = O_fixed
+                plot_data["roll"]      = roll
+                plot_data["pitch"]     = pitch
+                plot_data["current_z"] = current_z
+                plot_data["updated"]   = True
+                plot_data["frame"]     = frame.copy() # ★ ここで画像を渡す！
 
-            cv2.imshow("Camera", frame)
-            key = cv2.waitKey(1) & 0xFF
-            if   key == ord('q'): shared["quit"]        = True
-            elif key == ord('b'): shared["do_bg_reset"] = True
-            elif key == ord(' '): shared["do_calib"]    = True
+            #cv2.imshow("Camera", frame)
 
     finally:
         log.close()

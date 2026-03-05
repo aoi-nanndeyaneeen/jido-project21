@@ -51,6 +51,8 @@ def run_calibration(cam):
         FIELD_POINTS, np.array(points_2d, dtype=np.float32), K, None, flags=cv2.SOLVEPNP_EPNP)
     R, _ = cv2.Rodrigues(rvec)
     cv2.destroyAllWindows()
+    for _ in range(10):
+        cv2.waitKey(1)
     return K, R, tvec
 
 
@@ -124,7 +126,7 @@ def main():
         "quit":        False,
     }
 
-    # カメラスレッド起動
+# カメラスレッド起動
     cam_thread = threading.Thread(
         target=camera_thread_func,
         args=(cam, alt_sensor, K, R, tvec, log_path, shared, plot_lock, plot_data),
@@ -133,6 +135,9 @@ def main():
 
     dashboard = Dashboard(FIELD_POINTS)
     controller = AltitudeController(p_gain=5.0)
+
+    # ★ トラッキング用のカメラウィンドウを「サイズ変更可能」で新設！
+    cv2.namedWindow("Live Camera", cv2.WINDOW_NORMAL)
 
     # ターミナルでの入力受け付け用関数
     def ask_target():
@@ -160,12 +165,16 @@ def main():
             # --- アルゴリズムで送信値を計算してRP2040へ送る ---
             target_alt = controller.get_target()
             pitch_cmd = controller.calc_pitch_command(current_z)
-            alt_sensor.send_target_altitude(pitch_cmd) # 目標高度ではなく、計算されたPitch指令値を送る！
+            alt_sensor.send_target_altitude(pitch_cmd)
 
-            # --- ダッシュボードの描画 ---
-            dashboard.render_and_show(P, O, roll, pitch, current_z, target_alt, frame)
+            # --- ダッシュボードの描画 (frameは渡さない) ---
+            dashboard.render_and_show(P, O, roll, pitch, current_z, target_alt)
 
-        # === ここが正しいキー判定の場所 ===
+            # --- ★別ウィンドウでカメラ映像を表示 ---
+            if frame is not None:
+                cv2.imshow("Live Camera", frame)
+
+        # === キー判定 ===
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             shared["quit"] = True
@@ -178,6 +187,10 @@ def main():
 
     alt_sensor.stop()
     dashboard.close()
+    cv2.destroyAllWindows()
+
+    for _ in range(10):
+        cv2.waitKey(1) # ウィンドウが完全に閉じるのを待つ
 
 
 if __name__ == "__main__":

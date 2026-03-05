@@ -8,7 +8,7 @@ import numpy as np
 # ==========================================
 SRC_DIR  = Path(__file__).parent
 ROOT_DIR = SRC_DIR.parent
-LOG_DIR  = Path("C:/flight_logs")   # OneDrive外の安全なパス
+LOG_DIR  = ROOT_DIR / "logs"
 
 # ==========================================
 # カメラ・センサ設定
