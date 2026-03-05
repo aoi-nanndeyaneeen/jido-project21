@@ -13,6 +13,7 @@ venv/
 **/logs/
 *.csv
 Project20.code-workspace
+*.code-workspace
 # OSのシステムファイル
 .DS_Store
 Thumbs.db
