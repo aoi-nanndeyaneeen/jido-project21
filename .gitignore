@@ -9,9 +9,11 @@
 venv/
 
 # ログファイルやデータ（PCごとに違うため同期しない）
+# workspaceも同期しない方がいいと思う
 **/logs/
 *.csv
-
+Project20.code-workspace
+*.code-workspace
 # OSのシステムファイル
 .DS_Store
 Thumbs.db
