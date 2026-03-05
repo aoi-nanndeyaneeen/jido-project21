@@ -1,16 +1,21 @@
 #カメラスレッド、OpenCV描画
 
+"""
+tracker.py
+カメラスレッド・OpenCV描画・ログ記録を担当。
+"""
+
 import cv2
 import numpy as np
 import threading
 from pathlib import Path
 
-from geometry import get_ray, calc_tilt, accel_to_angles, is_valid_position
-from logger import FlightLogger
+from utils.config import MIN_TRACK_ALT
+from core.geometry import get_ray, calc_tilt, accel_to_angles, is_valid_position
+from utils.logger import FlightLogger
 
 
 def draw_horizon(frame, roll_deg, pitch_deg):
-    """人工水平儀をフレーム左上に描画"""
     cx, cy, r = 120, 120, 90
     cv2.circle(frame, (cx, cy), r, (40, 40, 40), -1)
     pitch_px  = int(np.clip(pitch_deg / 90.0 * r, -r, r))
@@ -43,16 +48,11 @@ def draw_horizon(frame, roll_deg, pitch_deg):
 
 def camera_thread_func(cam, alt_sensor, K, R, tvec, log_path: Path,
                        shared: dict, plot_lock: threading.Lock, plot_data: dict):
-    """
-    カメラ読み取り・動体検知・ログ記録・キー入力を担当するスレッド関数。
-    plot_data に描画用データを書き込む。
-    """
-    O_fixed    = (-R.T.dot(tvec)).flatten()
-    last_P_raw = None
-    log        = FlightLogger(log_path)
+    O_fixed = (-R.T.dot(tvec)).flatten()
+    log     = FlightLogger(log_path)
 
     cv2.namedWindow("Camera", cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback("Camera", lambda *a: None)  # クリック不要
+    cv2.setMouseCallback("Camera", lambda *a: None)
 
     try:
         while not shared.get("quit", False):
@@ -60,7 +60,6 @@ def camera_thread_func(cam, alt_sensor, K, R, tvec, log_path: Path,
             raw_accel = alt_sensor.get_accel()
 
             alt_offset = shared["alt_offset"]
-            pos_offset = shared["pos_offset"]
             current_z  = raw_alt - alt_offset
             roll, pitch = calc_tilt(raw_accel, shared["ref_roll"], shared["ref_pitch"])
 
@@ -73,43 +72,43 @@ def camera_thread_func(cam, alt_sensor, K, R, tvec, log_path: Path,
             cv2.putText(frame,
                 f"Alt(raw):{raw_alt:.2f}m  offset:{alt_offset:.2f}m  rel:{current_z:.2f}m",
                 (10,340), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180,180,180), 2)
-            cv2.putText(frame, "[SPACE]Calib  [B]BG Reset  [Q]Quit",
+            cv2.putText(frame, "[SPACE]Calib(Z+tilt)  [B]BG Reset  [Q]Quit",
                 (10, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2)
 
             # --- 3D位置推定 ---
             P_vec = None
             if center_uv is not None:
-                u, v = center_uv
-                O_ray, D = get_ray(u, v, K, R, tvec)
-                if abs(D[2]) > 1e-6:
-                    t_val = (current_z - O_ray[2]) / D[2]
-                    P_raw = O_ray + t_val * D
-                    if is_valid_position(np.append(P_raw[:2], current_z)):
-                        P_vec      = P_raw - pos_offset
-                        last_P_raw = P_raw.copy()
-                        cv2.putText(frame,
-                            f"X:{P_vec[0]:.2f} Y:{P_vec[1]:.2f} Z:{current_z:.2f}m",
-                            (50,100), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0,255,255), 4)
-                    else:
-                        cv2.putText(frame, "OUT OF RANGE",
-                            (50,100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
+                # ★ 低高度では交点計算が発散するためスキップ
+                if current_z < MIN_TRACK_ALT:
+                    cv2.putText(frame,
+                        f"ALT TOO LOW ({current_z:.2f}m < {MIN_TRACK_ALT}m)",
+                        (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 100, 255), 3)
+                else:
+                    u, v = center_uv
+                    O_ray, D = get_ray(u, v, K, R, tvec)
+                    if abs(D[2]) > 1e-6:
+                        t_val = (current_z - O_ray[2]) / D[2]
+                        P_raw = O_ray + t_val * D
+                        if is_valid_position(np.append(P_raw[:2], current_z)):
+                            P_vec = P_raw   # ★ pos_offset は廃止
+                            cv2.putText(frame,
+                                f"X:{P_vec[0]:.2f} Y:{P_vec[1]:.2f} Z:{current_z:.2f}m",
+                                (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0,255,255), 4)
+                        else:
+                            cv2.putText(frame, "OUT OF RANGE",
+                                (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
 
-            # --- ログ記録 ---
+            # --- ログ ---
             log.write(P_vec, current_z, roll, pitch, raw_alt, alt_offset)
 
-            # --- キャリブレーション処理 ---
+            # --- キャリブレーション（Z・傾きのみ、X/Yリセットなし） ---
             if shared.get("do_calib", False):
-                shared["do_calib"]    = False
-                shared["alt_offset"]  = raw_alt
+                shared["do_calib"]   = False
+                shared["alt_offset"] = raw_alt
                 r0, p0 = accel_to_angles(raw_accel)
-                shared["ref_roll"]    = r0
-                shared["ref_pitch"]   = p0
-                if last_P_raw is not None:
-                    shared["pos_offset"] = last_P_raw.copy()
-                    print(f"[Calib] Z={raw_alt:.2f}m  XY={last_P_raw[:2]}→原点  "
-                          f"Roll={r0:.1f}°  Pitch={p0:.1f}°")
-                else:
-                    print(f"[Calib] Z={raw_alt:.2f}m (XY未検知)  Roll={r0:.1f}°  Pitch={p0:.1f}°")
+                shared["ref_roll"]   = r0
+                shared["ref_pitch"]  = p0
+                print(f"[Calib] Z={raw_alt:.2f}m→0  Roll={r0:.1f}°  Pitch={p0:.1f}°")
 
             if shared.get("do_bg_reset", False):
                 shared["do_bg_reset"] = False
@@ -122,12 +121,11 @@ def camera_thread_func(cam, alt_sensor, K, R, tvec, log_path: Path,
                                   "roll": roll, "pitch": pitch,
                                   "current_z": current_z, "updated": True})
 
-            # --- キー入力 ---
             cv2.imshow("Camera", frame)
             key = cv2.waitKey(1) & 0xFF
-            if   key == ord('q'): shared["quit"]       = True
+            if   key == ord('q'): shared["quit"]        = True
             elif key == ord('b'): shared["do_bg_reset"] = True
-            elif key == ord(' '): shared["do_calib"]   = True
+            elif key == ord(' '): shared["do_calib"]    = True
 
     finally:
         log.close()

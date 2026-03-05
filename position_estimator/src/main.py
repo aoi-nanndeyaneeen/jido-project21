@@ -4,13 +4,14 @@ import threading
 import datetime
 import time
 
-from config import (CAMERA_ID, CAMERA_W, CAMERA_H,
+from utils.config import (CAMERA_ID, CAMERA_W, CAMERA_H,
                     SERIAL_PORT, SERIAL_BAUD,
                     FIELD_POINTS, LOG_DIR)
-from camera import CameraTracker
-from communication import SerialReceiver
-from tracker import camera_thread_func
-from visualizer import Visualizer3D
+from core.camera import CameraTracker
+from core.communication import SerialReceiver
+from core.tracker import camera_thread_func
+from ui.dashboard import Dashboard
+from core.controller import AltitudeController
 
 # スレッド間共有
 plot_lock = threading.Lock()
@@ -24,11 +25,11 @@ def run_calibration(cam):
     cv2.namedWindow("Camera", cv2.WINDOW_NORMAL)
 
     def on_click(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN and len(points_2d) < 4:
+        if event == cv2.EVENT_LBUTTONDOWN and len(points_2d) < 5:
             points_2d.append([x, y])
 
     cv2.setMouseCallback("Camera", on_click)
-    print("【準備】基準点4箇所（左下→右下→右上→左上）をクリックしてください。")
+    print("【準備】基準点5箇所（左下→右下→右上→左上→右上の2m上）をクリックしてください。")
 
     while True:
         ret, frame = cam.cap.read()
@@ -40,12 +41,14 @@ def run_calibration(cam):
             cv2.putText(disp, str(i+1), (p[0]+10, p[1]-10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         cv2.imshow("Camera", disp)
-        if cv2.waitKey(1) == 13 and len(points_2d) == 4:
+        if cv2.waitKey(1) == 13 and len(points_2d) == 5:
             break
+
+        
 
     K = cam.get_approx_camera_matrix()
     _, rvec, tvec = cv2.solvePnP(
-        FIELD_POINTS, np.array(points_2d, dtype=np.float32), K, None)
+        FIELD_POINTS, np.array(points_2d, dtype=np.float32), K, None, flags=cv2.SOLVEPNP_EPNP)
     R, _ = cv2.Rodrigues(rvec)
     cv2.destroyAllWindows()
     return K, R, tvec
@@ -128,8 +131,19 @@ def main():
         daemon=True)
     cam_thread.start()
 
-    # 3D描画（メインスレッド）
-    viz = Visualizer3D(FIELD_POINTS)
+    dashboard = Dashboard(FIELD_POINTS)
+    controller = AltitudeController(p_gain=5.0)
+
+    # ターミナルでの入力受け付け用関数
+    def ask_target():
+        try:
+            val = input("\n>>> 新しい目標高度を入力 (m): ")
+            target_alt = float(val)
+            controller.set_target(target_alt)
+            print(f">>> 目標高度を {target_alt}m に設定しました。")
+        except ValueError:
+            print(">>> [エラー] 数値を入力してください。")
+
     while not shared.get("quit", False):
         with plot_lock:
             updated   = plot_data["updated"]
@@ -138,19 +152,32 @@ def main():
             roll      = plot_data["roll"]
             pitch     = plot_data["pitch"]
             current_z = plot_data["current_z"]
+            frame     = plot_data.get("frame", None) # trackerから渡される映像
             if updated:
                 plot_data["updated"] = False
 
         if updated and O is not None:
-            viz.update(P, O, roll, pitch, current_z)
-        else:
-            try:
-                viz.fig.canvas.flush_events()
-            except Exception:
-                pass
+            # --- アルゴリズムで送信値を計算してRP2040へ送る ---
+            target_alt = controller.get_target()
+            pitch_cmd = controller.calc_pitch_command(current_z)
+            alt_sensor.send_target_altitude(pitch_cmd) # 目標高度ではなく、計算されたPitch指令値を送る！
+
+            # --- ダッシュボードの描画 ---
+            dashboard.render_and_show(P, O, roll, pitch, current_z, target_alt, frame)
+
+        # === ここが正しいキー判定の場所 ===
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            shared["quit"] = True
+        elif key == ord('b'):
+            shared["do_bg_reset"] = True
+        elif key == ord(' '):
+            shared["do_calib"] = True
+        elif key == ord('t'):
+            threading.Thread(target=ask_target, daemon=True).start()
 
     alt_sensor.stop()
-    viz.close()
+    dashboard.close()
 
 
 if __name__ == "__main__":

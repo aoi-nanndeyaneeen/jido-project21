@@ -1,0 +1,128 @@
+"""
+main_dummy.py  ―  シミュレーションモード
+実機に戻す際は main.py を使うだけ。他ファイルは変更不要。
+"""
+
+import threading
+import datetime
+import time
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+
+from config          import FIELD_POINTS, LOG_DIR, CAMERA_W, CAMERA_H
+from tracker         import camera_thread_func
+from visualizer      import Visualizer3D
+from trajectory_view import TrajectoryView
+from dummy_source    import DummyCamera, DummySensor, make_lookat_camera
+
+# ==========================================
+# シミュレーション設定
+# ==========================================
+SIM_ALTITUDE = 3.0    # 飛行高度 [m]
+SIM_RADIUS   = 4.0    # 旋回半径 [m]
+SIM_OMEGA    = 0.6    # 角速度  [rad/s]
+
+# 仮想カメラ：フィールド外・斜め上から俯瞰
+CAM_EYE    = (-18.0,  0.0, 15.0)
+CAM_TARGET = (  0.0,  0.0,  0.0)   # フィールド中心 = 原点
+
+# スレッド間共有
+plot_lock = threading.Lock()
+plot_data = {"P": None, "O": None, "roll": 0.0,
+             "pitch": 0.0, "current_z": 0.0, "updated": False}
+
+
+def main():
+    print()
+    print("=" * 52)
+    print("   POSITION ESTIMATOR  -  SIMULATION MODE")
+    print("=" * 52)
+    time.sleep(0.2)
+
+    field_center = (0.0, 0.0)   # フィールド中心 = 原点
+    print(f"\n[SIM]  フィールド中心 : {field_center}  (原点)")
+    print(f"[SIM]  旋回半径       : {SIM_RADIUS} m")
+    print(f"[SIM]  飛行高度       : {SIM_ALTITUDE} m")
+    print(f"[SIM]  角速度         : {SIM_OMEGA:.2f} rad/s"
+          f"  (1周 ≈ {2*3.14159/SIM_OMEGA:.1f} 秒)")
+    time.sleep(0.3)
+
+    print("\n[INIT 1/3]  仮想カメラ・センサを初期化中...")
+    K, R, tvec = make_lookat_camera(CAM_EYE, CAM_TARGET, CAMERA_W, CAMERA_H)
+    cam    = DummyCamera(K=K, R=R, tvec=tvec,
+                         width=CAMERA_W, height=CAMERA_H,
+                         center=field_center,
+                         radius=SIM_RADIUS,
+                         altitude=SIM_ALTITUDE,
+                         omega=SIM_OMEGA)
+    sensor = DummySensor(altitude=SIM_ALTITUDE)
+    print(f"  [OK]     仮想カメラ位置: {CAM_EYE}")
+    print(f"  [OK]     注視点       : {CAM_TARGET}")
+    time.sleep(0.2)
+
+    print("\n[INIT 2/3]  ログファイル準備中...")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"sim_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    print(f"  [OK]     保存先: {log_path}")
+    time.sleep(0.2)
+
+    shared = {
+        "alt_offset":  0.0,
+        "ref_roll":    0.0,
+        "ref_pitch":   0.0,
+        "do_calib":    False,
+        "do_bg_reset": False,
+        "quit":        False,
+    }
+
+    print("\n[INIT 3/3]  スレッド・描画ウィンドウ起動中...")
+    time.sleep(0.2)
+    print()
+    print("=" * 52)
+    print("   ALL SYSTEMS GO  -  SIMULATION STARTED")
+    print("=" * 52)
+    print()
+    print("  [SPACE] Z・傾きキャリブレーション（X/Yはリセットしない）")
+    print("  [Q]     終了")
+    print()
+
+    # カメラスレッド起動
+    cam_thread = threading.Thread(
+        target=camera_thread_func,
+        args=(cam, sensor, K, R, tvec, log_path, shared, plot_lock, plot_data),
+        daemon=True)
+    cam_thread.start()
+
+    # 描画（メインスレッド）
+    viz  = Visualizer3D(FIELD_POINTS)
+    traj = TrajectoryView()
+
+    while not shared.get("quit", False):
+        with plot_lock:
+            updated   = plot_data["updated"]
+            P         = plot_data["P"]
+            O         = plot_data["O"]
+            roll      = plot_data["roll"]
+            pitch     = plot_data["pitch"]
+            current_z = plot_data["current_z"]
+            if updated:
+                plot_data["updated"] = False
+
+        if updated and O is not None:
+            traj.update(P, current_z)   # 軌跡グラフ先に更新
+            viz.update(P, O, roll, pitch, current_z)
+        else:
+            try:
+                viz.fig.canvas.flush_events()
+                traj.fig.canvas.flush_events()
+            except Exception:
+                pass
+
+    sensor.stop()
+    traj.close()
+    viz.close()
+
+
+if __name__ == "__main__":
+    main()

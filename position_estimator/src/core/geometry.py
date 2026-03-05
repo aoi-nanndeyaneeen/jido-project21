@@ -2,7 +2,7 @@
 
 import cv2
 import numpy as np
-from config import VALID_X, VALID_Y, VALID_Z
+from utils.config import VALID_X, VALID_Y, VALID_Z
 
 
 def get_ray(u, v, K, R, tvec):

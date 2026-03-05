@@ -6,6 +6,23 @@ import time
 import re
 
 class SerialReceiver:
+    # SerialReceiver クラスの中に追加
+    def send_target_altitude(self, target_alt):
+        """目標高度をPCからRP2040へ送信する（今回はpitchフィールドを使用）"""
+        if not self.is_running or not self.ser.is_open:
+            return
+
+        # p_adj, i_adj, d_adj, roll, pitch(ここに目標高度), yaw
+        # 形式: "0.0,0.0,0.0,0.0,25.5,0.0\n"
+        send_str = f"0.0,0.0,0.0,0.0,{target_alt:.2f},0.0\n"
+        
+        try:
+            self.ser.write(send_str.encode('utf-8'))
+            print(f"[Serial] 目標高度 {target_alt} m を送信しました。")
+        except Exception as e:
+            print(f"[Serial] 送信エラー: {e}")
+
+
     def __init__(self, port="COM7", baudrate=115200):
         self.port     = port
         self.baudrate = baudrate

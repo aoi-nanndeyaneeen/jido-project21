@@ -19,6 +19,7 @@ void setup() {
 void loop() {
   if (!frec())  return; 
 
+  serial.read();
   serial.update(&Ground_Data);
   im920.read(Plane_Data);
 
