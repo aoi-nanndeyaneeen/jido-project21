@@ -27,12 +27,19 @@ void loop() {
   if (counter % 500 == 0) {
     im920.write(Ground_Data);
     
-    // ★ここが超重要！Python向けの形式
-    Serial.print("DATA,");
-    Serial.print(Plane_Data.altitude, 2); Serial.print(",");
-    Serial.print(Plane_Data.ax, 2); Serial.print(",");
-    Serial.print(Plane_Data.ay, 2); Serial.print(",");
-    Serial.print(Plane_Data.az, 2);
-    Serial.println(); // 改行
+    // ==========================================
+    // ★ Teleplot用フォーマット (>変数名:値)
+    // ==========================================
+    
+    // 1. 加速度の生データ
+    Serial.print(">ax:"); Serial.println(Plane_Data.ax, 2);
+    Serial.print(">ay:"); Serial.println(Plane_Data.ay, 2);
+    Serial.print(">az:"); Serial.println(Plane_Data.az, 2);
+    
+    // 2. 機体の姿勢（Teensy側で gx, gy に Roll, Pitch を入れています）
+    Serial.print(">Roll:"); Serial.println(Plane_Data.gx, 2);
+    Serial.print(">Pitch:"); Serial.println(Plane_Data.gy, 2);
+    
+    // ※気圧センサ未接続のため、Plane_Data.altitude は出力しません
   }
 }
