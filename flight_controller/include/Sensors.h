@@ -7,21 +7,22 @@
 #include <MadgwickAHRS.h>
 #include "Config.h" // Timing::FREQUENCYなどを使うため
 
-class mpu_value {
+class IMU {
 private:
     MPU6050 mpu;
     Madgwick filter;
     int16_t ax, ay, az;
     int16_t gx, gy, gz;
+    TwoWire *wire;
     const float ACCEL_SCALE = 16384.0;
     const float GYRO_SCALE = 131.0;
 
 public:
-    mpu_value() : mpu(0x68) {};
+    IMU(TwoWire *wire_i = &Wire) : mpu(0x68), wire(wire_i) {};
 
     void begin() {
-        Wire.begin();
-        Wire.setClock(400000);
+        wire->begin();
+        wire->setClock(400000);
         mpu.initialize();
         filter.begin(FREQUENCY);
         mpu.setXAccelOffset(0);
@@ -56,12 +57,12 @@ private:
     float pressure;
     float raw_altitude;
     float smoothed_altitude;
-    
+
     float sea_level_pressure; 
     float alpha;              
 
 public:
-    BarometerSensor(float sea_level = 1013.25, float filter_alpha = 0.1) : bmp(&Wire1) {
+    BarometerSensor(float sea_level = 1013.25, float filter_alpha = 0.1, TwoWire *wire_i = &Wire1) : bmp(wire_i) {
         sea_level_pressure = sea_level;
         alpha = filter_alpha;
         temperature = 0.0;

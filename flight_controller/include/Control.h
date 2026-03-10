@@ -10,12 +10,15 @@ class PID {
     float d_alpha, i_limit;
 
 public:
-    void initPID(float kp_i, float ki_i, float kd_i) {
+    PID(float kp_i = 0, float ki_i = 0, float kd_i = 0,float d_alpha_i = 0.7f, float i_limit_i = 200.0f) : 
+        kp(kp_i), ki(ki_i), kd(kd_i),
+        kp_ori(kp_i), ki_ori(ki_i), kd_ori(kd_i),
+        i(0), prev(0), d_lpf(0), d_alpha(d_alpha_i), i_limit(i_limit_i) {}
+
+    void setgains(float kp_i, float ki_i, float kd_i, float d_alpha_i = 0.7f, float i_limit_i = 200.0f) {
         kp = kp_i; ki = ki_i; kd = kd_i;
-        kp_ori = kp; ki_ori = ki; kd_ori = kd;
-        i = 0; prev = 0; d_lpf = 0;
-        i_limit = 200.0f;
-        d_alpha = 0.7f;
+        kp_ori = kp_i; ki_ori = ki_i; kd_ori = kd_i;
+        d_alpha = d_alpha_i; i_limit = i_limit_i;
     }
 
     void addjest(float kp_adj, float ki_adj, float kd_adj) {
@@ -43,9 +46,11 @@ public:
     float Sen;
     PID c_rate, c_ang;
 
-    void setgains(float kp_r, float ki_r, float kd_r, float kp_a, float ki_a, float kd_a, float Sen_in) {
-        c_rate.initPID(kp_r, ki_r, kd_r);
-        c_ang.initPID(kp_a, ki_a, kd_a);
+    Axis_value (float kp_r, float ki_r, float kd_r, float kp_a, float ki_a, float kd_a, float Sen_in = 1.0f, 
+                float d_alpha_r = 0.7f, float i_limit_r = 200.0f, float d_alpha_a = 0.7f, float i_limit_a = 200.0f)
+    {
+        c_rate.setgains(kp_r, ki_r, kd_r, d_alpha_r, i_limit_r);
+        c_ang.setgains(kp_a, ki_a, kd_a, d_alpha_a, i_limit_a);
         Sen = Sen_in;
     }
 

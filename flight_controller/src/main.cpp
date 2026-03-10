@@ -21,12 +21,6 @@
 #include "Actuators.h"
 
 // ============================================================
-//  グローバル変数の実体定義
-// ============================================================
-unsigned long dt;
-int counter;
-
-// ============================================================
 //  飛行モード定義
 // ============================================================
 enum FlightMode : uint8_t {
@@ -47,14 +41,22 @@ unsigned long modeStartMs = 0;
 // ============================================================
 //  インスタンス生成
 // ============================================================
-Axis_value Roll, Pitch, Yaw;
-mpu_value MPU;
-Sbus sbus(&Serial2);
-BarometerSensor barometer(1013.25, 0.1);
+
+Axis_value  Roll(ROLL_gain.kp_rate, ROLL_gain.ki_rate, ROLL_gain.kd_rate, ROLL_gain.kp_angle, ROLL_gain.ki_angle, ROLL_gain.kd_angle, ROLL_gain.sensitivity, ROLL_gain.rate_d_alpha, ROLL_gain.rate_i_limit, ROLL_gain.angle_d_alpha, ROLL_gain.angle_i_limit),
+            Pitch(PITCH_gain.kp_rate, PITCH_gain.ki_rate, PITCH_gain.kd_rate, PITCH_gain.kp_angle, PITCH_gain.ki_angle, PITCH_gain.kd_angle, PITCH_gain.sensitivity, PITCH_gain.rate_d_alpha, PITCH_gain.rate_i_limit, PITCH_gain.angle_d_alpha, PITCH_gain.angle_i_limit),
+            Yaw(YAW_gain.kp_rate, YAW_gain.ki_rate, YAW_gain.kd_rate, YAW_gain.kp_angle, YAW_gain.ki_angle, YAW_gain.kd_angle, YAW_gain.sensitivity, YAW_gain.rate_d_alpha, YAW_gain.rate_i_limit, YAW_gain.angle_d_alpha, YAW_gain.angle_i_limit);
+            //kp_rate, ki_rate, kd_rate, kp_angle, ki_angle, kd_angle, sensitivity, rate_d_alpha, rate_i_limit, angle_d_alpha, angle_i_limit
+            //とってもながい
+            
+IMU mpu(Config::wire::mpu);
+BarometerSensor barometer(1013.25, 0.1, Config::wire::bmp);
+
+Sbus sbus(Config::serial::sbus);
+IM920SL_Generic<PlaneData, GroundData> im920(Config::serial::im920);
 
 PlaneData  Plane_Data;
 GroundData Ground_Data;
-IM920SL_Generic<PlaneData, GroundData> im920(&Serial3);
+
 
 RC_servo Ail1(1, 0.0, -1.0, 1.0),
          Ail2(6, 0.0, -1.0, 1.0),
@@ -80,34 +82,8 @@ void       print_sbus();
 //  setup
 // ============================================================
 void setup() {
-    MPU.begin();
+    mpu.begin();
     sbus.begin();
-
-    // ---- PIDゲイン設定 ----
-    // setgains(kp_rate, ki_rate, kd_rate, kp_angle, ki_angle, kd_angle, sensitivity)
-    //
-    // [重要] 全て0からスタートし、必ず地上で手持ちしながら少しずつ上げること
-    //  手順:
-    //  1. kp_angleを上げて機体が目標角に向かうか確認
-    //  2. kp_rateを上げてサーボの追従速度を上げる
-    //  3. kd_rateを足して振動を抑える
-    //  4. ki_rateは最後に少しだけ足す
-
-    Roll.setgains(
-        0.01f, 0.00f, 0.00f,   // レートPID: kp, ki, kd
-        1.0f, 0.0f, 0.01f,   // 角度PID:  kp, ki, kd
-        1.0f                  // 感度(Sensitivity)
-    );
-    Pitch.setgains(
-        0.4f, 0.01f, 0.04f,
-        1.5f, 0.00f, 0.00f,
-        1.0f
-    );
-    Yaw.setgains(
-        0.02f, 0.00f, 0.00f,   // ラダーはレートのみ
-        0.0f, 0.00f, 0.00f,
-        1.0f
-    );
 
     Ail1.begin(); Ail2.begin();
     Ele.begin();  Rud.begin();
@@ -164,12 +140,12 @@ void loop() {
     // 6) テレメトリ・デバッグ (1000Hz ÷ 100 = 10Hz)
     if (counter % 100 == 0) {
         barometer.update();
-        Plane_Data.ax       = MPU.getRoll();
-        Plane_Data.ay       = MPU.getPitch();
-        Plane_Data.az       = MPU.getYaw();
-        Plane_Data.gx       = MPU.getGyroX();
-        Plane_Data.gy       = MPU.getGyroY();
-        Plane_Data.gz       = MPU.getGyroZ();
+        Plane_Data.ax       = mpu.getRoll();
+        Plane_Data.ay       = mpu.getPitch();
+        Plane_Data.az       = mpu.getYaw();
+        Plane_Data.gx       = mpu.getGyroX();
+        Plane_Data.gy       = mpu.getGyroY();
+        Plane_Data.gz       = mpu.getGyroZ();
         Plane_Data.altitude = barometer.get_smoothed_altitude();
 
         Serial.print("\033[2J\033[H"); // ターミナルクリア
@@ -196,13 +172,13 @@ void loop() {
 //  センサ・受信機・無線通信の更新
 // ============================================================
 void updateSensorsAndComms() {
-    MPU.update();
+    mpu.update();
     sbus.update();
 
     // Axis_valueへセンサ値を流し込む (des は後で上書きされるので0でOK)
-    Roll.update_value(sbus.des[Ch::ROLL],  MPU.getRoll(),  MPU.getAccX(), MPU.getGyroX());
-    Pitch.update_value(sbus.des[Ch::PITCH], MPU.getPitch(), MPU.getAccY(), MPU.getGyroY());
-    Yaw.update_value(sbus.des[Ch::YAW],   MPU.getYaw(),   MPU.getAccZ(), MPU.getGyroZ());
+    Roll.update_value(sbus.des[Ch::ROLL],  mpu.getRoll(),  mpu.getAccX(), mpu.getGyroX());
+    Pitch.update_value(sbus.des[Ch::PITCH], mpu.getPitch(), mpu.getAccY(), mpu.getGyroY());
+    Yaw.update_value(sbus.des[Ch::YAW],   mpu.getYaw(),   mpu.getAccZ(), mpu.getGyroZ());
 
     // 地上局からパラメータ受信
     if (im920.read(Ground_Data)) {
