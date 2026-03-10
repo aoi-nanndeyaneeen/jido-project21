@@ -8,6 +8,12 @@ struct __attribute__((__packed__)) PlaneData {
     float gx, gy, gz;
     float altitude; 
 
+    void update(float ax_in, float ay_in, float az_in, float gx_in, float gy_in, float gz_in, float alt_in) {
+        ax = ax_in; ay = ay_in; az = az_in;
+        gx = gx_in; gy = gy_in; gz = gz_in;
+        altitude = alt_in;
+    }   
+    
     void print() const {
         Serial.printf("Accel: [%.2f, %.2f, %.2f] g\n", ax, ay, az);
         Serial.printf("Gyro : [%.2f, %.2f, %.2f] deg/s\n", gx, gy, gz);
@@ -19,6 +25,11 @@ struct __attribute__((__packed__)) GroundData {
     float p_adj, i_adj, d_adj;
     float roll, pitch, yaw;
     
+    void update(float p, float i, float d, float r, float pt, float y) {
+        p_adj = p; i_adj = i; d_adj = d;
+        roll = r; pitch = pt; yaw = y;
+    }
+
     void print() const {
         Serial.println("=== Ground Data ===");
         Serial.printf("PID Adjust: P=%.3f, I=%.3f, D=%.3f\n", p_adj, i_adj, d_adj);
@@ -65,7 +76,6 @@ bool frec() {
 }
 
 //初期値
-
     // ---- PIDゲイン設定 ----
     // setgains(kp_rate, ki_rate, kd_rate, kp_angle, ki_angle, kd_angle, sensitivity)
     //

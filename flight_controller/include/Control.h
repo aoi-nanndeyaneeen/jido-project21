@@ -25,6 +25,12 @@ public:
         kp = kp_ori + kp_adj; ki = ki_ori + ki_adj; kd = kd_ori + kd_adj;
     }
 
+    void reset() {
+    i = 0.0f;       // 積分項をゼロに
+    prev = 0.0f;    // 前回誤差をゼロに
+    d_lpf = 0.0f;   // フィルタ後の微分値もクリア
+    }
+
     float pidStep(float input, float des, float kando) {
         float dt_sec = dt / 1e6f; // Config.h で extern 宣言された dt を使用
         float PID_value = 0;
@@ -56,6 +62,11 @@ public:
 
     void update_value(float des_in, float ang_in, float acc_in, float gyr_in) {
         des = des_in; ang = ang_in; acc = acc_in; gyr = gyr_in;
+    }
+    
+    void pid_reset() {
+        c_rate.reset();
+        c_ang.reset();
     }
 
     void update_RateAnglePID(){

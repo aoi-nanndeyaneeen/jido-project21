@@ -19,7 +19,7 @@
 #include "Sensors.h"
 #include "Receiver.h"
 #include "Actuators.h"
-
+#include "Serial_com.h"
 // ============================================================
 //  飛行モード定義
 // ============================================================
@@ -47,12 +47,13 @@ Axis_value  Roll(ROLL_gain.kp_rate, ROLL_gain.ki_rate, ROLL_gain.kd_rate, ROLL_g
             Yaw(YAW_gain.kp_rate, YAW_gain.ki_rate, YAW_gain.kd_rate, YAW_gain.kp_angle, YAW_gain.ki_angle, YAW_gain.kd_angle, YAW_gain.sensitivity, YAW_gain.rate_d_alpha, YAW_gain.rate_i_limit, YAW_gain.angle_d_alpha, YAW_gain.angle_i_limit);
             //kp_rate, ki_rate, kd_rate, kp_angle, ki_angle, kd_angle, sensitivity, rate_d_alpha, rate_i_limit, angle_d_alpha, angle_i_limit
             //とってもながい
-            
+
 IMU mpu(Config::wire::mpu);
 BarometerSensor barometer(1013.25, 0.1, Config::wire::bmp);
 
 Sbus sbus(Config::serial::sbus);
 IM920SL_Generic<PlaneData, GroundData> im920(Config::serial::im920);
+
 
 PlaneData  Plane_Data;
 GroundData Ground_Data;
@@ -74,9 +75,6 @@ void       updateSensorsAndComms();
 void       manualControl();
 void       autonomousControl();
 void       writeServos(bool autonomous);
-void       print_PID(float r, float p, float y);
-void       print_MPU();
-void       print_sbus();
 
 // ============================================================
 //  setup
@@ -111,8 +109,7 @@ void loop() {
     if (currentMode != prevMode) {
         modeStartMs = millis();
         prevMode    = currentMode;
-        // 積分リセットはAxis_value経由でPIDがリセットされる
-        // (現状のPIDクラスにreset関数がないため遷移時は自然減衰に任せる)
+        Roll.pid_reset();   Pitch.pid_reset();  Yaw.pid_reset();
     }
 
     // 3) モードに応じた制御演算
@@ -140,27 +137,19 @@ void loop() {
     // 6) テレメトリ・デバッグ (1000Hz ÷ 100 = 10Hz)
     if (counter % 100 == 0) {
         barometer.update();
-        Plane_Data.ax       = mpu.getRoll();
-        Plane_Data.ay       = mpu.getPitch();
-        Plane_Data.az       = mpu.getYaw();
-        Plane_Data.gx       = mpu.getGyroX();
-        Plane_Data.gy       = mpu.getGyroY();
-        Plane_Data.gz       = mpu.getGyroZ();
-        Plane_Data.altitude = barometer.get_smoothed_altitude();
+        Plane_Data.update(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
+                         mpu.getGyroX(), mpu.getGyroY(), mpu.getGyroZ(),
+                         barometer.get_smoothed_altitude());
 
         Serial.print("\033[2J\033[H"); // ターミナルクリア
         im920.write(Plane_Data);
 
         // モード表示
-        const char* modeStr[] = {"MANUAL", "LEVEL_TURN", "FIGURE_8"};
-        Serial.print("Mode: "); Serial.print(modeStr[(int)currentMode]);
-        Serial.print("  BankAngle: "); Serial.print(BANK_ANGLE, 1);
-        Serial.print(" deg  TurnMs: "); Serial.print(TURN_MS);
-        Serial.println(" ms");
+        print_flightmode(int(currentMode), BANK_ANGLE, TURN_MS);
 
         print_PID(Roll.pid, Pitch.pid, Yaw.pid);
-        print_MPU();
-        print_sbus();
+        print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
+        print_sbus(sbus.des[Ch::ROLL], sbus.des[Ch::PITCH], sbus.des[Ch::THR], sbus.des[Ch::YAW], sbus.des[Ch::Aux1], sbus.des[Ch::Aux2], sbus.des[Ch::Aux3]);
         Ground_Data.print();
 
         Serial.print("Altitude: "); Serial.print(Plane_Data.altitude, 2);
@@ -183,7 +172,7 @@ void updateSensorsAndComms() {
     // 地上局からパラメータ受信
     if (im920.read(Ground_Data)) {
         if (Ground_Data.roll  != 0.0f) BANK_ANGLE = fabsf(Ground_Data.roll);
-        if (Ground_Data.pitch != 0.0f) TURN_MS    = (unsigned long)(Ground_Data.pitch * 1000.0f);
+        if (Ground_Data.pitch != 0.0f) TURN_MS    = (unsigned long)(Ground_Data.pitch * 1000.0f);//これやってることすごい
         // PIDゲイン調整 (Rollのレートゲインに適用)
         if (Ground_Data.p_adj != 0.0f || Ground_Data.i_adj != 0.0f || Ground_Data.d_adj != 0.0f) {
             Roll.Rate_PID_adj(Ground_Data.p_adj, Ground_Data.i_adj, Ground_Data.d_adj);
@@ -270,33 +259,3 @@ void writeServos(bool autonomous) {
     }
 }
 
-// ============================================================
-//  デバッグ表示
-// ============================================================
-void print_PID(float r, float p, float y) {
-    Serial.print("|PIDRoll= ");  Serial.print(r, 3);
-    Serial.print("|PIDPitch= "); Serial.print(p, 3);
-    Serial.print("|PIDYaw= ");   Serial.print(y, 3);
-    Serial.print("\n");
-}
-
-void print_MPU() {
-    Serial.print(Roll.ang, 2);  Serial.print(",");
-    Serial.print(Pitch.ang, 2); Serial.print(",");
-    Serial.print(Yaw.ang, 2);   Serial.print(",");
-    Serial.print(Roll.gyr, 2);  Serial.print(",");
-    Serial.print(Pitch.gyr, 2); Serial.print(",");
-    Serial.print(Yaw.gyr, 2);   Serial.print(",");
-    Serial.print("\n");
-}
-
-void print_sbus() {
-    Serial.print("|ch1(ail) = ");  Serial.print(Roll.des, 2);
-    Serial.print(" |ch2(ele) = "); Serial.print(Pitch.des, 2);
-    Serial.print(" |ch3(thr) = "); Serial.print(sbus.des[Ch::THR], 2);
-    Serial.print(" |ch4(rud) = "); Serial.print(Yaw.des, 2);
-    Serial.print(" |Aux1(flp)= "); Serial.print(sbus.des[Ch::Aux1], 2);
-    Serial.print(" |Aux2(trn)= "); Serial.print(sbus.des[Ch::Aux2], 2);
-    Serial.print(" |Aux3(fig)= "); Serial.print(sbus.des[Ch::Aux3], 2);
-    Serial.print("\n");
-}
