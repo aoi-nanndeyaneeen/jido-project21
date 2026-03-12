@@ -1,6 +1,7 @@
 //設定
 #pragma once
 #include <Arduino.h>
+#include <Wire.h>
 
 // ==== 通信用の構造体 ====
 struct __attribute__((__packed__)) PlaneData {
@@ -56,24 +57,20 @@ enum Ch {
   ROLL,PITCH,THR,YAW,Aux1,THR_CUT,Aux2,Aux3,Aux4,Aux5
 };
 
-// ==== タイミング制御 ====
-constexpr float FREQUENCY = 1000.0f;  //(Hz)とっても大事！！！制御周期！！！
-constexpr unsigned long PERIOD = 1*1e6f/FREQUENCY;//microに合わせた一周期当たりの時間
-inline unsigned long dt;
-inline int counter;
+enum FlightMode : uint8_t {
+    MODE_MANUAL     = 0,  // プロポ直接操作
+    MODE_LEVEL_TURN = 1,  // 自動水平旋回
+    MODE_FIGURE_8   = 2,  // 8の字飛行
+};
 
-bool frec() {
-    static u_int32_t t_prev = micros();
-    u_int32_t t_now = micros();
-    dt = t_now - t_prev;
-    if (dt < PERIOD) return false;
 
-    t_prev = t_now;
-    if (counter == 1000) counter = 1; else counter++;
-    if (dt > PERIOD*1.01) Serial.println(dt);
+// ============================================================
+//  自律飛行パラメータ
+// ============================================================
+inline float         BANK_ANGLE = 40.0f;    // バンク角 [deg]
+inline unsigned long TURN_MS    = 4000UL;   // 8の字の片道時間 [ms]
+inline unsigned long modeStartMs = 0;
 
-    return true;
-}
 
 //初期値
     // ---- PIDゲイン設定 ----
@@ -101,5 +98,38 @@ namespace Config {
     namespace wire {
         inline TwoWire *const mpu = &Wire;   // MPU用I2Cポート
         inline TwoWire *const bmp = &Wire1;  // 気圧センサ用I2Cポート
+    }
+
+    namespace Timing {
+        // ==== タイミング制御 ====
+        constexpr int MAIN_Hz = 1000;  //(Hz)とっても大事！！！制御周期！！！
+        constexpr int DEBUG_Hz = 10;   //(Hz)デバッグ周期
+        constexpr unsigned long MAIN_PERIOD = 1000000UL / MAIN_Hz; // 周期 [us]
+        inline unsigned long Main_dt = 1/MAIN_Hz; // センサ更新周期 (us)
+
+        template <int Hz>
+        bool freq(unsigned long &dt) {
+            static uint32_t t_prev = 0;
+            constexpr uint32_t period = 1000000UL / Hz;
+            
+            uint32_t t_now = micros();
+            if (t_now - t_prev < period) return false;
+
+            t_prev = t_now;
+            dt = t_now - t_prev;
+            return true;
+        }
+
+        template <int Hz>
+        bool freq() {
+            static uint32_t t_prev = 0;
+            constexpr uint32_t period = 1000000UL / Hz;
+            
+            uint32_t t_now = micros();
+            if (t_now - t_prev < period) return false;
+
+            t_prev = t_now;
+            return true;
+        }
     }
 }

@@ -20,23 +20,9 @@
 #include "Receiver.h"
 #include "Actuators.h"
 #include "Serial_com.h"
-// ============================================================
-//  飛行モード定義
-// ============================================================
-enum FlightMode : uint8_t {
-    MODE_MANUAL     = 0,  // プロポ直接操作
-    MODE_LEVEL_TURN = 1,  // 自動水平旋回
-    MODE_FIGURE_8   = 2,  // 8の字飛行
-};
-FlightMode currentMode = MODE_MANUAL;
-FlightMode prevMode    = MODE_MANUAL;  // モード変化検出用
 
-// ============================================================
-//  自律飛行パラメータ
-// ============================================================
-float         BANK_ANGLE = 40.0f;    // バンク角 [deg]
-unsigned long TURN_MS    = 4000UL;   // 8の字の片道時間 [ms]
-unsigned long modeStartMs = 0;
+namespace T = Config::Timing; // T に凝縮
+
 
 // ============================================================
 //  インスタンス生成
@@ -58,6 +44,8 @@ IM920SL_Generic<PlaneData, GroundData> im920(Config::serial::im920);
 PlaneData  Plane_Data;
 GroundData Ground_Data;
 
+FlightMode currentMode = MODE_MANUAL;
+FlightMode prevMode    = MODE_MANUAL;  // モード変化検出用
 
 RC_servo Ail1(1, 0.0, -1.0, 1.0),
          Ail2(6, 0.0, -1.0, 1.0),
@@ -97,45 +85,44 @@ void setup() {
 //  loop
 // ============================================================
 void loop() {
-    if (!frec()) return; // 周期制御 (1000Hz)
+    if (T::freq<T::MAIN_Hz>(T::Main_dt)){// 周期制御 (1000Hz)}
+        // 1) センサ・受信機・通信の更新
+        updateSensorsAndComms();
 
-    // 1) センサ・受信機・通信の更新
-    updateSensorsAndComms();
+        // 2) モード判定
+        currentMode = getFlightMode();
 
-    // 2) モード判定
-    currentMode = getFlightMode();
+        // モード切替時にPIリセットとタイマ更新
+        if (currentMode != prevMode) {
+            modeStartMs = millis();
+            prevMode    = currentMode;
+            Roll.pid_reset();   Pitch.pid_reset();  Yaw.pid_reset();
+        }
 
-    // モード切替時にPIリセットとタイマ更新
-    if (currentMode != prevMode) {
-        modeStartMs = millis();
-        prevMode    = currentMode;
-        Roll.pid_reset();   Pitch.pid_reset();  Yaw.pid_reset();
+        // 3) モードに応じた制御演算
+        if (currentMode == MODE_MANUAL) {
+            manualControl();
+            writeServos(false);
+        } else {
+            autonomousControl();
+            writeServos(true);
+        }
+
+        // 4) スロットル出力 (モード問わずスティック入力)
+        if (sbus.isSafe()) {
+            Thr_r.write(sbus.des[Ch::THR]);
+            Thr_l.write(sbus.des[Ch::THR]);
+        } else {
+            Thr_r.write(0);
+            Thr_l.write(0);
+        }
+
+        // 5) フラップ
+        Flp1.flap(sbus.Ch_state(Aux1));
+        Flp2.flap(sbus.Ch_state(Aux1));
     }
-
-    // 3) モードに応じた制御演算
-    if (currentMode == MODE_MANUAL) {
-        manualControl();
-        writeServos(false);
-    } else {
-        autonomousControl();
-        writeServos(true);
-    }
-
-    // 4) スロットル出力 (モード問わずスティック入力)
-    if (sbus.isSafe()) {
-        Thr_r.write(sbus.des[Ch::THR]);
-        Thr_l.write(sbus.des[Ch::THR]);
-    } else {
-        Thr_r.write(0);
-        Thr_l.write(0);
-    }
-
-    // 5) フラップ
-    Flp1.flap(sbus.Ch_state(Aux1));
-    Flp2.flap(sbus.Ch_state(Aux1));
-
     // 6) テレメトリ・デバッグ (1000Hz ÷ 100 = 10Hz)
-    if (counter % 100 == 0) {
+    if (T::freq<T::DEBUG_Hz>()){// 周期制御 (10Hz){
         barometer.update();
         Plane_Data.update(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
                          mpu.getGyroX(), mpu.getGyroY(), mpu.getGyroZ(),
@@ -232,8 +219,8 @@ void autonomousControl() {
     // --- 角度外ループ + レート内ループ (Control.hのupdate_RateAnglePID使用) ---
     //   角度PID: 100Hzで目標レートを算出 (counter%10)
     //   レートPID: 1000Hzでサーボ指令を算出
-    Roll.update_RateAnglePID();
-    Pitch.update_RateAnglePID();
+    Roll.update_RateAnglePID(Roll.des);
+    Pitch.update_RateAnglePID(Pitch.des);
 
     // --- 協調ラダー: バンク角に比例してラダーを打つ ---
     //   係数(0.05f)は実機でのスリップ量を見ながら調整

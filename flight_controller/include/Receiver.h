@@ -14,9 +14,9 @@ private:
     int connection_fail;
 
     float scaleToUnit(float raw) {
-        const float minVal = 360.0f;
-        const float midVal = 1040.0f;
-        const float maxVal = 1680.0f;
+        constexpr float minVal = 360.0f;
+        constexpr float midVal = 1040.0f;
+        constexpr float maxVal = 1680.0f;
 
         // 範囲外をガード
         raw = constrain(raw, minVal, maxVal);

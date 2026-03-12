@@ -24,7 +24,7 @@ public:
         wire->begin();
         wire->setClock(400000);
         mpu.initialize();
-        filter.begin(FREQUENCY);
+        filter.begin(Config::Timing::MAIN_Hz);
         mpu.setXAccelOffset(0);
         mpu.setYAccelOffset(0);
         mpu.setZAccelOffset(0);
