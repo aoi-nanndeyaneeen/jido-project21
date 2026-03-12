@@ -2,7 +2,7 @@
 #pragma once
 #include <Arduino.h>
 #include <Servo.h>
-
+#include "Config.h"
 class RC_servo{
   private:
   int _pin;
