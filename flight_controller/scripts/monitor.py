@@ -21,6 +21,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 import sys
@@ -33,28 +34,33 @@ AUTO_DETECT  = True
 MANUAL_PORT  = "COM14"
 LOGS_DIR     = Path(__file__).parent.parent / "logs"
 
-ACCEL_SCALE  = 16384.0   # ±2g
+ACCEL_SCALE  = 16384.0   # ±2g (レジスタ確認後に要調整: ±8gなら4096.0)
 GYRO_SCALE   = 131.0     # ±250dps
-PLOT_SECONDS = 5.0        # グラフの表示幅 [秒]
-SAMPLE_RATE  = 50         # Teensy送信レート [Hz]
+PLOT_SECONDS = 5.0
+SAMPLE_RATE  = 50
 PLOT_POINTS  = int(PLOT_SECONDS * SAMPLE_RATE)
 
 # ============================================================
 #  状態管理
 # ============================================================
-# オフセット（キャリブレーションで更新）
-offset = np.zeros(6)          # [ax,ay,az,gx,gy,gz] の生値オフセット
-offset[2] = ACCEL_SCALE       # az は +1g(=16384)が理想なので差し引く
+# オフセットは全軸0スタート（重力を引かない・生値をそのまま表示）
+# Rキーで水平静止キャリブ後にaz_offset=-az_rawになり重力除去される
+offset = np.zeros(6)
+# ※ 水平静止時にazが1.0gになるかどうかでスケールを確認する
+#   1.0g → ACCEL_SCALE=16384 正しい
+#   0.25g → ACCEL_SCALE=4096 に変更（±8g設定になっている）
+#   0.5g → ACCEL_SCALE=8192 に変更（±4g設定）
 
 # リングバッファ
-buf_time  = np.zeros(PLOT_POINTS)
-buf_ax    = np.zeros(PLOT_POINTS)
-buf_ay    = np.zeros(PLOT_POINTS)
-buf_az    = np.zeros(PLOT_POINTS)
-buf_gx    = np.zeros(PLOT_POINTS)
-buf_gy    = np.zeros(PLOT_POINTS)
-buf_gz    = np.zeros(PLOT_POINTS)
-buf_norm  = np.zeros(PLOT_POINTS)
+# dequeでリングバッファ（numpy rollより高速でフリーズしない）
+buf_time  = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
+buf_ax    = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
+buf_ay    = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
+buf_az    = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
+buf_gx    = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
+buf_gy    = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
+buf_gz    = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
+buf_norm  = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
 
 lock         = threading.Lock()
 calib_flag   = False    # Rキーでセット
@@ -89,14 +95,10 @@ def find_port():
 def serial_thread(ser):
     global offset, calib_flag, calib_buf, sample_count, t_start
 
-    # READY待ち
-    print("Teensy起動待ち...", end="", flush=True)
-    while True:
-        line = ser.readline().decode("utf-8", errors="replace").strip()
-        if line == "READY":
-            print(" OK")
-            break
-
+    # Teensy4.0はUSB接続でリセットしないためREADY待ちは不要
+    # バッファをフラッシュして即受信開始
+    ser.reset_input_buffer()
+    print("受信開始")
     t_start = time.time()
 
     while True:
@@ -121,14 +123,14 @@ def serial_thread(ser):
                         offset = new_offset
                     norm_after = np.linalg.norm(
                         (mean[:3] - new_offset[:3]) / ACCEL_SCALE)
-                    print(f"\n[キャリブ完了] |a|={norm_after:.4f}g  "
+                    print(f"\n[Calib done] |a|={norm_after:.4f}g  "
                           f"offset={new_offset[:3].astype(int)}")
                     if norm_after > 1.8:
-                        print("[WARN] まだ≈2g → スケール設定を確認")
+                        print("[WARN] still ~2g -> check scale setting")
                     elif norm_after < 0.5:
-                        print("[ERROR] ≈0g → センサ故障の可能性")
+                        print("[ERROR] ~0g -> sensor may be broken")
                     else:
-                        print("[OK] ≈1g → 正常")
+                        print("[OK] ~1g -> normal")
                     calib_buf.clear()
                     calib_flag = False
                 continue
@@ -137,7 +139,7 @@ def serial_thread(ser):
             with lock:
                 off = offset.copy()
             ax = (ax_r - off[0]) / ACCEL_SCALE
-            ay = (ay_r - off[1]) / ACCEL_SCALE
+            ay = -(ay_r - off[1]) / ACCEL_SCALE  # Y軸反転
             az = (az_r - off[2]) / ACCEL_SCALE
             gx = (gx_r - off[3]) / GYRO_SCALE
             gy = (gy_r - off[4]) / GYRO_SCALE
@@ -145,16 +147,11 @@ def serial_thread(ser):
             norm = np.sqrt(ax**2 + ay**2 + az**2)
             t    = time.time() - t_start
 
-            # バッファ更新（ロールシフト）
             with lock:
-                buf_time[:-1] = buf_time[1:]; buf_time[-1] = t
-                buf_ax[:-1]   = buf_ax[1:];   buf_ax[-1]   = ax
-                buf_ay[:-1]   = buf_ay[1:];   buf_ay[-1]   = ay
-                buf_az[:-1]   = buf_az[1:];   buf_az[-1]   = az
-                buf_gx[:-1]   = buf_gx[1:];   buf_gx[-1]   = gx
-                buf_gy[:-1]   = buf_gy[1:];   buf_gy[-1]   = gy
-                buf_gz[:-1]   = buf_gz[1:];   buf_gz[-1]   = gz
-                buf_norm[:-1] = buf_norm[1:]; buf_norm[-1] = norm
+                buf_time.append(t)
+                buf_ax.append(ax); buf_ay.append(ay); buf_az.append(az)
+                buf_gx.append(gx); buf_gy.append(gy); buf_gz.append(gz)
+                buf_norm.append(norm)
                 sample_count += 1
 
             # ログ書き込み
@@ -201,10 +198,9 @@ def keyboard_thread():
 #  グラフ設定
 # ============================================================
 fig, (ax_plot, gyro_plot) = plt.subplots(2, 1, figsize=(10, 7))
-fig.suptitle("MPU6050 リアルタイムモニタ  |  R=キャリブ  L=ログ  Q=終了",
-             fontsize=11)
+fig.suptitle("MPU6050 Monitor  |  R=Calib  L=Log  Q=Quit", fontsize=11)
 
-ax_plot.set_title("加速度 [g]")
+ax_plot.set_title("Accelerometer [g]")
 ax_plot.set_ylim(-2.2, 2.2)
 ax_plot.axhline(1.0,  color="gray", lw=0.5, ls="--")
 ax_plot.axhline(-1.0, color="gray", lw=0.5, ls="--")
@@ -212,11 +208,11 @@ ax_plot.axhline(0.0,  color="gray", lw=0.5)
 ax_plot.set_ylabel("[g]")
 ax_plot.grid(True, alpha=0.3)
 
-gyro_plot.set_title("ジャイロ [dps]")
+gyro_plot.set_title("Gyroscope [dps]")
 gyro_plot.set_ylim(-300, 300)
 gyro_plot.axhline(0.0, color="gray", lw=0.5)
 gyro_plot.set_ylabel("[dps]")
-gyro_plot.set_xlabel("時間 [s]")
+gyro_plot.set_xlabel("Time [s]")
 gyro_plot.grid(True, alpha=0.3)
 
 line_ax,   = ax_plot.plot([], [], "r-",  lw=1.2, label="ax")
@@ -237,10 +233,10 @@ norm_text = ax_plot.text(0.02, 0.92, "", transform=ax_plot.transAxes,
 
 def update_plot(_):
     with lock:
-        t   = buf_time.copy()
-        _ax = buf_ax.copy(); _ay = buf_ay.copy(); _az = buf_az.copy()
-        _gx = buf_gx.copy(); _gy = buf_gy.copy(); _gz = buf_gz.copy()
-        _nm = buf_norm.copy()
+        t   = np.array(buf_time)
+        _ax = np.array(buf_ax); _ay = np.array(buf_ay); _az = np.array(buf_az)
+        _gx = np.array(buf_gx); _gy = np.array(buf_gy); _gz = np.array(buf_gz)
+        _nm = np.array(buf_norm)
 
     if t[-1] == 0:
         return line_ax, line_ay, line_az, line_norm, line_gx, line_gy, line_gz, norm_text
