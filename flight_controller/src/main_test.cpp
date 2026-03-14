@@ -41,8 +41,8 @@ void setup() {
         bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
                         Adafruit_BMP280::SAMPLING_X2,   // 温度: 少し上げる
                         Adafruit_BMP280::SAMPLING_X16,  // 気圧: 最大オーバーサンプリング
-                        Adafruit_BMP280::FILTER_X16,    // IIRフィルタ最大
-                        Adafruit_BMP280::STANDBY_MS_500); // 500ms待機 → 約2Hz更新
+                        Adafruit_BMP280::FILTER_X2,     // IIRフィルタを最小限にして遅延を減らす
+                        Adafruit_BMP280::STANDBY_MS_1); // 1ms待機 → 高速サンプリング
     }
     delay(300);
     Serial.println("READY");

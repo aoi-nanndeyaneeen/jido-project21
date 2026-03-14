@@ -61,8 +61,8 @@ class AltitudeKalman:
         # BMP280が遅くて正確(2Hz, σ≈0.1m) → R_baro小さく強く信頼
         # 加速度が速くて積分誤差あり → Q_vz大きく速度変化を許容
         self.Q_z    = 0.001  # 高度プロセスノイズ
-        self.Q_vz   = 0.1    # 速度プロセスノイズ
-        self.R_baro = 0.01   # BMP280観測ノイズ(σ≈0.1m → σ²=0.01)
+        self.Q_vz   = 0.2    # 速度プロセスノイズ (0.1 -> 0.2: 垂直方向の機敏さ向上)
+        self.R_baro = 0.05   # BMP280観測ノイズ (0.01 -> 0.05: ハードウェアフィルタ削減によるノイズ増加への対応)
 
     def init(self, alt):
         self.z = alt; self.vz = 0.0
