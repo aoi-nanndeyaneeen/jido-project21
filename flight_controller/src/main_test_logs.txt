@@ -1,0 +1,266 @@
+// ============================================================
+// src/main_test.cpp
+// SDカードなし版: シリアルにCSVを流し、PC側のlogger.pyが保存
+//
+// 【シリアルコマンド】(シリアルモニタから1文字送信)
+//   L : ログ開始/停止
+//   R : オフセットキャリブレーション再実行
+//   P : 現在値スナップショット表示
+// ============================================================
+#include <Arduino.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <Adafruit_BMP280.h>
+#include <MadgwickAHRS.h>
+
+// ============================================================
+//  設定
+// ============================================================
+constexpr float        LOOP_HZ = 200.0f;
+constexpr unsigned long PERIOD  = (unsigned long)(1e6f / LOOP_HZ);
+float sea_level_hpa              = 1013.25f; // ← 天気予報の現在気圧に変更
+
+// ============================================================
+//  カルマンフィルタ
+// ============================================================
+class AltitudeKalman {
+public:
+    // 1行ずつ宣言して、確実にpublicにする！
+    float Q_z = 0.001f;
+    float Q_vz = 0.01f;
+    float R_baro = 0.25f;
+    float z_est = 0.0f;
+    float vz_est = 0.0f;
+
+    void init(float alt) {
+        z_est = alt;
+        vz_est = 0.0f;
+        // 半角スペースと半角記号で打ち直した安全な配列初期化
+        P[0][0] = 1.0f;
+        P[0][1] = 0.0f;
+        P[1][0] = 0.0f;
+        P[1][1] = 1.0f;
+    }
+    
+    void update(float dt, float az_w, float baro) {
+        float zp = z_est + vz_est * dt + 0.5f * az_w * dt * dt;
+        float vzp = vz_est + az_w * dt;
+        float P00 = P[0][0] + dt * (P[1][0] + P[0][1]) + dt * dt * P[1][1] + Q_z;
+        float P01 = P[0][1] + dt * P[1][1];
+        float P10 = P[1][0] + dt * P[1][1];
+        float P11 = P[1][1] + Q_vz;
+        float S = P00 + R_baro;
+        float K0 = P00 / S;
+        float K1 = P10 / S;
+        float inn = baro - zp;
+        
+        z_est = zp + K0 * inn;
+        vz_est = vzp + K1 * inn;
+        
+        P[0][0] = (1 - K0) * P00;
+        P[0][1] = (1 - K0) * P01;
+        P[1][0] = -K1 * P00 + P10;
+        P[1][1] = -K1 * P01 + P11;
+    }
+private:
+    float P[2][2];
+};
+
+// ============================================================
+//  グローバル
+// ============================================================
+MPU6050         mpu(0x68);
+Adafruit_BMP280 bmp(&Wire1);
+Madgwick        madgwick;
+AltitudeKalman  kalman;
+
+const float ACCEL_SCALE=16384.0f, GYRO_SCALE=131.0f;
+int16_t ax_r,ay_r,az_r,gx_r,gy_r,gz_r;
+float ax,ay,az,gx,gy,gz;
+float baro_alt=0, az_world=0;
+unsigned long t_prev=0, log_start_ms=0;
+int  counter=0;
+bool mpu_ok=false, bmp_ok=false, logging=false;
+
+// ============================================================
+//  出力ヘルパー: ログ中は "DATA," プレフィックス付きで出力
+//  logger.py は "DATA," で始まる行だけCSVに保存する
+// ============================================================
+void printData() {
+    // "DATA,time_ms,ax,ay,az,gx,gy,gz,roll,pitch,yaw,baro,kalman_z,kalman_vz,az_world"
+    Serial.printf("DATA,%lu,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.4f\n",
+        millis() - log_start_ms,
+        ax, ay, az, gx, gy, gz,
+        madgwick.getRoll(), madgwick.getPitch(), madgwick.getYaw(),
+        baro_alt, kalman.z_est, kalman.vz_est, az_world);
+}
+
+// ============================================================
+//  オフセットキャリブレーション
+// ============================================================
+void calibrate_offsets() {
+    Serial.println("INFO: キャリブレーション中 (静止 200サンプル)...");
+    long s_ax=0,s_ay=0,s_az=0,s_gx=0,s_gy=0,s_gz=0;
+    for(int i=0;i<200;i++){
+        mpu.getMotion6(&ax_r,&ay_r,&az_r,&gx_r,&gy_r,&gz_r);
+        s_ax+=ax_r;s_ay+=ay_r;s_az+=az_r;
+        s_gx+=gx_r;s_gy+=gy_r;s_gz+=gz_r;
+        delay(5);
+    }
+    float m_ax=s_ax/200.0f,m_ay=s_ay/200.0f,m_az=s_az/200.0f;
+    float m_gx=s_gx/200.0f,m_gy=s_gy/200.0f,m_gz=s_gz/200.0f;
+
+    mpu.setXAccelOffset((int16_t)(-m_ax/8));
+    mpu.setYAccelOffset((int16_t)(-m_ay/8));
+    mpu.setZAccelOffset((int16_t)(-(m_az-16384.0f)/8));
+    mpu.setXGyroOffset((int16_t)(-m_gx/4));
+    mpu.setYGyroOffset((int16_t)(-m_gy/4));
+    mpu.setZGyroOffset((int16_t)(-m_gz/4));
+
+    float a_norm = sqrtf((m_ax/ACCEL_SCALE)*(m_ax/ACCEL_SCALE)
+                       + (m_ay/ACCEL_SCALE)*(m_ay/ACCEL_SCALE)
+                       + (m_az/ACCEL_SCALE)*(m_az/ACCEL_SCALE));
+    Serial.printf("INFO: キャリブ前合力=%.4fg  az生値=%.0f (16384が理想)\n", a_norm, m_az);
+
+    if (fabsf(m_az) < 8000.0f)
+        Serial.println("INFO: [WARN] センサが傾いています。水平に置いてRで再実行してください。");
+
+    delay(200);
+    // 確認
+    s_ax=0;s_ay=0;s_az=0;
+    for(int i=0;i<50;i++){
+        mpu.getMotion6(&ax_r,&ay_r,&az_r,&gx_r,&gy_r,&gz_r);
+        s_ax+=ax_r;s_ay+=ay_r;s_az+=az_r; delay(5);
+    }
+    m_ax=s_ax/50.0f;m_ay=s_ay/50.0f;m_az=s_az/50.0f;
+    a_norm = sqrtf((m_ax/ACCEL_SCALE)*(m_ax/ACCEL_SCALE)
+                 + (m_ay/ACCEL_SCALE)*(m_ay/ACCEL_SCALE)
+                 + (m_az/ACCEL_SCALE)*(m_az/ACCEL_SCALE));
+    Serial.printf("INFO: キャリブ後合力=%.4fg  ax=%.4f ay=%.4f az=%.4f\n",
+                  a_norm, m_ax/ACCEL_SCALE, m_ay/ACCEL_SCALE, m_az/ACCEL_SCALE);
+    Serial.println("INFO: キャリブレーション完了");
+}
+
+// ============================================================
+//  初期化
+// ============================================================
+void mpu_init() {
+    Serial.println("INFO: MPU6050 初期化中...");
+    mpu.initialize();
+    if (!mpu.testConnection()) { Serial.println("INFO: [ERROR] MPU6050 応答なし"); return; }
+    mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+    mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+    delay(100);
+    Serial.printf("INFO: FS確認 accel=%d(0=±2g) gyro=%d(0=±250dps)\n",
+                  mpu.getFullScaleAccelRange(), mpu.getFullScaleGyroRange());
+    calibrate_offsets();
+    mpu_ok = true;
+}
+
+void bmp_init() {
+    Serial.println("INFO: BMP280 初期化中...");
+    bmp_ok = bmp.begin(0x76);
+    if (!bmp_ok) bmp_ok = bmp.begin(0x77);
+    if (!bmp_ok) { Serial.println("INFO: [ERROR] BMP280 応答なし"); return; }
+    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                    Adafruit_BMP280::SAMPLING_X1,
+                    Adafruit_BMP280::SAMPLING_X4,
+                    Adafruit_BMP280::FILTER_X16,
+                    Adafruit_BMP280::STANDBY_MS_1);
+    delay(200);
+    float sum=0;
+    for(int i=0;i<50;i++){ sum+=bmp.readAltitude(sea_level_hpa); delay(10); }
+    baro_alt = sum/50.0f;
+    kalman.init(baro_alt);
+    Serial.printf("INFO: BMP280 初期高度=%.3fm\n", baro_alt);
+    bmp_ok = true;
+}
+
+// ============================================================
+//  スナップショット表示
+// ============================================================
+void printSnapshot() {
+    Serial.println("INFO: ===== スナップショット =====");
+    Serial.printf("INFO: 加速度[g]  ax=%+.4f  ay=%+.4f  az=%+.4f  |a|=%.4f\n",
+                  ax,ay,az, sqrtf(ax*ax+ay*ay+az*az));
+    Serial.printf("INFO: ジャイロ   gx=%+.3f  gy=%+.3f  gz=%+.3f  dps\n",gx,gy,gz);
+    Serial.printf("INFO: 姿勢角     Roll=%+.2f  Pitch=%+.2f  Yaw=%+.2f deg\n",
+                  madgwick.getRoll(),madgwick.getPitch(),madgwick.getYaw());
+    Serial.printf("INFO: 高度       baro=%.3f  kalman=%.3f  vz=%.3f m/s\n",
+                  baro_alt,kalman.z_est,kalman.vz_est);
+    Serial.println("INFO: 【軸確認】水平置き→az≈+1g / 手前90°→ax≈+1g / 右90°→ay≈-1g");
+    Serial.println("INFO: =========================");
+}
+
+// ============================================================
+//  setup
+// ============================================================
+void setup() {
+    Serial.begin(115200);
+    while(!Serial && millis()<3000){}
+
+    Wire.begin();  Wire.setClock(400000);
+    Wire1.begin(); Wire1.setClock(400000);
+    delay(300);
+
+    Serial.println("INFO: === Sensor Test + Logger ===");
+    Serial.println("INFO: コマンド: L=ログ開始/停止  R=キャリブ再実行  P=スナップショット");
+    Serial.printf ("INFO: 海面気圧=%.2f hPa\n", sea_level_hpa);
+
+    mpu_init();
+    bmp_init();
+    if(mpu_ok) madgwick.begin(LOOP_HZ);
+
+    // logger.py へのCSVヘッダ通知 (HEADER, で始まる行をヘッダとして使う)
+    Serial.println("HEADER,time_ms,ax,ay,az,gx,gy,gz,roll,pitch,yaw,baro_alt,kalman_alt,kalman_vz,az_world");
+    Serial.println("INFO: 準備完了");
+
+    t_prev = micros();
+}
+
+// ============================================================
+//  loop
+// ============================================================
+void loop() {
+    // コマンド受付
+    if (Serial.available()) {
+        char c = toupper(Serial.read());
+        if (c=='L') {
+            logging = !logging;
+            if (logging) {
+                log_start_ms = millis();
+                // logger.pyへログ開始シグナル
+                Serial.println("LOG_START");
+            } else {
+                Serial.println("LOG_STOP");
+            }
+        }
+        if (c=='R') calibrate_offsets();
+        if (c=='P') printSnapshot();
+    }
+
+    unsigned long t_now = micros();
+    if (t_now - t_prev < PERIOD) return;
+    float dt = (t_now - t_prev) / 1e6f;
+    t_prev = t_now;
+    counter++;
+
+    if (!mpu_ok || !bmp_ok) { delay(500); return; }
+
+    mpu.getMotion6(&ax_r,&ay_r,&az_r,&gx_r,&gy_r,&gz_r);
+    ax=ax_r/ACCEL_SCALE; ay=ay_r/ACCEL_SCALE; az=az_r/ACCEL_SCALE;
+    gx=gx_r/GYRO_SCALE;  gy=gy_r/GYRO_SCALE;  gz=gz_r/GYRO_SCALE;
+
+    madgwick.updateIMU(gx,gy,gz,ax,ay,az);
+
+    float roll_r=madgwick.getRoll()*M_PI/180.0f;
+    float pitch_r=madgwick.getPitch()*M_PI/180.0f;
+    az_world=(az*cosf(roll_r)*cosf(pitch_r)-1.0f)*9.80665f;
+
+    if (counter%10==0) baro_alt=bmp.readAltitude(sea_level_hpa);
+
+    kalman.update(dt, az_world, baro_alt);
+
+    // 10Hz でデータ出力
+    if (counter%20==0) printData();
+}

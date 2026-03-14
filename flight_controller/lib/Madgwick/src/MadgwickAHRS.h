@@ -40,6 +40,7 @@ private:
 public:
     Madgwick(void);
     void begin(float sampleFrequency) { invSampleFreq = 1.0f / sampleFrequency; }
+    void reset() { q0 = 1.0f; q1 = 0.0f; q2 = 0.0f; q3 = 0.0f; anglesComputed = 0; }
     void update(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz);
     void updateIMU(float gx, float gy, float gz, float ax, float ay, float az);
     //float getPitch(){return atan2f(2.0f * q2 * q3 - 2.0f * q0 * q1, 2.0f * q0 * q0 + 2.0f * q3 * q3 - 1.0f);};
@@ -55,7 +56,7 @@ public:
     }
     float getYaw() {
         if (!anglesComputed) computeAngles();
-        return yaw * 57.29578f + 180.0f;
+        return yaw * 57.29578f;
     }
     float getRollRadians() {
         if (!anglesComputed) computeAngles();

@@ -3,3 +3,10 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+.vscode/settings.json
+# PlatformIO & AI Cache
+.pio/
+.vscode/
+.cache/
+.clangd/
+compile_commands.json
