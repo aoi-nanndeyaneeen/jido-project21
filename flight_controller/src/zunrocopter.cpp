@@ -113,13 +113,14 @@ void loop() {
     }
     // 6) テレメトリ・デバッグ (1000Hz ÷ 100 = 10Hz)
     if (T::freq<T::DEBUG_Hz>()){// 周期制御 (10Hz){
-        barometer.update();
+        //barometer.update();
         Plane_Data.update(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
                          mpu.getGyroX(), mpu.getGyroY(), mpu.getGyroZ(),
-                         barometer.get_smoothed_altitude());
+                         //barometer.get_smoothed_altitude()
+                         0.0f);
 
         Serial.print("\033[2J\033[H"); // ターミナルクリア
-        im920.write(Plane_Data);
+        //im920.write(Plane_Data);
 
         // モード表示
         print_flightmode(int(Mode.get_mode()), BANK_ANGLE, TURN_MS);
@@ -127,9 +128,9 @@ void loop() {
         print_PID(Roll.pid, Pitch.pid, Yaw.pid);
         print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
         print_sbus(sbus.des[Ch::ROLL], sbus.des[Ch::PITCH], sbus.des[Ch::THR], sbus.des[Ch::YAW], sbus.des[Ch::Aux1], sbus.des[Ch::Aux2], sbus.des[Ch::Aux3]);
-        Ground_Data.print();
+        //Ground_Data.print();
 
-        Serial.print("Altitude: "); Serial.print(Plane_Data.altitude, 2);
+        //Serial.print("Altitude: "); Serial.print(Plane_Data.altitude, 2);
         Serial.println(" m");
     }
 }

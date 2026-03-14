@@ -54,13 +54,14 @@ enum Sw {
 };
 
 enum Ch {
-  ROLL,PITCH,THR,YAW,Aux1,THR_CUT,Aux2,Aux3,Aux4,Aux5
+  ROLL,PITCH,THR,YAW,Aux1,Aux2,THR_CUT,Aux3,Aux4,Aux5
 };
 
 enum FlightMode : uint8_t {
     MODE_MANUAL     = 0,  // プロポ直接操作
     MODE_LEVEL_TURN = 1,  // 自動水平旋回
     MODE_FIGURE_8   = 2,  // 8の字飛行
+    MODE_SEMI_MANUAL= 4,
 };
 
 
@@ -69,7 +70,7 @@ enum FlightMode : uint8_t {
 // ============================================================
 inline float         BANK_ANGLE = 40.0f;    // バンク角 [deg]
 inline unsigned long TURN_MS    = 4000UL;   // 8の字の片道時間 [ms]
-inline unsigned long modeStartMs = 0;
+
 
 
 //初期値
