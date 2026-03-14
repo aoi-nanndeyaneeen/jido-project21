@@ -116,12 +116,11 @@ namespace Config {
         constexpr int16_t GYRO_Y_OFFSET  = 0;
         constexpr int16_t GYRO_Z_OFFSET  = 0;
 
-        // BMP280 気圧センサ設定
-        // 理想的な10Hz更新設定 (STANDBY_MS_63 + FILTER_X4)
-        constexpr auto BMP_STANDBY = Adafruit_BMP280::STANDBY_MS_63;
-        constexpr auto BMP_FILTER  = Adafruit_BMP280::FILTER_X4;
-        constexpr auto BMP_SAMP_P  = Adafruit_BMP280::SAMPLING_X16;
-        constexpr auto BMP_SAMP_T  = Adafruit_BMP280::SAMPLING_X2;
+        // BMP280 気圧センサー設定 (main_test の実績値に合わせる)
+        constexpr auto BMP_STANDBY = Adafruit_BMP280::STANDBY_MS_1;
+        constexpr auto BMP_FILTER  = Adafruit_BMP280::FILTER_X16;
+        constexpr auto BMP_SAMP_P  = Adafruit_BMP280::SAMPLING_X4;
+        constexpr auto BMP_SAMP_T  = Adafruit_BMP280::SAMPLING_X1;
     }
 
     namespace Timing {

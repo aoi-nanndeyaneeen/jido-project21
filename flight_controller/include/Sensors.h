@@ -61,12 +61,12 @@ public:
         delay(100);
 
         long s_ax=0, s_ay=0, s_az=0, s_gx=0, s_gy=0, s_gz=0;
-        const int samples = 100;
+        const int samples = 200;
         for(int i=0; i<samples; i++) {
             mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
             s_ax+=ax; s_ay+=ay; s_az+=az;
             s_gx+=gx; s_gy+=gy; s_gz+=gz;
-            delay(2);
+            delay(5);
         }
         // MPU6050のハードウェアオフセットレジスタへの書き込み
         // accelは/8、gyroは/4のスケール調整が必要（チップの仕様）

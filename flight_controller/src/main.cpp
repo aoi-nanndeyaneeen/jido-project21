@@ -85,7 +85,7 @@ void setup() {
 //  loop
 // ============================================================
 void loop() {
-    if (T::freq<T::MAIN_Hz>(T::Main_dt)){// 周期制御 (1000Hz)}
+    if (T::freq<T::MAIN_Hz>(T::Main_dt)){// 周期制御 (1000Hz)
         // 1) センサ・受信機・通信の更新
         updateSensorsAndComms();
 
@@ -120,27 +120,33 @@ void loop() {
         // 5) フラップ
         Flp1.flap(sbus.Ch_state(Aux1));
         Flp2.flap(sbus.Ch_state(Aux1));
-    }
-    // 6) テレメトリ・デバッグ (1000Hz ÷ 100 = 10Hz)
-    if (T::freq<T::DEBUG_Hz>()){// 周期制御 (10Hz){
-        barometer.update();
-        Plane_Data.update(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
-                         mpu.getGyroX(), mpu.getGyroY(), mpu.getGyroZ(),
-                         barometer.get_smoothed_altitude());
 
-        Serial.print("\033[2J\033[H"); // ターミナルクリア
-        im920.write(Plane_Data);
+        // 6) テレメトリ・デバッグ (1000Hz ÷ 100 = 10Hz)
+        //    ★ 1000Hzブロック内に配置し、Serial出力がループをブロックしないようにする
+        static int dbg_cnt = 0;
+        if (++dbg_cnt >= 100) {
+            dbg_cnt = 0;
+            barometer.update();
+            Plane_Data.update(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
+                             mpu.getGyroX(), mpu.getGyroY(), mpu.getGyroZ(),
+                             barometer.get_smoothed_altitude());
 
-        // モード表示
-        print_flightmode(int(currentMode), BANK_ANGLE, TURN_MS);
+            Serial.print("\033[2J\033[H"); // ターミナルクリア
+            im920.write(Plane_Data);
 
-        print_PID(Roll.pid, Pitch.pid, Yaw.pid);
-        print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
-        print_sbus(sbus.des[Ch::ROLL], sbus.des[Ch::PITCH], sbus.des[Ch::THR], sbus.des[Ch::YAW], sbus.des[Ch::Aux1], sbus.des[Ch::Aux2], sbus.des[Ch::Aux3]);
-        Ground_Data.print();
+            // モード表示
+            print_flightmode(int(currentMode), BANK_ANGLE, TURN_MS);
 
-        Serial.print("Altitude: "); Serial.print(Plane_Data.altitude, 2);
-        Serial.println(" m");
+            print_PID(Roll.pid, Pitch.pid, Yaw.pid);
+            print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
+            print_ACC(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ());
+            print_sbus(sbus.des[Ch::ROLL], sbus.des[Ch::PITCH], sbus.des[Ch::THR], sbus.des[Ch::YAW], sbus.des[Ch::Aux1], sbus.des[Ch::Aux2], sbus.des[Ch::Aux3]);
+            Ground_Data.print();
+
+            Serial.print("Altitude: "); Serial.print(Plane_Data.altitude, 2);
+            Serial.println(" m");
+            print_timing(T::Main_dt);
+        }
     }
 }
 

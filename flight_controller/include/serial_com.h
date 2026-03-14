@@ -37,3 +37,12 @@ void print_flightmode(int currentMode, float bankAngle, unsigned long turnMs) {
     Serial.print(" deg  TurnMs: "); Serial.print(turnMs);
     Serial.println(" ms");
 }
+
+void print_ACC(float ax, float ay, float az) {
+    Serial.printf("Acc: ax=%+.4f ay=%+.4f az=%+.4f [g]  |a|=%.4f\n",
+                  ax, ay, az, sqrtf(ax*ax + ay*ay + az*az));
+}
+
+void print_timing(unsigned long dt_us) {
+    Serial.printf("Timing: dt=%lu us (%.0f Hz)\n", dt_us, 1000000.0f / dt_us);
+}

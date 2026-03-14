@@ -71,7 +71,6 @@ public:
 
     void update_RateAnglePID(float input){
         static int counter = 0;
-        counter++;
         if(++counter >= 10){// 1000Hz / 10 = 100Hz
             pid_ang  = c_ang.pidStep (ang,input,Sen);
             counter = 0;
