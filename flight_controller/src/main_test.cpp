@@ -22,6 +22,7 @@ int16_t ax_r, ay_r, az_r, gx_r, gy_r, gz_r;
 unsigned long t_prev = 0;
 float baro_alt = 0.0f;
 bool bmp_ok = false;
+int PERIOD = 250; // 10Hz
 
 void setup() {
     Serial.begin(115200);
