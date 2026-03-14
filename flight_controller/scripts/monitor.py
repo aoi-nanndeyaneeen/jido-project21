@@ -259,9 +259,22 @@ def keyboard_thread():
     while True:
         c = input().strip().upper()
         if c == "R":
-            print(f"[Calib] Keep still ({CALIB_SAMPLES} samples)...")
+            print(f"[Reset] Calibrating IMU + Resetting Altitude Baseline...")
+            # --- IMUキャリブレーション開始 ---
             calib_buf.clear()
             calib_flag = True
+            
+            # --- 高度ベースラインリセット ---
+            with lock:
+                if buf_baro:
+                    alt_base += list(buf_baro)[-1]
+            kalman.init(0.0)
+
+            # --- Teensyへコマンド送信 ---
+            try:
+                ser.write(b"R")
+            except Exception as e:
+                print(f"[ERROR] Failed to send 'R' to serial: {e}")
         elif c == "B":
             # 現在地を高度0mにリセット
             with lock:

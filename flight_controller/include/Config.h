@@ -2,6 +2,7 @@
 #pragma once
 #include <Arduino.h>
 #include <Wire.h>
+#include <Adafruit_BMP280.h>
 
 // ==== 通信用の構造体 ====
 struct __attribute__((__packed__)) PlaneData {
@@ -128,7 +129,7 @@ namespace Config {
         constexpr int MAIN_Hz = 1000;  //(Hz)とっても大事！！！制御周期！！！
         constexpr int DEBUG_Hz = 10;   //(Hz)デバッグ周期
         constexpr unsigned long MAIN_PERIOD = 1000000UL / MAIN_Hz; // 周期 [us]
-        inline unsigned long Main_dt = 1/MAIN_Hz; // センサ更新周期 (us)
+        inline unsigned long Main_dt = 1000000UL / MAIN_Hz; // センサ更新周期 (us)
 
         template <int Hz>
         bool freq(unsigned long &dt) {
@@ -138,8 +139,8 @@ namespace Config {
             uint32_t t_now = micros();
             if (t_now - t_prev < period) return false;
 
-            t_prev = t_now;
             dt = t_now - t_prev;
+            t_prev = t_now;
             return true;
         }
 
@@ -153,6 +154,14 @@ namespace Config {
 
             t_prev = t_now;
             return true;
+        }
+
+        inline void resetTiming() {
+            // 注意: テンプレート内の静的変数はリセットできないため、
+            // 各テンプレートインスタンスを手動で「一度空回し」させるか、
+            // 大局的な基準時間を更新する設計にする必要があります。
+            // ここではシンプルに Main_dt を標準値に戻し、次の freq 呼び出しを待つ設計にします。
+            Main_dt = 1000000UL / MAIN_Hz;
         }
     }
 }

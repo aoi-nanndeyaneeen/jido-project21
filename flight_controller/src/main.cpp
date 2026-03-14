@@ -156,6 +156,18 @@ void updateSensorsAndComms() {
     Pitch.update_value(sbus.des[Ch::PITCH], mpu.getPitch(), mpu.getAccY(), mpu.getGyroY());
     Yaw.update_value(sbus.des[Ch::YAW],   mpu.getYaw(),   mpu.getAccZ(), mpu.getGyroZ());
 
+    // --- シリアルコマンド (PCモニタからのRキー等) ---
+    if (Serial.available()) {
+        char c = toupper(Serial.read());
+        if (c == 'R') {
+            mpu.recalibrate();
+            barometer.reset();
+            Config::Timing::resetTiming();
+            Roll.pid_reset(); Pitch.pid_reset(); Yaw.pid_reset();
+            Serial.println("INFO: System-wide Reset Complete.");
+        }
+    }
+
     // 地上局からパラメータ受信
     if (im920.read(Ground_Data)) {
         if (Ground_Data.roll  != 0.0f) BANK_ANGLE = fabsf(Ground_Data.roll);
