@@ -92,10 +92,10 @@ public:
         Serial.println("【成功】BMP280の接続を確認しました！");
         
         bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     
-                        Adafruit_BMP280::SAMPLING_X2,     
-                        Adafruit_BMP280::SAMPLING_X16,    
-                        Adafruit_BMP280::FILTER_X16,      
-                        Adafruit_BMP280::STANDBY_MS_500); 
+                        Config::sensor::BMP_SAMP_T,     
+                        Config::sensor::BMP_SAMP_P,    
+                        Config::sensor::BMP_FILTER,      
+                        Config::sensor::BMP_STANDBY); 
         return true;
     }
 
