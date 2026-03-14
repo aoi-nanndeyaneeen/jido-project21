@@ -32,7 +32,7 @@ public:
     }
 
     float pidStep(float input, float des, float kando) {
-        float dt_sec = dt / 1e6f; // Config.h で extern 宣言された dt を使用
+        float dt_sec = Config::Timing::Main_dt / 1e6f; // Config.h 宣言された メイン周期のdt を使用
         float PID_value = 0;
         float e = des * kando - input;
         float d_raw = (e - prev) / dt_sec;
@@ -69,8 +69,13 @@ public:
         c_ang.reset();
     }
 
-    void update_RateAnglePID(){
-        if(counter%10 == 0)  pid_ang  = c_ang.pidStep (ang,des,Sen);
+    void update_RateAnglePID(float input){
+        static int counter = 0;
+        counter++;
+        if(++counter >= 10){// 1000Hz / 10 = 100Hz
+            pid_ang  = c_ang.pidStep (ang,input,Sen);
+            counter = 0;
+        }  
         pid = c_rate.pidStep(gyr,pid_ang ,1);
     }
 
