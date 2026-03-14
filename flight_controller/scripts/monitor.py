@@ -311,9 +311,11 @@ def update_plot(_):
     ax_plot.set_xlim(x_min, x_max)
     alt_plot.set_xlim(x_min, x_max)
 
-    # 高度レンジを自動調整（余白1m）
-    if _ka.max() - _ka.min() > 0.1:
-        margin = max(1.0, (_ka.max() - _ka.min()) * 0.2)
+    # 高度レンジを自動調整（余白を小さくしてブレを見やすくする）
+    ka_range = _ka.max() - _ka.min()
+    if ka_range > 0.01:
+        # 最小余白を0.2mにして、微小な変動をズームする
+        margin = max(0.2, ka_range * 0.2)
         alt_plot.set_ylim(_ka.min() - margin, _ka.max() + margin)
 
     line_ax.set_data(t, _ax); line_ay.set_data(t, _ay)
@@ -325,7 +327,27 @@ def update_plot(_):
     norm_text.set_text(f"|a|={cur_norm:.3f}g [{status}]")
     norm_text.set_color("green" if status == "OK" else "red")
 
-    alt_text.set_text(f"baro={_br[-1]:.2f}m  kalman={_ka[-1]:.2f}m  vz={kalman.vz:.2f}m/s")
+    # 7秒間の計算 (SAMPLE_RATE = 50, 最新7秒間 = 350サンプル)
+    eval_points = int(7.0 * SAMPLE_RATE)
+    if len(_ka) > eval_points:
+        _ka_eval = _ka[-eval_points:]
+    else:
+        _ka_eval = _ka
+
+    if len(_ka_eval) > 0:
+        ka_p2p = _ka_eval.max() - _ka_eval.min()
+        ka_std = np.std(_ka_eval)
+        stable_str = " [STABLE]" if ka_p2p <= 0.4 else ""
+        stable_color = "green" if ka_p2p <= 0.4 else "black"
+    else:
+        ka_p2p = 0.0
+        ka_std = 0.0
+        stable_str = " [CALC...]"
+        stable_color = "gray"
+
+    alt_text.set_text(f"baro={_br[-1]:.2f}m  kalman={_ka[-1]:.2f}m  vz={kalman.vz:.2f}m/s\n"
+                      f"7s precision: P-P={ka_p2p:.3f}m  std={ka_std:.3f}m{stable_str}")
+    alt_text.set_color(stable_color)
 
     return line_ax, line_ay, line_az, line_norm, line_baro, line_kalt, norm_text, alt_text
 

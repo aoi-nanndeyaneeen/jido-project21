@@ -14,8 +14,6 @@ private:
     int16_t ax, ay, az;
     int16_t gx, gy, gz;
     TwoWire *wire;
-    const float ACCEL_SCALE = 16384.0;
-    const float GYRO_SCALE = 131.0;
 
 public:
     IMU(TwoWire *wire_i = &Wire) : mpu(0x68), wire(wire_i) {};
@@ -24,13 +22,21 @@ public:
         wire->begin();
         wire->setClock(400000);
         mpu.initialize();
+
+        // --- スケール強制設定 MPU6050 (±2g / ±250dps) ---
+        // main_test.cpp と同等の精度と感度にするためアンプゲインを固定
+        wire->beginTransmission(0x68); wire->write(0x1C); wire->write(0x00); wire->endTransmission(); // Accel ±2g
+        wire->beginTransmission(0x68); wire->write(0x1B); wire->write(0x00); wire->endTransmission(); // Gyro ±250dps
+
         filter.begin(Config::Timing::MAIN_Hz);
-        mpu.setXAccelOffset(0);
-        mpu.setYAccelOffset(0);
-        mpu.setZAccelOffset(0);
-        mpu.setXGyroOffset(0);
-        mpu.setYGyroOffset(0);
-        mpu.setZGyroOffset(0);
+        
+        // Config.h で定義されたオフセットを適用
+        mpu.setXAccelOffset(Config::sensor::ACCEL_X_OFFSET);
+        mpu.setYAccelOffset(Config::sensor::ACCEL_Y_OFFSET);
+        mpu.setZAccelOffset(Config::sensor::ACCEL_Z_OFFSET);
+        mpu.setXGyroOffset(Config::sensor::GYRO_X_OFFSET);
+        mpu.setYGyroOffset(Config::sensor::GYRO_Y_OFFSET);
+        mpu.setZGyroOffset(Config::sensor::GYRO_Z_OFFSET);
     }
 
     void update() {
@@ -38,12 +44,12 @@ public:
         filter.updateIMU(getGyroX(), getGyroY(), getGyroZ(), getAccX(), getAccY(), getAccZ());
     }
 
-    float getAccX() { return (float)ax / ACCEL_SCALE; }
-    float getAccY() { return (float)ay / ACCEL_SCALE; }
-    float getAccZ() { return (float)az / ACCEL_SCALE; }
-    float getGyroX() { return (float)gx / GYRO_SCALE; }
-    float getGyroY() { return (float)gy / GYRO_SCALE; }
-    float getGyroZ() { return (float)gz / GYRO_SCALE; }
+    float getAccX() { return (float)ax / Config::sensor::ACCEL_SCALE; }
+    float getAccY() { return (float)ay / Config::sensor::ACCEL_SCALE; }
+    float getAccZ() { return (float)az / Config::sensor::ACCEL_SCALE; }
+    float getGyroX() { return (float)gx / Config::sensor::GYRO_SCALE; }
+    float getGyroY() { return (float)gy / Config::sensor::GYRO_SCALE; }
+    float getGyroZ() { return (float)gz / Config::sensor::GYRO_SCALE; }
     float getRoll()  { return filter.getRoll(); }
     float getPitch() { return filter.getPitch(); }
     float getYaw()   { return filter.getYaw(); }

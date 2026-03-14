@@ -100,6 +100,22 @@ namespace Config {
         inline TwoWire *const bmp = &Wire1;  // 気圧センサ用I2Cポート
     }
 
+    // ==== センサ・キャリブレーション定数 ====
+    namespace sensor {
+        // MPU6050のスケール (±2g, ±250dps)
+        constexpr float ACCEL_SCALE = 16384.0f;
+        constexpr float GYRO_SCALE  = 131.0f;
+        
+        // monitor.pyのキャリブレーション(Rキー)で得られたオフセット値を入力する
+        // デフォルトは0に設定。機体ごとに調整すること
+        constexpr int16_t ACCEL_X_OFFSET = 0;
+        constexpr int16_t ACCEL_Y_OFFSET = 0;
+        constexpr int16_t ACCEL_Z_OFFSET = 0;
+        constexpr int16_t GYRO_X_OFFSET  = 0;
+        constexpr int16_t GYRO_Y_OFFSET  = 0;
+        constexpr int16_t GYRO_Z_OFFSET  = 0;
+    }
+
     namespace Timing {
         // ==== タイミング制御 ====
         constexpr int MAIN_Hz = 1000;  //(Hz)とっても大事！！！制御周期！！！
