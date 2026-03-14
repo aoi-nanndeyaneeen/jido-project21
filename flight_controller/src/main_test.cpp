@@ -1,154 +1,146 @@
 // ============================================================
-// sensor_test/main.cpp  修正版
-// 変更点:
-//   1. MPU6050のスケール設定を明示 (±2g, ±250dps)
-//   2. BMP280のサンプリング間隔を200Hzに合わせて高速化
-//   3. 海面気圧を自動推定する初期キャリブレーション追加
-//   4. オフセットキャリブレーション追加
+// src/main_test.cpp  IMU 6軸確認版
+//
+// 【Teleplotでリアルタイム表示】
+//   VSCode拡張 "Teleplot" をインストールして使用
+//   表示される変数: ax, ay, az, gx, gy, gz, a_norm
+//
+// 【シリアルコマンド】
+//   R : オフセットキャリブレーション再実行
+//   P : スナップショット + レジスタ値表示
+//   S : スケール設定の読み返し確認
+//
+// 【軸確認手順】(Pキーを押しながら各姿勢を確認)
+//   水平置き (チップ面上向き) : az≈+1g, ax≈0, ay≈0
+//   手前に90°傾ける           : ax≈+1g, az≈0
+//   右に90°傾ける             : ay≈-1g, az≈0
+//   裏返し                    : az≈-1g, ax≈0, ay≈0
 // ============================================================
 #include <Arduino.h>
 #include <Wire.h>
 #include <MPU6050.h>
-#include <Adafruit_BMP280.h>
-#include <MadgwickAHRS.h>
 
 // ============================================================
 //  設定
 // ============================================================
 constexpr float        LOOP_HZ = 200.0f;
 constexpr unsigned long PERIOD = (unsigned long)(1e6f / LOOP_HZ);
+constexpr uint8_t      MPU_ADDR = 0x68;
 
-// BMP280は高速設定にするため、海面気圧は起動時に手動入力するか
-// 以下の値を自分の地域の現在値に変える（天気予報アプリの「気圧」より）
-// 例: 東京の場合 1013〜1025hPa 程度で変動する
-constexpr float SEA_LEVEL_HPA_DEFAULT = 1013.25f;
-
-// ============================================================
-//  カルマンフィルタ
-// ============================================================
-class AltitudeKalman {
-public:
-    float Q_z    = 0.001f;
-    float Q_vz   = 0.01f;
-    float R_baro = 0.25f;
-    float z_est  = 0.0f;
-    float vz_est = 0.0f;
-
-    void init(float initial_alt) {
-        z_est = initial_alt; vz_est = 0.0f;
-        P[0][0]=1; P[0][1]=0; P[1][0]=0; P[1][1]=1;
-    }
-
-    void update(float dt, float az_world, float baro_z) {
-        float z_p  = z_est  + vz_est*dt + 0.5f*az_world*dt*dt;
-        float vz_p = vz_est + az_world*dt;
-        float P00 = P[0][0] + dt*(P[1][0]+P[0][1]) + dt*dt*P[1][1] + Q_z;
-        float P01 = P[0][1] + dt*P[1][1];
-        float P10 = P[1][0] + dt*P[1][1];
-        float P11 = P[1][1] + Q_vz;
-        float S=P00+R_baro, K0=P00/S, K1=P10/S;
-        float inn = baro_z - z_p;
-        z_est  = z_p  + K0*inn;
-        vz_est = vz_p + K1*inn;
-        P[0][0]=(1-K0)*P00; P[0][1]=(1-K0)*P01;
-        P[1][0]=-K1*P00+P10; P[1][1]=-K1*P01+P11;
-    }
-private:
-    float P[2][2]={{1,0},{0,1}};
-};
+// ±2g設定時のスケール。後述のレジスタ確認で実際の設定値を見てから変える
+// FS=0(±2g)  → 16384
+// FS=1(±4g)  → 8192
+// FS=2(±8g)  → 4096
+// FS=3(±16g) → 2048
+float ACCEL_SCALE = 16384.0f;
+float GYRO_SCALE  = 131.0f;   // ±250dps固定
 
 // ============================================================
 //  グローバル
 // ============================================================
-MPU6050         mpu(0x68);
-Adafruit_BMP280 bmp(&Wire1);  // BMP280はWire1(SDA=17,SCL=16)
-Madgwick        madgwick;
-AltitudeKalman  kalman;
-
-const float ACCEL_SCALE = 16384.0f; // ±2g設定時
-const float GYRO_SCALE  = 131.0f;   // ±250dps設定時
-
-int16_t ax_r,ay_r,az_r,gx_r,gy_r,gz_r;
-float ax,ay,az,gx,gy,gz;
-float baro_alt = 0.0f;
-float sea_level_hpa = SEA_LEVEL_HPA_DEFAULT;
+MPU6050 mpu(MPU_ADDR);
+int16_t ax_r, ay_r, az_r, gx_r, gy_r, gz_r;
+float   ax, ay, az, gx, gy, gz;
 unsigned long t_prev = 0;
 int counter = 0;
-bool mpu_ok=false, bmp_ok=false;
+bool mpu_ok = false;
 
 // ============================================================
-//  MPU6050 診断 + スケール強制設定
+//  レジスタ直読み (ライブラリを介さず確認)
 // ============================================================
-void mpu_diagnose() {
-    Serial.println("\n======= MPU6050 診断 =======");
-    mpu.initialize();
-    if (!mpu.testConnection()) {
-        Serial.println("[ERROR] MPU6050 が応答しません");
-        return;
-    }
-    Serial.println("[OK] 接続確認");
+uint8_t read_register(uint8_t reg) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(reg);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, (uint8_t)1);
+    return Wire.read();
+}
 
-    // ★ スケールを明示的に設定（これが今回の修正の核心）
-    mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);   // ±2g
-    mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);   // ±250dps
-    delay(100);
+void write_register(uint8_t reg, uint8_t val) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(reg); Wire.write(val);
+    Wire.endTransmission();
+}
 
-    // 実際に設定されたスケールを読み返して確認
-    uint8_t accel_fs = mpu.getFullScaleAccelRange();
-    uint8_t gyro_fs  = mpu.getFullScaleGyroRange();
-    Serial.printf("  加速度FS設定値: %d (0=±2g, 1=±4g, 2=±8g, 3=±16g)\n", accel_fs);
-    Serial.printf("  ジャイロFS設定値: %d (0=±250, 1=±500, 2=±1000, 3=±2000 dps)\n", gyro_fs);
+// ============================================================
+//  スケール確認と強制設定
+// ============================================================
+void check_and_set_scale() {
+    // レジスタ直書き (ライブラリが効かない場合の保険)
+    // 0x1C ACCEL_CONFIG: bits[4:3] = 00 → ±2g
+    // 0x1B GYRO_CONFIG:  bits[4:3] = 00 → ±250dps
+    write_register(0x1C, 0x00);
+    write_register(0x1B, 0x00);
+    delay(10);
 
-    if (accel_fs != 0) {
-        Serial.println("[WARN] 加速度FS=0(±2g)に設定できていません！ライブラリを確認してください。");
-    }
+    uint8_t accel_cfg = read_register(0x1C);
+    uint8_t gyro_cfg  = read_register(0x1B);
 
-    // ---- オフセットキャリブレーション ----
-    // センサを水平静止させた状態で実行すること
-    Serial.println("  オフセットキャリブレーション中 (200サンプル, 静止してください)...");
+    // bits[4:3]を取り出してFSレンジを判定
+    uint8_t afs = (accel_cfg >> 3) & 0x03;
+    uint8_t gfs = (gyro_cfg  >> 3) & 0x03;
+
+    // 実際のFSレンジに合わせてスケールを設定
+    const float accel_scales[] = {16384.0f, 8192.0f, 4096.0f, 2048.0f};
+    const float gyro_scales[]  = {131.0f,   65.5f,   32.8f,   16.4f};
+    ACCEL_SCALE = accel_scales[afs];
+    GYRO_SCALE  = gyro_scales[gfs];
+
+    Serial.println("INFO: === スケール確認 ===");
+    Serial.printf("INFO: ACCEL_CONFIG=0x%02X → FS=%d → ±%dg → スケール=%.0f\n",
+                  accel_cfg, afs, (2 << afs), ACCEL_SCALE);
+    Serial.printf("INFO: GYRO_CONFIG =0x%02X → FS=%d → スケール=%.1f\n",
+                  gyro_cfg, gfs, GYRO_SCALE);
+
+    if (afs == 0)
+        Serial.println("INFO: [OK] 加速度 ±2g 設定確認");
+    else
+        Serial.printf("INFO: [WARN] 加速度が±%dgになっています。スケールを自動修正しました。\n", 2<<afs);
+}
+
+// ============================================================
+//  オフセットキャリブレーション
+// ============================================================
+void calibrate() {
+    Serial.println("INFO: キャリブレーション開始 (静止 300サンプル)...");
     long s_ax=0,s_ay=0,s_az=0,s_gx=0,s_gy=0,s_gz=0;
-    for(int i=0;i<200;i++){
+    for(int i=0;i<300;i++){
         mpu.getMotion6(&ax_r,&ay_r,&az_r,&gx_r,&gy_r,&gz_r);
         s_ax+=ax_r; s_ay+=ay_r; s_az+=az_r;
         s_gx+=gx_r; s_gy+=gy_r; s_gz+=gz_r;
         delay(5);
     }
-    float m_ax=s_ax/200.0f, m_ay=s_ay/200.0f, m_az=s_az/200.0f;
-    float m_gx=s_gx/200.0f, m_gy=s_gy/200.0f, m_gz=s_gz/200.0f;
+    float m_ax=s_ax/300.0f, m_ay=s_ay/300.0f, m_az=s_az/300.0f;
+    float m_gx=s_gx/300.0f, m_gy=s_gy/300.0f, m_gz=s_gz/300.0f;
 
-    // 加速度の合力チェック (スケール修正後)
-    float a_norm = sqrtf((m_ax/ACCEL_SCALE)*(m_ax/ACCEL_SCALE)
-                       + (m_ay/ACCEL_SCALE)*(m_ay/ACCEL_SCALE)
-                       + (m_az/ACCEL_SCALE)*(m_az/ACCEL_SCALE));
-    Serial.printf("  生値平均: ax=%.1f ay=%.1f az=%.1f\n", m_ax, m_ay, m_az);
-    Serial.printf("  [g]平均:  ax=%.4f ay=%.4f az=%.4f |a|=%.4f g\n",
-                  m_ax/ACCEL_SCALE, m_ay/ACCEL_SCALE, m_az/ACCEL_SCALE, a_norm);
+    // キャリブ前の合力
+    float norm_before = sqrtf((m_ax/ACCEL_SCALE)*(m_ax/ACCEL_SCALE)
+                             +(m_ay/ACCEL_SCALE)*(m_ay/ACCEL_SCALE)
+                             +(m_az/ACCEL_SCALE)*(m_az/ACCEL_SCALE));
+    Serial.printf("INFO: キャリブ前  ax=%.4f ay=%.4f az=%.4f |a|=%.4f g\n",
+                  m_ax/ACCEL_SCALE, m_ay/ACCEL_SCALE, m_az/ACCEL_SCALE, norm_before);
+    Serial.printf("INFO: 生値平均    ax=%.0f ay=%.0f az=%.0f\n", m_ax, m_ay, m_az);
 
-    if (a_norm > 0.9f && a_norm < 1.1f) {
-        Serial.printf("[OK]  合力 %.4f g → 正常\n", a_norm);
-        mpu_ok = true;
-    } else {
-        Serial.printf("[ERROR] 合力 %.4f g → 異常 (±2g設定後もこの値なら故障の疑い)\n", a_norm);
-        // 処理は続行して詳細確認
-        mpu_ok = true;
+    // az生値が16384に近い → センサは水平
+    // ax生値が16384に近い → センサは手前90°傾き
+    float ideal_az = ACCEL_SCALE; // 水平置きなら重力はzに乗る想定
+    Serial.printf("INFO: az生値=%.0f (水平なら±%.0f に近いはず)\n", m_az, ideal_az);
+
+    if (fabsf(m_az) < fabsf(m_ax) && fabsf(m_az) < fabsf(m_ay)) {
+        Serial.println("INFO: [WARN] az が最小 → センサが横倒しの可能性。水平に置いてRで再実行。");
     }
 
-    // オフセット値をセット（重力方向の軸は除く: 1g=16384カウント分を差し引く）
-    // ※ 水平置きでazが+1gになるはず → az_offset = 16384 - m_az
-    // どの軸が重力方向かは搭載向きによる。出力を見て調整する。
+    // オフセット設定 (重力が乗っている軸は理想値との差をオフセット)
+    // 水平置き前提: az → 理想+16384、ax,ay → 理想0
     mpu.setXAccelOffset((int16_t)(-m_ax / 8));
     mpu.setYAccelOffset((int16_t)(-m_ay / 8));
-    // Z軸は重力1g分を残す: 実測平均から理想値(16384)を引いてオフセット計算
-    mpu.setZAccelOffset((int16_t)(-(m_az - 16384.0f) / 8));
+    mpu.setZAccelOffset((int16_t)(-(m_az - ACCEL_SCALE) / 8));
     mpu.setXGyroOffset((int16_t)(-m_gx / 4));
     mpu.setYGyroOffset((int16_t)(-m_gy / 4));
     mpu.setZGyroOffset((int16_t)(-m_gz / 4));
-
-    Serial.printf("  ジャイロ生値平均: gx=%.1f gy=%.1f gz=%.1f\n", m_gx, m_gy, m_gz);
-    Serial.println("  オフセット設定完了。再計測...");
     delay(200);
 
-    // オフセット設定後の再確認
+    // キャリブ後確認
     s_ax=0;s_ay=0;s_az=0;s_gx=0;s_gy=0;s_gz=0;
     for(int i=0;i<100;i++){
         mpu.getMotion6(&ax_r,&ay_r,&az_r,&gx_r,&gy_r,&gz_r);
@@ -158,60 +150,52 @@ void mpu_diagnose() {
     }
     m_ax=s_ax/100.0f; m_ay=s_ay/100.0f; m_az=s_az/100.0f;
     m_gx=s_gx/100.0f; m_gy=s_gy/100.0f; m_gz=s_gz/100.0f;
-    a_norm = sqrtf((m_ax/ACCEL_SCALE)*(m_ax/ACCEL_SCALE)
-                 + (m_ay/ACCEL_SCALE)*(m_ay/ACCEL_SCALE)
-                 + (m_az/ACCEL_SCALE)*(m_az/ACCEL_SCALE));
-    Serial.printf("  [キャリブ後] |a|=%.4f g  ジャイロ合力=%.3f dps\n",
-                  a_norm,
-                  sqrtf((m_gx/GYRO_SCALE)*(m_gx/GYRO_SCALE)
-                       +(m_gy/GYRO_SCALE)*(m_gy/GYRO_SCALE)
-                       +(m_gz/GYRO_SCALE)*(m_gz/GYRO_SCALE)));
-    Serial.println("============================\n");
+    float norm_after = sqrtf((m_ax/ACCEL_SCALE)*(m_ax/ACCEL_SCALE)
+                            +(m_ay/ACCEL_SCALE)*(m_ay/ACCEL_SCALE)
+                            +(m_az/ACCEL_SCALE)*(m_az/ACCEL_SCALE));
+    Serial.printf("INFO: キャリブ後  ax=%.4f ay=%.4f az=%.4f |a|=%.4f g\n",
+                  m_ax/ACCEL_SCALE, m_ay/ACCEL_SCALE, m_az/ACCEL_SCALE, norm_after);
+    float gyro_norm = sqrtf((m_gx/GYRO_SCALE)*(m_gx/GYRO_SCALE)
+                           +(m_gy/GYRO_SCALE)*(m_gy/GYRO_SCALE)
+                           +(m_gz/GYRO_SCALE)*(m_gz/GYRO_SCALE));
+    Serial.printf("INFO: ジャイロ    gx=%.4f gy=%.4f gz=%.4f |g|=%.4f dps\n",
+                  m_gx/GYRO_SCALE, m_gy/GYRO_SCALE, m_gz/GYRO_SCALE, gyro_norm);
+
+    // 合力判定
+    if (norm_after > 0.97f && norm_after < 1.03f)
+        Serial.println("INFO: [OK] 合力≒1g → センサ正常");
+    else if (norm_before > 1.8f && norm_after > 1.8f)
+        Serial.println("INFO: [ERROR] 合力≈2g → スケール設定を確認 (Sキー)");
+    else if (norm_after < 0.5f)
+        Serial.println("INFO: [ERROR] 合力<0.5g → センサ故障の可能性大");
+    else
+        Serial.printf("INFO: [WARN] 合力=%.4g → 許容範囲外。センサの傾きかオフセット残差。\n", norm_after);
+
+    Serial.println("INFO: キャリブレーション完了");
 }
 
 // ============================================================
-//  BMP280 診断 (高速サンプリング設定)
+//  スナップショット表示
 // ============================================================
-void bmp_diagnose() {
-    Serial.println("======= BMP280 診断 =======");
-    bmp_ok = bmp.begin(0x76);
-    if (!bmp_ok) bmp_ok = bmp.begin(0x77);
-    if (!bmp_ok) { Serial.println("[ERROR] BMP280 応答なし"); return; }
-    Serial.println("[OK] 接続確認");
-
-    // ★ 200Hz制御に合わせて高速設定に変更
-    // STANDBY_MS_0_5 = 0.5ms待機 → 約200Hz更新可能
-    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                    Adafruit_BMP280::SAMPLING_X1,    // 温度: 最小
-                    Adafruit_BMP280::SAMPLING_X4,    // 気圧: 低オーバーサンプリングで高速
-                    Adafruit_BMP280::FILTER_X16,     // IIRフィルタ: 強め
-                    Adafruit_BMP280::STANDBY_MS_1);  // 1ms待機
-
-    // 起動安定待ち
-    delay(200);
-
-    // 静止ノイズ計測
-    Serial.println("  静止ノイズ計測中 (100サンプル, 10ms間隔)...");
-    float samples[100]; float sum=0;
-    for(int i=0;i<100;i++){
-        samples[i] = bmp.readAltitude(sea_level_hpa);
-        sum += samples[i];
-        delay(10);
-    }
-    float mean=sum/100.0f, var=0;
-    for(int i=0;i<100;i++) var+=(samples[i]-mean)*(samples[i]-mean);
-    float sigma=sqrtf(var/100.0f);
-
-    Serial.printf("  平均高度: %.3f m (海面気圧=%.2f hPa)\n", mean, sea_level_hpa);
-    Serial.printf("  標準偏差: %.3f m\n", sigma);
-
-    if (sigma < 0.15f)      Serial.println("[OK]  ±0.3m以内");
-    else if (sigma < 0.5f)  Serial.printf("[WARN] sigma=%.3f m (許容範囲)\n", sigma);
-    else                    Serial.printf("[ERROR] sigma=%.3f m (配線ノイズ or 電源ノイズを確認)\n", sigma);
-
-    baro_alt = mean;
-    kalman.init(mean);
-    Serial.println("============================\n");
+void printSnapshot() {
+    mpu.getMotion6(&ax_r,&ay_r,&az_r,&gx_r,&gy_r,&gz_r);
+    float _ax=ax_r/ACCEL_SCALE, _ay=ay_r/ACCEL_SCALE, _az=az_r/ACCEL_SCALE;
+    float _gx=gx_r/GYRO_SCALE,  _gy=gy_r/GYRO_SCALE,  _gz=gz_r/GYRO_SCALE;
+    float norm = sqrtf(_ax*_ax+_ay*_ay+_az*_az);
+    Serial.println("INFO: ===== スナップショット =====");
+    Serial.printf ("INFO: 加速度[g] ax=%+.4f  ay=%+.4f  az=%+.4f  |a|=%.4f\n",_ax,_ay,_az,norm);
+    Serial.printf ("INFO: ジャイロ  gx=%+.3f  gy=%+.3f  gz=%+.3f  dps\n",_gx,_gy,_gz);
+    Serial.println("INFO: ---- 判定 ----");
+    Serial.printf ("INFO: |a|=%.4f → %s\n", norm,
+                   norm>0.97f&&norm<1.03f ? "正常 (≒1g)" :
+                   norm>1.8f             ? "スケール誤り疑い (≒2g)" :
+                   norm<0.5f             ? "故障疑い (<0.5g)" : "要確認");
+    Serial.println("INFO: ---- 軸確認ガイド ----");
+    Serial.println("INFO: 水平置き  → az≈+1.0g, ax≈0, ay≈0");
+    Serial.println("INFO: 手前90°  → ax≈+1.0g, az≈0");
+    Serial.println("INFO: 右90°    → ay≈-1.0g, az≈0");
+    Serial.println("INFO: 裏返し   → az≈-1.0g, ax≈0, ay≈0");
+    Serial.println("INFO: ==========================");
 }
 
 // ============================================================
@@ -219,86 +203,61 @@ void bmp_diagnose() {
 // ============================================================
 void setup() {
     Serial.begin(115200);
-    Wire.begin();   Wire.setClock(400000);   // MPU6050: SDA=18, SCL=19
-    Wire1.begin();  Wire1.setClock(400000);  // BMP280:  SDA=17, SCL=16
-    delay(500);
+    while(!Serial && millis()<3000){}
+    Wire.begin(); Wire.setClock(400000);
+    delay(300);
 
-    Serial.println("\n=== Sensor Diagnostic & Kalman Altitude Test ===");
+    Serial.println("INFO: === IMU 6軸確認モード ===");
+    Serial.println("INFO: コマンド: R=キャリブ  P=スナップショット  S=スケール確認");
 
-    // ★ 現在地の気圧を天気予報アプリで確認して入力 (重要)
-    // sea_level_hpa = 1015.0f;  // ← 例: 今日の東京が1015hPaなら変更する
-    Serial.printf("海面気圧設定: %.2f hPa\n", sea_level_hpa);
-    Serial.println("※ 天気予報の現在気圧に合わせると高度精度が上がります\n");
+    mpu.initialize();
+    if (!mpu.testConnection()) {
+        Serial.println("INFO: [ERROR] MPU6050 応答なし。配線を確認してください。");
+        while(1){}
+    }
+    Serial.println("INFO: MPU6050 接続OK");
 
-    mpu_diagnose();
-    bmp_diagnose();
+    check_and_set_scale();
+    calibrate();
 
-    if (mpu_ok) madgwick.begin(LOOP_HZ);
-
-    // シリアルプロッタ用ヘッダ
-    Serial.println("baro_alt,kalman_alt,kalman_vz,roll,pitch,az_world");
+    // Teleplot用ヘッダ出力
+    Serial.println("INFO: Teleplot表示開始 (ax ay az gx gy gz a_norm)");
     t_prev = micros();
+    mpu_ok = true;
 }
 
 // ============================================================
 //  loop
 // ============================================================
 void loop() {
+    if (Serial.available()) {
+        char c = toupper(Serial.read());
+        if (c=='R') { check_and_set_scale(); calibrate(); }
+        if (c=='P') printSnapshot();
+        if (c=='S') check_and_set_scale();
+    }
+
     unsigned long t_now = micros();
     if (t_now - t_prev < PERIOD) return;
-    float dt = (t_now - t_prev) / 1e6f;
     t_prev = t_now;
     counter++;
 
-    if (!mpu_ok || !bmp_ok) { delay(1000); return; }
+    if (!mpu_ok) return;
 
     mpu.getMotion6(&ax_r,&ay_r,&az_r,&gx_r,&gy_r,&gz_r);
     ax=ax_r/ACCEL_SCALE; ay=ay_r/ACCEL_SCALE; az=az_r/ACCEL_SCALE;
     gx=gx_r/GYRO_SCALE;  gy=gy_r/GYRO_SCALE;  gz=gz_r/GYRO_SCALE;
 
-    madgwick.updateIMU(gx,gy,gz,ax,ay,az);
-
-    float roll_r  = madgwick.getRoll()  * M_PI/180.0f;
-    float pitch_r = madgwick.getPitch() * M_PI/180.0f;
-    float az_world = (az*cosf(roll_r)*cosf(pitch_r) - 1.0f) * 9.80665f;
-
-    // BMP280は高速設定なので毎ループ読んでOK (内部で更新されていない場合は前回値を返す)
-    if (counter % 10 == 0) {  // 200Hz ÷ 10 = 20Hz で読む
-        baro_alt = bmp.readAltitude(sea_level_hpa);
+    // Teleplot形式で10Hz出力
+    if (counter % 20 == 0) {
+        float a_norm = sqrtf(ax*ax+ay*ay+az*az);
+        Serial.printf(">ax:%.4f\n", ax);
+        Serial.printf(">ay:%.4f\n", ay);
+        Serial.printf(">az:%.4f\n", az);
+        Serial.printf(">gx:%.3f\n", gx);
+        Serial.printf(">gy:%.3f\n", gy);
+        Serial.printf(">gz:%.3f\n", gz);
+        // a_normが常に1.0gなら正常、2.0gならスケール誤り
+        Serial.printf(">a_norm:%.4f\n", a_norm);
     }
-
-    kalman.update(dt, az_world, baro_alt);
-
-    if (counter % 20 == 0) {  // 10Hz でシリアル出力
-        // Teleplot用のフォーマット (>変数名:数値\n) に変更！
-        Serial.printf(">baro_alt:%.3f\n", baro_alt);
-        Serial.printf(">kalman_alt:%.3f\n", kalman.z_est);
-        Serial.printf(">kalman_vz:%.3f\n", kalman.vz_est);
-        Serial.printf(">roll:%.2f\n", madgwick.getRoll());
-        Serial.printf(">pitch:%.2f\n", madgwick.getPitch());
-        Serial.printf(">az_world:%.3f\n", az_world);
-    }
-
-    // === シリアルから 'r' を受信したらリセット ===
-    if (Serial.available() > 0) {
-        char inChar = Serial.read();
-        if (inChar == 'r' || inChar == 'R') {
-            Serial.println(">reset:1"); // Teleplotにリセットを通知(グラフにマーカーを出すなど)
-            
-            // 1. 高度を現在の気圧高度でリセット
-            baro_alt = bmp.readAltitude(sea_level_hpa);
-            kalman.init(baro_alt); 
-            
-            // 2. MPUのオフセットを再計算（今の姿勢を水平とする）
-            Serial.println(">msg:Calibrating MPU... Keep it still!");
-            mpu_diagnose(); // MPUのキャリブレーション関数をもう一度呼ぶ
-            
-            // 3. Madgwickフィルタのリセット (ライブラリに依存しますが、インスタンスを作り直すのが確実)
-            // madgwick = Madgwick(); // 一度破棄して
-            // madgwick.begin(LOOP_HZ); // 再初期化
-            
-            Serial.println(">msg:Reset Complete!");
-        }
-    }
-
 }
