@@ -7,8 +7,13 @@
 #include <MPU6050.h>
 #include <Adafruit_BMP280.h>
 
-constexpr float        LOOP_HZ  = 200.0f;
-constexpr unsigned long PERIOD  = (unsigned long)(1e6f / LOOP_HZ);
+// BMP280 チューニング
+// STANDBY_MS_63 + SAMPLING_X16 で約10Hz更新 (安定性重視)
+// STANDBY_MS_1  + SAMPLING_X16 で約23Hz更新 (即応性重視)
+constexpr auto BMP_STANDBY = Adafruit_BMP280::STANDBY_MS_63;
+constexpr auto BMP_FILTER  = Adafruit_BMP280::FILTER_X4;
+constexpr auto BMP_SAMP_P  = Adafruit_BMP280::SAMPLING_X16;
+constexpr auto BMP_SAMP_T  = Adafruit_BMP280::SAMPLING_X2;
 
 MPU6050         mpu(0x68);
 Adafruit_BMP280 bmp(&Wire1);   // SDA=17, SCL=16
@@ -35,14 +40,11 @@ void setup() {
     bmp_ok = bmp.begin(0x76);
     if (!bmp_ok) bmp_ok = bmp.begin(0x77);
     if (bmp_ok) {
-        // 高速設定: 約26Hz更新
-        // FILTER_X16で内部ノイズを最大限除去 → σ≈0.1m が期待値
-        // 応答の遅さ(約1.5秒)はカルマンの加速度予測で補う
         bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                        Adafruit_BMP280::SAMPLING_X2,   // 温度: 少し上げる
-                        Adafruit_BMP280::SAMPLING_X16,  // 気圧: 最大オーバーサンプリング
-                        Adafruit_BMP280::FILTER_X2,     // IIRフィルタを最小限にして遅延を減らす
-                        Adafruit_BMP280::STANDBY_MS_1); // 1ms待機 → 高速サンプリング
+                        BMP_SAMP_T,
+                        BMP_SAMP_P,
+                        BMP_FILTER,
+                        BMP_STANDBY);
     }
     delay(300);
     Serial.println("READY");
