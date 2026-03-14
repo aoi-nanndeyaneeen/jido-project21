@@ -28,6 +28,8 @@ from pathlib import Path
 from datetime import datetime
 import sys
 
+import re
+
 # ============================================================
 #  設定
 # ============================================================
@@ -146,11 +148,39 @@ def serial_thread(ser):
             if not raw or raw == "READY":
                 continue
             parts = raw.split(",")
-            if len(parts) != 4:
+            
+            # --- 解析 (柔軟に対応) ---
+            try:
+                if parts[0] == "DATA" and len(parts) >= 15:
+                    # DATA,time_ms,ax,ay,az,gx,gy,gz,roll,pitch,yaw,baro,kalman_z,kalman_vz,az_world
+                    ax_r = float(parts[2]) * ACCEL_SCALE
+                    ay_r = float(parts[3]) * ACCEL_SCALE
+                    az_r = float(parts[4]) * ACCEL_SCALE
+                    baro_raw = float(parts[11])
+                elif len(parts) == 4:
+                    # ax_raw, ay_raw, az_raw, baro_alt
+                    ax_r, ay_r, az_r = int(parts[0]), int(parts[1]), int(parts[2])
+                    baro_raw = float(parts[3])
+                elif ":" in raw:
+                    # ラベル付き形式 (例: "ax:0.00 ay:0.00 az:1.00 baro:35.0")
+                    # カンマまたはスペースで区切られていると想定
+                    pairs = re.findall(r"([a-zA-Z_]+)\s*:\s*([-+]?\d*\.?\d+)", raw)
+                    data_map = {k.lower(): float(v) for k, v in pairs}
+                    if all(k in data_map for k in ["ax", "ay", "az"]):
+                         # 生値(int)か正規化値(float)か判定 (1.5以上なら生値とみなす)
+                         # ただし az は 1.0g なので、16384 などの大きな値かどうかで判断
+                         is_raw = abs(data_map["az"]) > 10.0
+                         ax_r = data_map["ax"] if is_raw else data_map["ax"] * ACCEL_SCALE
+                         ay_r = data_map["ay"] if is_raw else data_map["ay"] * ACCEL_SCALE
+                         az_r = data_map["az"] if is_raw else data_map["az"] * ACCEL_SCALE
+                         # 気圧データを探す (baro, alt, altitude など)
+                         baro_raw = data_map.get("baro", data_map.get("alt", data_map.get("height", 0.0)))
+                    else:
+                        continue
+                else:
+                    continue
+            except (ValueError, IndexError):
                 continue
-
-            ax_r, ay_r, az_r = int(parts[0]), int(parts[1]), int(parts[2])
-            baro_raw = float(parts[3])
 
             # --- キャリブ収集 ---
             if calib_flag:
@@ -304,25 +334,33 @@ def update_plot(_):
         _br  = np.array(buf_baro)
         _ka  = np.array(buf_kalt)
 
-    if t[-1] == 0:
+    if len(t) == 0 or np.all(t == 0):
         return line_ax, line_ay, line_az, line_norm, line_baro, line_kalt, norm_text, alt_text
 
-    x_max = t[-1]; x_min = x_max - PLOT_SECONDS
+    # 有効なデータの位置を探す (0埋めされている部分を除外)
+    valid_idx = np.where(t != 0)[0]
+    if len(valid_idx) == 0:
+        return line_ax, line_ay, line_az, line_norm, line_baro, line_kalt, norm_text, alt_text
+    
+    t_plot = t[valid_idx]
+    ax_p = _ax[valid_idx]; ay_p = _ay[valid_idx]; az_p = _az[valid_idx]
+    nm_p = _nm[valid_idx]; br_p = _br[valid_idx]; ka_p = _ka[valid_idx]
+
+    x_max = t_plot[-1]; x_min = x_max - PLOT_SECONDS
     ax_plot.set_xlim(x_min, x_max)
     alt_plot.set_xlim(x_min, x_max)
 
-    # 高度レンジを自動調整（余白を小さくしてブレを見やすくする）
-    ka_range = _ka.max() - _ka.min()
+    # 高度レンジを自動調整
+    ka_range = ka_p.max() - ka_p.min()
     if ka_range > 0.01:
-        # 最小余白を0.2mにして、微小な変動をズームする
         margin = max(0.2, ka_range * 0.2)
-        alt_plot.set_ylim(_ka.min() - margin, _ka.max() + margin)
+        alt_plot.set_ylim(ka_p.min() - margin, ka_p.max() + margin)
 
-    line_ax.set_data(t, _ax); line_ay.set_data(t, _ay)
-    line_az.set_data(t, _az); line_norm.set_data(t, _nm)
-    line_baro.set_data(t, _br); line_kalt.set_data(t, _ka)
+    line_ax.set_data(t_plot, ax_p); line_ay.set_data(t_plot, ay_p)
+    line_az.set_data(t_plot, az_p); line_norm.set_data(t_plot, nm_p)
+    line_baro.set_data(t_plot, br_p); line_kalt.set_data(t_plot, ka_p)
 
-    cur_norm = _nm[-1]
+    cur_norm = nm_p[-1]
     status = "OK" if 0.95 < cur_norm < 1.05 else ("scale?" if cur_norm > 1.5 else "check")
     norm_text.set_text(f"|a|={cur_norm:.3f}g [{status}]")
     norm_text.set_color("green" if status == "OK" else "red")
