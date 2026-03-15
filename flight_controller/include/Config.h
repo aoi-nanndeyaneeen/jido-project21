@@ -106,9 +106,23 @@ namespace Config {
         // MPU6050のスケール (±2g, ±250dps)
         constexpr float ACCEL_SCALE = 16384.0f;
         constexpr float GYRO_SCALE  = 131.0f;
+
+        // ---- ソフトウェア・キャリブレーション補正値 ----
+        // monitor.py と同じ仕組み: 
+        // 1. 各軸のバイアスを引く
+        // 2. ay は符号を反転する
+        // 3. az は 1.0g 分を残すようにオフセット計算する
+        inline float s_ax_bias = 0.0f;
+        inline float s_ay_bias = 0.0f;
+        inline float s_az_bias = 0.0f;
+        
+        inline float s_gx_bias = 0.0f;
+        inline float s_gy_bias = 0.0f;
+        inline float s_gz_bias = 0.0f;
         
         // monitor.pyのキャリブレーション(Rキー)で得られたオフセット値を入力する
         // デフォルトは0に設定。機体ごとに調整すること
+        // ハードウェアオフセット(レジスタ書き込み)は不具合の原因になるため使用しない
         constexpr int16_t ACCEL_X_OFFSET = 0;
         constexpr int16_t ACCEL_Y_OFFSET = 0;
         constexpr int16_t ACCEL_Z_OFFSET = 0;

@@ -48,21 +48,22 @@ PLOT_POINTS  = int(PLOT_SECONDS * SAMPLE_RATE)
 
 # ============================================================
 #  カルマンフィルタ
-#  目標: 3m→6mの変化を0.1秒以内に反映
-#  R_baro=0.05 + BMP280 20Hz → 約50ms/サンプルで即追従
+#  【トレードオフ】 R_baro を +/- キーで調整可能:
+#    R_baro小 (0.02) → 気圧を強く信頼 → 即応答・ノイズ多め
+#    R_baro大 (1.0+) → 加速度予測を信頼 → 遅応答・滑らか
+#  BMP280 10HzでのR_baro推奨値: 0.1～0.3
 # ============================================================
+R_BARO_DEFAULT = 0.15  # BMP280 10Hz + FILTER_X16 向けデフォルト
+
 class AltitudeKalman:
     def __init__(self):
         self.z   = 0.0   # 推定高度 [m]
         self.vz  = 0.0   # 推定垂直速度 [m/s]
         self.P   = np.eye(2)
 
-        # BMP280 FILTER_X16 + SAMPLING_X16設定に合わせたパラメータ
-        # BMP280が遅くて正確(2Hz, σ≈0.1m) → R_baro小さく強く信頼
-        # 加速度が速くて積分誤差あり → Q_vz大きく速度変化を許容
         self.Q_z    = 0.001  # 高度プロセスノイズ
-        self.Q_vz   = 0.15   # 速度プロセスノイズ (0.2から少し下げて安定性へ振る)
-        self.R_baro = 0.02   # BMP280観測ノイズ (X4フィルタに合わせて調整)
+        self.Q_vz   = 0.10   # 速度プロセスノイズ
+        self.R_baro = R_BARO_DEFAULT  # BMP280観測ノイズ (+/- キーで調整可能)
 
     def init(self, alt):
         self.z = alt; self.vz = 0.0
@@ -93,13 +94,13 @@ offset   = np.zeros(3)      # [ax, ay, az] 生値オフセット
 kalman   = AltitudeKalman()
 alt_base = 0.0              # Bキーでリセットする高度ベースライン
 
-buf_time  = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
-buf_ax    = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
-buf_ay    = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
-buf_az    = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
-buf_norm  = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
-buf_baro  = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
-buf_kalt  = deque([0.0] * PLOT_POINTS, maxlen=PLOT_POINTS)
+buf_time  = deque(maxlen=PLOT_POINTS)
+buf_ax    = deque(maxlen=PLOT_POINTS)
+buf_ay    = deque(maxlen=PLOT_POINTS)
+buf_az    = deque(maxlen=PLOT_POINTS)
+buf_norm  = deque(maxlen=PLOT_POINTS)
+buf_baro  = deque(maxlen=PLOT_POINTS)
+buf_kalt  = deque(maxlen=PLOT_POINTS)
 
 lock          = threading.Lock()
 calib_flag    = False
@@ -113,6 +114,17 @@ kalman_ready  = False
 CALIB_SAMPLES = 200
 BASELINE_SAMPLES = 50   # 起動時に何サンプル平均でベースラインを決めるか
 baseline_buf  = []      # 起動時のベースライン収集用
+auto_calib_done = False  # 起動時の自動キャリブレーション完了フラグ
+auto_calib_buf  = []     # 起動時の自動キャリブレーション用バッファ
+
+def clear_deques():
+    """描画用バッファをすべてクリアする（キャリブ直後の履歴を消却）"""
+    with lock:
+        buf_time.clear()
+        buf_ax.clear(); buf_ay.clear(); buf_az.clear()
+        buf_norm.clear()
+        buf_baro.clear()
+        buf_kalt.clear()
 
 # ============================================================
 #  ポート検出
@@ -136,6 +148,7 @@ def find_port():
 def serial_thread(ser):
     global offset, calib_flag, calib_buf, t_start, t_last
     global baro_prev, kalman_ready, alt_base
+    global auto_calib_done, auto_calib_buf
 
     ser.reset_input_buffer()
     print("Receiving...")
@@ -182,7 +195,32 @@ def serial_thread(ser):
             except (ValueError, IndexError):
                 continue
 
-            # --- キャリブ収集 ---
+            # --- 起動時の自動キャリブレーション ---
+            if not auto_calib_done:
+                auto_calib_buf.append([ax_r, ay_r, az_r])
+                if len(auto_calib_buf) >= CALIB_SAMPLES:
+                    arr  = np.array(auto_calib_buf, dtype=float)
+                    mean = arr.mean(axis=0)
+                    new_off = mean.copy()
+                    new_off[2] = mean[2] - ACCEL_SCALE  # az: 重力1g分を残す
+                    with lock:
+                        offset[:] = new_off
+                    auto_calib_buf.clear()
+                    auto_calib_done = True
+                    _az_check = (mean[2] - new_off[2]) / ACCEL_SCALE
+                    print(f"[Auto-Calib done] offset=({new_off[0]:.0f}, {new_off[1]:.0f}, {new_off[2]:.0f})  "
+                          f"az_check={_az_check:.4f}g")
+                    
+                    # キャリブレーション完了直後に高度とVZをリセットしてドリフトをクリアする
+                    with lock:
+                        if buf_baro:
+                            alt_base = baro_adj
+                        kalman.init(0.0)
+                    clear_deques()
+                    print("[Auto-Reset] Calibration donor. History cleared.")
+                # 自動キャリブ中もベースライン収集は続行させるためcontinueしない
+
+            # --- 手動キャリブ収集 (Rキー) ---
             if calib_flag:
                 calib_buf.append([ax_r, ay_r, az_r])
                 if len(calib_buf) >= CALIB_SAMPLES:
@@ -269,6 +307,7 @@ def keyboard_thread():
                 if buf_baro:
                     alt_base += list(buf_baro)[-1]
             kalman.init(0.0)
+            clear_deques()
 
             # --- Teensyへコマンド送信 ---
             try:
@@ -281,6 +320,7 @@ def keyboard_thread():
                 if buf_baro:
                     alt_base += list(buf_baro)[-1]  # 現在の相対高度をベースに加算
             kalman.init(0.0)
+            clear_deques()
             print("[Baseline reset] Current altitude -> 0 m")
         elif c == "L":
             if not logging_flag:
@@ -300,12 +340,20 @@ def keyboard_thread():
             if log_file:
                 log_file.flush(); log_file.close()
             sys.exit(0)
+        elif c == "+" or c == "=":
+            # R_baroを上げる → 気圧を信頼しない → 滑らか・遅応答
+            kalman.R_baro = min(kalman.R_baro * 2.0, 10.0)
+            print(f"[R_baro ↑] {kalman.R_baro:.4f}  (滑らか・遅応答)")
+        elif c == "-":
+            # R_baroを下げる → 気圧を強く信頼 → 即応答・ノイズ多め
+            kalman.R_baro = max(kalman.R_baro / 2.0, 0.005)
+            print(f"[R_baro ↓] {kalman.R_baro:.4f}  (即応答・ノイズ多め)")
 
 # ============================================================
 #  グラフ設定
 # ============================================================
 fig, (ax_plot, alt_plot) = plt.subplots(2, 1, figsize=(11, 7))
-fig.suptitle("IMU Monitor  |  R=Calib  B=BaselineReset  L=Log  Q=Quit", fontsize=11)
+fig.suptitle("IMU Monitor  |  R=Calib  B=Baseline  L=Log  +/-=R_baro  Q=Quit", fontsize=11)
 
 # 上段: 加速度
 ax_plot.set_title("Accelerometer [g]")
@@ -321,7 +369,7 @@ alt_plot.set_title("Altitude [m]  (relative to baseline)")
 alt_plot.set_ylim(-5, 20)
 alt_plot.axhline(0.0, color="gray", lw=0.5)
 alt_plot.set_ylabel("[m]")
-alt_plot.set_xlabel("Time [s]")
+alt_plot.set_xlabel("Time [s during last 8s]")
 alt_plot.grid(True, alpha=0.3)
 
 line_ax,   = ax_plot.plot([], [], "r-",  lw=1.2, label="ax")
@@ -347,21 +395,16 @@ def update_plot(_):
         _br  = np.array(buf_baro)
         _ka  = np.array(buf_kalt)
 
-    if len(t) == 0 or np.all(t == 0):
+    if len(t) == 0:
         return line_ax, line_ay, line_az, line_norm, line_baro, line_kalt, norm_text, alt_text
 
-    # 有効なデータの位置を探す (0埋めされている部分を除外)
-    valid_idx = np.where(t != 0)[0]
-    if len(valid_idx) == 0:
-        return line_ax, line_ay, line_az, line_norm, line_baro, line_kalt, norm_text, alt_text
-    
-    t_plot = t[valid_idx]
-    ax_p = _ax[valid_idx]; ay_p = _ay[valid_idx]; az_p = _az[valid_idx]
-    nm_p = _nm[valid_idx]; br_p = _br[valid_idx]; ka_p = _ka[valid_idx]
+    t_plot = t - t[-1]  # 現在時刻を 0 にする相対表示
+    ax_p = _ax; ay_p = _ay; az_p = _az
+    nm_p = _nm; br_p = _br; ka_p = _ka
 
-    x_max = t_plot[-1]; x_min = x_max - PLOT_SECONDS
-    ax_plot.set_xlim(x_min, x_max)
-    alt_plot.set_xlim(x_min, x_max)
+    # X軸を常に最新 8秒間に固定
+    ax_plot.set_xlim(-PLOT_SECONDS, 0)
+    alt_plot.set_xlim(-PLOT_SECONDS, 0)
 
     # 高度レンジを自動調整
     ka_range = ka_p.max() - ka_p.min()
@@ -378,16 +421,14 @@ def update_plot(_):
     norm_text.set_text(f"|a|={cur_norm:.3f}g [{status}]")
     norm_text.set_color("green" if status == "OK" else "red")
 
-    # 7秒間の計算 (SAMPLE_RATE = 50, 最新7秒間 = 350サンプル)
-    eval_points = int(7.0 * SAMPLE_RATE)
-    if len(_ka) > eval_points:
-        _ka_eval = _ka[-eval_points:]
-    else:
-        _ka_eval = _ka
+    # 8秒間の計算 (相対時刻 [-8, 0] の中から選ぶ)
+    eval_mask = t_plot >= -8.0
+    _ka_eval = ka_p[eval_mask]
 
-    if len(_ka_eval) > 0:
+    if len(_ka_eval) > 10:  # 最低10サンプル必要
         ka_p2p = _ka_eval.max() - _ka_eval.min()
         ka_std = np.std(_ka_eval)
+        # 条件: P-P振れ幅が 0.4m (±0.2m) 以内
         stable_str = " [STABLE]" if ka_p2p <= 0.4 else ""
         stable_color = "green" if ka_p2p <= 0.4 else "black"
     else:
@@ -397,7 +438,7 @@ def update_plot(_):
         stable_color = "gray"
 
     alt_text.set_text(f"baro={_br[-1]:.2f}m  kalman={_ka[-1]:.2f}m  vz={kalman.vz:.2f}m/s\n"
-                      f"7s precision: P-P={ka_p2p:.3f}m  std={ka_std:.3f}m{stable_str}")
+                      f"8s precision: P-P={ka_p2p:.3f}m  std={ka_std:.3f}m{stable_str}")
     alt_text.set_color(stable_color)
 
     return line_ax, line_ay, line_az, line_norm, line_baro, line_kalt, norm_text, alt_text
@@ -419,6 +460,6 @@ if __name__ == "__main__":
     threading.Thread(target=keyboard_thread,               daemon=True).start()
 
     ani = animation.FuncAnimation(fig, update_plot, interval=100,
-                                  blit=True, cache_frame_data=False)
+                                  blit=False, cache_frame_data=False)
     plt.tight_layout()
     plt.show()
