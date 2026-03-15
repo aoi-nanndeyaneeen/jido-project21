@@ -104,8 +104,10 @@ void loop() {
             dbg_cnt = 0;
             barometer.update();
             Plane_Data.update(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
-                             mpu.getGyroX(), mpu.getGyroY(), mpu.getGyroZ(),
+                             Roll.ang, Pitch.ang, Yaw.ang,
                              barometer.get_smoothed_altitude());
+            
+            im920.write(Plane_Data);
 
             Serial.print("\033[2J\033[H"); // 常にシリアルモニタの上に表示する
 

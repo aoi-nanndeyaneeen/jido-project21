@@ -77,15 +77,27 @@ def main():
     # ── シリアル（センサ）初期化 ──────────────────
     print(f"\n[INIT 2/4]  センサ受信モジュール起動中...  ({SERIAL_PORT} @ {SERIAL_BAUD}bps)")
     alt_sensor = SerialReceiver(port=SERIAL_PORT, baudrate=SERIAL_BAUD)
-    time.sleep(0.5)  # 最初のデータが来るまで少し待つ
+    
+    # データが来るまで最大2秒待機
+    print("  [WAIT]   データ受信待ち...", end="", flush=True)
+    for _ in range(20):
+        time.sleep(0.1)
+        alt = alt_sensor.get_altitude()
+        acc = alt_sensor.get_accel()
+        if acc != (0.0, 0.0, 0.0) or alt != 0.0:
+            print(" [OK]")
+            break
+        print(".", end="", flush=True)
+    else:
+        print(" [TIMEOUT]")
 
     alt  = alt_sensor.get_altitude()
     acc  = alt_sensor.get_accel()
     if acc == (0.0, 0.0, 0.0) and alt == 0.0:
-        print(f"  [WARN]   センサデータ未受信（ケーブル・COMポートを確認）")
+        print(f"  [WARN]   センサデータ未受信（ケーブル・COMポート・他のソフトがポートを占有していないか確認）")
     else:
         print(f"  [OK]     高度     : {alt:.2f} m")
-        print(f"  [OK]     加速度   : Ax={acc[0]:.2f}  Ay={acc[1]:.2f}  Az={acc[2]:.2f}  [m/s²]")
+        print(f"  [OK]     加速度   : Ax={acc[0]:.3f}  Ay={acc[1]:.3f}  Az={acc[2]:.3f}  [g]")
     time.sleep(0.2)
 
     # ── 行列・ログ準備 ────────────────────────────

@@ -318,7 +318,8 @@ def keyboard_thread():
             # 現在地を高度0mにリセット
             with lock:
                 if buf_baro:
-                    alt_base += list(buf_baro)[-1]  # 現在の相対高度をベースに加算
+                    current_alt = list(buf_baro)[-1]
+                    alt_base += current_alt  # 現在の相対高度をベースに加算
             kalman.init(0.0)
             clear_deques()
             print("[Baseline reset] Current altitude -> 0 m")

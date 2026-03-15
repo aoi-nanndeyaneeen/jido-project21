@@ -25,7 +25,7 @@ Axis_value  Roll(ROLL_gain.kp_rate, ROLL_gain.ki_rate, ROLL_gain.kd_rate, ROLL_g
             Yaw(YAW_gain.kp_rate, YAW_gain.ki_rate, YAW_gain.kd_rate, YAW_gain.kp_angle, YAW_gain.ki_angle, YAW_gain.kd_angle, YAW_gain.sensitivity, YAW_gain.rate_d_alpha, YAW_gain.rate_i_limit, YAW_gain.angle_d_alpha, YAW_gain.angle_i_limit);
 
 IMU mpu(Config::wire::mpu);
-BarometerSensor barometer(1013.25, 0.1, Config::wire::bmp);
+BarometerSensor barometer(Config::sensor::BARO_SEA_LEVEL_HPA, Config::sensor::BARO_ALPHA, Config::wire::bmp);
 
 Sbus sbus(Config::serial::sbus);
 IM920SL_Generic<PlaneData, GroundData> im920(Config::serial::im920);

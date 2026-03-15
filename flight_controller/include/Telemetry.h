@@ -25,7 +25,7 @@ public:
         uint8_t *p = (uint8_t *)&data;
         size_t size = sizeof(Sender);
         uint32_t _check_sum = 0;
-        _IM920SL_Serial->print("TXDA");
+        _IM920SL_Serial->print("TXDA "); // Added space
         for (size_t i = 0; i < size; i++) {
             char buf[3];
             _check_sum += p[i];
@@ -66,10 +66,11 @@ public:
         }
         return false;
     }
-
     bool get_stl() {
         while (_IM920SL_Serial->available() > 0) {
-            _raw += (char)_IM920SL_Serial->read();
+            char c = (char)_IM920SL_Serial->read();
+            _raw += c;
+            // Serial.print(c); // Raw echo for heavy debugging (optional)
         }
         if (_raw.indexOf("\r\n") == -1) return false;
         if (_raw.indexOf(':') == -1) {

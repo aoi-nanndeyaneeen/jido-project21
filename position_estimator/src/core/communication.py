@@ -43,6 +43,7 @@ class SerialReceiver:
         self.thread.start()
 
     def _receive_loop(self):
+        print(f"[SerialReceiver] 受信ループを開始しました ({self.port})")
         while self.is_running:
             try:
                 if self.ser.in_waiting > 0:
@@ -52,6 +53,9 @@ class SerialReceiver:
                     if not line:
                         continue
 
+                    # デバッグ用: 受信した生の行を表示（必要に応じてコメントアウト）
+                    # print(f"[DEBUG RAW] {line}")
+
                     # パターン1: "DATA,高度,ax,ay,az"
                     if line.startswith("DATA,"):
                         parts = line.split(",")
@@ -60,16 +64,20 @@ class SerialReceiver:
                             self.latest_accel    = (float(parts[2]), float(parts[3]), float(parts[4]))
                         continue
 
-                    # パターン2: "Alt  : -8.92 m"
-                    if "Alt" in line:
+                    # パターン2: "Alt  : -8.92 m" または "lt: -31.08 m"
+                    if "Alt" in line or "lt:" in line:
+                        # "lt: -31.08 m" のような形式に対応
                         m = re.search(r"[-+]?\d+\.?\d*", line)
                         if m:
                             self.latest_altitude = float(m.group())
 
-                    # パターン3: "Accel: [-45.96, -84.84, 152.80] g"
-                    if "Accel" in line or "accel" in line:
+                    # パターン3: "Accel: [-45.96, -84.84, 152.80] g" 
+                    # または "Acc: ax=-0.2144 ay=-0.3411 az=+1.0781 [g]"
+                    if "Acc" in line or "accel" in line:
+                        # "ax=-0.2144 ay=-0.3411 az=+1.0781" から数値を抽出
                         nums = re.findall(r"[-+]?\d+\.?\d*", line)
                         if len(nums) >= 3:
+                            # 最初の3つの数値を ax, ay, az として取得
                             self.latest_accel = (float(nums[0]), float(nums[1]), float(nums[2]))
                             if not self._accel_received:
                                 print(f"[SerialReceiver] 加速度の受信を確認: {self.latest_accel}")
@@ -78,7 +86,7 @@ class SerialReceiver:
             except Exception as e:
                 print(f"[SerialReceiver] 受信エラー: {e}")
 
-            time.sleep(0.005)
+            time.sleep(0.001) # ループを少し速める
 
     def get_altitude(self):
         return self.latest_altitude

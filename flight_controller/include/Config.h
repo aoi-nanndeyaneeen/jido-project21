@@ -131,11 +131,14 @@ namespace Config {
         constexpr int16_t GYRO_Y_OFFSET  = 0;
         constexpr int16_t GYRO_Z_OFFSET  = 0;
 
+        // 気圧センサ設定
+        constexpr float BARO_SEA_LEVEL_HPA = 1013.25f;
+        constexpr float BARO_ALPHA         = 0.1f;
         // BMP280 気圧センサー設定 (main_test の実績値に合わせる)
-        constexpr auto BMP_STANDBY = Adafruit_BMP280::STANDBY_MS_1;
+        constexpr auto BMP_STANDBY = Adafruit_BMP280::STANDBY_MS_500;
         constexpr auto BMP_FILTER  = Adafruit_BMP280::FILTER_X16;
-        constexpr auto BMP_SAMP_P  = Adafruit_BMP280::SAMPLING_X4;
-        constexpr auto BMP_SAMP_T  = Adafruit_BMP280::SAMPLING_X1;
+        constexpr auto BMP_SAMP_P  = Adafruit_BMP280::SAMPLING_X16;
+        constexpr auto BMP_SAMP_T  = Adafruit_BMP280::SAMPLING_X2;
     }
 
     namespace Timing {
