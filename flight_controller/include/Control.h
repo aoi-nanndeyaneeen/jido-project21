@@ -47,8 +47,7 @@ public:
 
 class Axis_value {
 public:
-    float des, ang, acc, gyr;
-    float pid_rate, pid_ang, pid;
+    float ang, acc, gyr, tar, cmd, sbus, pid;
     float Sen;
     PID c_rate, c_ang;
 
@@ -61,7 +60,7 @@ public:
     }
 
     void update_value(float des_in, float ang_in, float acc_in, float gyr_in) {
-        des = des_in; ang = ang_in; acc = acc_in; gyr = gyr_in;
+        sbus = des_in; ang = ang_in; acc = acc_in; gyr = gyr_in;
     }
     
     void pid_reset() {
@@ -71,19 +70,46 @@ public:
 
     void update_RateAnglePID(float input){
         static int counter = 0;
+        static float pid_ang = 0;
+        counter++;
         if(++counter >= 10){// 1000Hz / 10 = 100Hz
             pid_ang  = c_ang.pidStep (ang,input,Sen);
             counter = 0;
         }  
         pid = c_rate.pidStep(gyr,pid_ang ,1);
+        cmd = pid;
     }
 
     void update_RatePID(float input) {
         pid = c_rate.pidStep(gyr, input, Sen);
+        cmd = pid;
     }
 
     void update_AnglePID(float input) {
         pid = c_ang.pidStep(ang, input, Sen);
+        cmd = pid;
+    }
+
+    void update_RateAnglePID(){
+    static int counter = 0;
+    static float pid_ang = 0;
+    counter++;
+    if(++counter >= 10){// 1000Hz / 10 = 100Hz
+        pid_ang  = c_ang.pidStep (ang,tar,Sen);
+        counter = 0;
+    }  
+    pid = c_rate.pidStep(gyr,pid_ang ,1);
+    cmd = pid;
+    }
+
+    void update_RatePID() {
+        pid = c_rate.pidStep(gyr, tar, Sen);
+        cmd = pid;
+    }
+
+    void update_AnglePID() {
+        pid = c_ang.pidStep(ang, tar, Sen);
+        cmd = pid;
     }
 
     void Rate_PID_adj(float kp_adj, float ki_adj, float kd_adj) {
