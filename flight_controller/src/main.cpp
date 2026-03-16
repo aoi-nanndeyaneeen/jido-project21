@@ -134,11 +134,11 @@ void loop() {
 void updateSensorsAndComms() {
     mpu.update();
     sbus.update();
-    Mode.update(sbus.Ch_state(Aux1), sbus.Ch_state(Aux2));
+    Mode.update(sbus.Ch_state(Aux2), sbus.Ch_state(Aux3));
 
-    Roll.update_value(sbus.des[Ch::ROLL],   mpu.getRoll(),  mpu.getAccX(), mpu.getGyroX());
-    Pitch.update_value(sbus.des[Ch::PITCH], mpu.getPitch(), mpu.getAccY(), mpu.getGyroY());
-    Yaw.update_value(sbus.des[Ch::YAW],     mpu.getYaw(),   mpu.getAccZ(), mpu.getGyroZ());
+    Roll.update_value(sbus.des[Ch::ROLL],    -mpu.getRoll(),  mpu.getAccX(), mpu.getGyroX());
+    Pitch.update_value(sbus.des[Ch::PITCH], -mpu.getPitch(),  mpu.getAccY(), mpu.getGyroY());
+    Yaw.update_value(sbus.des[Ch::YAW],        mpu.getYaw(),  mpu.getAccZ(), mpu.getGyroZ());
 
     // --- シリアルコマンド (PCモニタからのRキー等) ---
     if (reset()) {
@@ -151,6 +151,16 @@ void updateSensorsAndComms() {
 
     // 地上局からパラメータ受信
     if (im920.read(Ground_Data)) {
+        // --- リモートリセット(Ground Receiverからの'R'キー)の処理 ---
+        if (Ground_Data.reset_cmd == 1) {
+            mpu.recalibrate();
+            barometer.reset();
+            Config::Timing::resetTiming();
+            Roll.pid_reset(); Pitch.pid_reset(); Yaw.pid_reset();
+            Serial.println("INFO: Remote Reset Complete.");
+            Ground_Data.reset_cmd = 0;
+        }
+
         if (Ground_Data.roll  != 0.0f) BANK_ANGLE = fabsf(Ground_Data.roll);
         if (Ground_Data.pitch != 0.0f) TURN_MS    = (unsigned long)(Ground_Data.pitch * 1000.0f);
         

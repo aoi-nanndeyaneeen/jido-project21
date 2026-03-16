@@ -53,14 +53,15 @@ public:
     float getGyroY_Raw() { return (float)gy_raw / Config::sensor::GYRO_SCALE; }
     float getGyroZ_Raw() { return (float)gz_raw / Config::sensor::GYRO_SCALE; }
     
-    // ソフトウェア補正適用済みの値
-    float getAccX() { return (getAccX_Raw() - Config::sensor::s_ax_bias); }
-    float getAccY() { return -(getAccY_Raw() - Config::sensor::s_ay_bias); } // Y軸反転
-    float getAccZ() { return (getAccZ_Raw() - Config::sensor::s_az_bias); }
+    // ソフトウェア補正適用済みの値 (機体座標系: Forward, Left, Up)
+    // ユーザーの報告に基づき: 前倒しでX=-1 -> 前は-X, 右倒しでY=-1 (左は上がって+1のはず) -> 左は-Y
+    float getAccX()  { return -(getAccX_Raw() - Config::sensor::s_ax_bias); } // 前 = -X
+    float getAccY()  { return -(getAccY_Raw() - Config::sensor::s_ay_bias); } // 左 = -Y
+    float getAccZ()  { return  (getAccZ_Raw() - Config::sensor::s_az_bias); } // 上 = +Z
 
-    float getGyroX() { return getGyroX_Raw() - Config::sensor::s_gx_bias; }
-    float getGyroY() { return getGyroY_Raw() - Config::sensor::s_gy_bias; }
-    float getGyroZ() { return getGyroZ_Raw() - Config::sensor::s_gz_bias; }
+    float getGyroX() { return -(getGyroX_Raw() - Config::sensor::s_gx_bias); }
+    float getGyroY() { return -(getGyroY_Raw() - Config::sensor::s_gy_bias); }
+    float getGyroZ() { return  (getGyroZ_Raw() - Config::sensor::s_gz_bias); }
 
     float getRoll()  { return filter.getRoll(); }
     float getPitch() { return filter.getPitch(); }

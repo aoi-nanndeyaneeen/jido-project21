@@ -26,8 +26,9 @@ struct __attribute__((__packed__)) PlaneData {
 struct __attribute__((__packed__)) GroundData {
     float p_adj, i_adj, d_adj;
     float roll, pitch, yaw;
+    uint8_t reset_cmd; // 1: Reset trigger
     
-    void update(float p, float i, float d, float r, float pt, float y) {
+    void update(float p, float i, float d, float r, float pt, float y, uint8_t reset = 0) {
         p_adj = p; i_adj = i; d_adj = d;
         roll = r; pitch = pt; yaw = y;
     }

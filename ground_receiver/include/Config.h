@@ -18,6 +18,7 @@ struct __attribute__((__packed__)) PlaneData {
 struct __attribute__((__packed__)) GroundData {
     float p_adj, i_adj, d_adj;
     float roll, pitch, yaw;
+    uint8_t reset_cmd; // 1: Reset trigger
     
     void print() const {
         Serial.println("=== Ground Data ===");
