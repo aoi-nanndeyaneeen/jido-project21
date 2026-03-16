@@ -93,7 +93,7 @@ PID_Gains   ROLL_gain  = {1.2f, 0.5f, 0.01f, 4.5f, 0.0f, 0.0f, 1.0f, 0.7f, 200.0
 namespace Config {
 
     namespace serial{
-        inline HardwareSerial* const im920 = &Serial1; // IM920SL用シリアルポート
+        inline HardwareSerial* const im920 = &Serial3; // IM920SL用シリアルポート
         inline HardwareSerial* const sbus  = &Serial2; // S.BUS用シリアルポート
     }
 

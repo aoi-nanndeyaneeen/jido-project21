@@ -43,49 +43,69 @@ public:
     }
 
     bool read(Reciver &data) {
-        uint8_t *p = (uint8_t *)&data;
-        size_t size = sizeof(Reciver);
+        if (!get_stl()) return false;
+
+        uint8_t buffer[sizeof(Reciver)];
         uint32_t _check_sum = 0;
-        if (get_stl()) {
-            for (size_t i = 0; i < size; i++) {
-                _Byte = _temp;
-                _Byte.remove(2, _Byte.length());
-                p[i] = (uint8_t)strtoul(_Byte.c_str(), NULL, 16);
-                _check_sum += p[i];
-                _temp.remove(0, 2);
-            }
-            uint32_t q;
-            uint8_t *r = (uint8_t *)&q;
-            for (size_t i = 0; i < sizeof(_check_sum); i++) {
-                _Byte = _temp;
-                _Byte.remove(2, _Byte.length());
-                r[i] = (uint8_t)strtoul(_Byte.c_str(), NULL, 16);
-                _temp.remove(0, 2);
-            }
-            if (_check_sum + q == 0) return true;
+
+        // パースした行（_temp）から実データを読み取る
+        for (size_t i = 0; i < sizeof(Reciver); i++) {
+            _Byte = _temp.substring(0, 2);
+            buffer[i] = (uint8_t)strtoul(_Byte.c_str(), NULL, 16);
+            _check_sum += buffer[i];
+            _temp.remove(0, 2);
         }
+
+        // チェックサム部分（最後の4バイト）を読み取る
+        uint32_t q = 0;
+        uint8_t *r = (uint8_t *)&q;
+        for (size_t i = 0; i < sizeof(q); i++) {
+            _Byte = _temp.substring(0, 2);
+            r[i] = (uint8_t)strtoul(_Byte.c_str(), NULL, 16);
+            _temp.remove(0, 2);
+        }
+
+        // 正しければ構造体に反映
+        if (_check_sum + q == 0) {
+            memcpy(&data, buffer, sizeof(Reciver));
+            return true;
+        }
+
         return false;
     }
+
     bool get_stl() {
         while (_IM920SL_Serial->available() > 0) {
             char c = (char)_IM920SL_Serial->read();
             _raw += c;
-            // Serial.print(c); // Raw echo for heavy debugging (optional)
         }
-        if (_raw.indexOf("\r\n") == -1) return false;
-        if (_raw.indexOf(':') == -1) {
-            Serial.println(_raw);
-            _raw.remove(0, _raw.indexOf("\r\n") + 2);
-            return false;
-        } else {
+
+        while (true) {
+            
             int line_end = _raw.indexOf("\r\n");
-            int colon = _raw.indexOf(':');
-            _temp = _raw;
+            if (line_end == -1) {
+                return false; // 改行まで受信していない
+            }
+
+            // 1行切り出す
+            String line = _raw.substring(0, line_end);
             _raw.remove(0, line_end + 2);
-            _temp.remove(line_end, _temp.length());
-            _temp.remove(0, colon + 1);
-            _temp.replace(",", "");
-            return true;
+
+            int colon = line.indexOf(':');
+            if (colon == -1) {
+                Serial.print(_raw);
+                // ':'が含まれていない行はデータではないのでスキップ (例: "OK", 起動メッセージ等)
+                continue;
+            }
+
+            // ':' 以降をデータ文字列として抽出
+            _temp = line.substring(colon + 1);
+            _temp.replace(",", ""); // RSSIや他の付加情報を消す場合など
+            
+            // 十分な長さがあるかチェック (データ部 + チェックサム4バイト(8文字))
+            if (_temp.length() >= (sizeof(Reciver) * 2 + 8)) {
+                return true;
+            }
         }
     }
 };
