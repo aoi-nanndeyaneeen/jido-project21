@@ -2,6 +2,14 @@
 #include <Arduino.h>
 #include "Config.h"
 
+bool reset(){
+    if (Serial.available()){
+        char c = toupper(Serial.read());
+        if( c == 'R') return true;
+    }
+    return false;
+}
+
 void print_PID(float r, float p, float y) {
     Serial.print("|PIDRoll= ");  Serial.print(r, 3);
     Serial.print("|PIDPitch= "); Serial.print(p, 3);

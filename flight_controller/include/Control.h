@@ -31,10 +31,10 @@ public:
     d_lpf = 0.0f;   // フィルタ後の微分値もクリア
     }
 
-    float pidStep(float input, float des, float kando) {
+    float pidStep(float input, float tar, float kando) {
         float dt_sec = Config::Timing::Main_dt / 1e6f; // Config.h 宣言された メイン周期のdt を使用
         float PID_value = 0;
-        float e = des * kando - input;
+        float e = tar * kando - input;
         float d_raw = (e - prev) / dt_sec;
         i += e * dt_sec;
         d_lpf = d_alpha * d_lpf + (1.0f - d_alpha) * d_raw;
