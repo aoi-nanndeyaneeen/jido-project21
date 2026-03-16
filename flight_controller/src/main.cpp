@@ -112,6 +112,10 @@ void loop() {
             Serial.print("\033[2J\033[H"); // 常にシリアルモニタの上に表示する
 
             print_flightmode(int(Mode.get_mode()), BANK_ANGLE, TURN_MS);
+
+            Serial.print("\033[2J\033[H"); // ターミナルクリア
+            im920.write(Plane_Data);
+
             print_PID(Roll.pid, Pitch.pid, Yaw.pid);
             print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
             print_ACC(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ());
@@ -136,16 +140,13 @@ void updateSensorsAndComms() {
     Pitch.update_value(sbus.des[Ch::PITCH], mpu.getPitch(), mpu.getAccY(), mpu.getGyroY());
     Yaw.update_value(sbus.des[Ch::YAW],     mpu.getYaw(),   mpu.getAccZ(), mpu.getGyroZ());
 
-    // シリアルコマンド (R:リセット)
-    if (Serial.available()) {
-        char c = toupper(Serial.read());
-        if (c == 'R') {
-            mpu.recalibrate();
-            barometer.reset();
-            T::resetTiming();
-            Roll.pid_reset(); Pitch.pid_reset(); Yaw.pid_reset();
-            Serial.println("INFO: Reset Complete (Acc to 0,0,1).");
-        }
+    // --- シリアルコマンド (PCモニタからのRキー等) ---
+    if (reset()) {
+        mpu.recalibrate();
+        barometer.reset();
+        Config::Timing::resetTiming();
+        Roll.pid_reset(); Pitch.pid_reset(); Yaw.pid_reset();
+        Serial.println("INFO: System-wide Reset Complete.");
     }
 
     // 地上局からパラメータ受信
@@ -155,7 +156,7 @@ void updateSensorsAndComms() {
         
         if (Ground_Data.p_adj != 0.0f || Ground_Data.i_adj != 0.0f || Ground_Data.d_adj != 0.0f) {
             Roll.Rate_PID_adj(Ground_Data.p_adj, Ground_Data.i_adj, Ground_Data.d_adj);
-            Pitch.Rate_PID_adj(Ground_Data.p_adj, Ground_Data.i_adj, Ground_Data.d_adj);
+            //Pitch.Rate_PID_adj(Ground_Data.p_adj, Ground_Data.i_adj, Ground_Data.d_adj);
         }
     }
 }
@@ -164,40 +165,52 @@ void updateSensorsAndComms() {
 //  自律制御
 // ============================================================
 void autonomousControl() {
-    float target_roll  = 0.0f;
-    float target_pitch = 0.0f;
 
     switch (Mode.get_mode()) {
         case MODE_LEVEL_TURN:
-            target_roll = +BANK_ANGLE;
+            // ★ 左旋回にしたい場合は -BANK_ANGLE にする
+            Roll.tar = +BANK_ANGLE;
             break;
 
         case MODE_FIGURE_8: {
             unsigned long elapsed = millis() - Mode.modeStartMs;
             int phase = (int)(elapsed / TURN_MS) % 2;
-            target_roll = (phase == 0) ? +BANK_ANGLE : -BANK_ANGLE;
+            Roll.tar = (phase == 0) ? +BANK_ANGLE : -BANK_ANGLE;
             break;
         }
 
-        case MODE_MANUAL:
+        case MODE_SEMI_MANUAL:{
+            // ============================================================
+            //  マニュアル制御: スティック → レートPID → サーボ
+            // ============================================================
             Roll.tar = Roll.sbus;
             Pitch.tar= Pitch.sbus;
             Yaw.tar  = Yaw.sbus;
             Roll.update_RatePID();
             Pitch.update_RatePID();
             Yaw.update_RatePID();
-            return;
-        
+            return; //ここで戻る   
+        }
+
+        case MODE_MANUAL:{
+            Roll.cmd = Roll.sbus;
+            Pitch.cmd= Pitch.sbus;
+            Yaw.cmd =  Yaw.sbus;
+            return;//これもここで戻す
+        }
         default: break;
     }
 
-    Roll.tar  = target_roll;
-    Pitch.tar = target_pitch;
-
+    // --- 角度外ループ + レート内ループ (Control.hのupdate_RateAnglePID使用) ---
+    //   角度PID: 100Hzで目標レートを算出 (counter%10)
+    //   レートPID: 1000Hzでサーボ指令を算出
+    //   内部.cmdの数値を勝手に、目標値からいじる
     Roll.update_RateAnglePID();
     Pitch.update_RateAnglePID();
 
-    Yaw.cmd = constrain(target_roll * 0.05f, -1.0f, 1.0f);
+    // --- 協調ラダー: バンク角に比例してラダーを打つ ---
+    //   係数(0.05f)は実機でのスリップ量を見ながら調整
+    Yaw.cmd = constrain(Roll.tar * 0.05f, -1.0f, 1.0f);
 }
 
 void writeServos() {

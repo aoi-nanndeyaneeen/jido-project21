@@ -17,8 +17,10 @@ public:
         // 優先度: 8の字 > 水平旋回 > マニュアル
         if (_Aux1 == up)
             currentMode = MODE_FIGURE_8;
-        else if (_Aux2 == down)
+        else if (_Aux1 == cen)
             currentMode = MODE_LEVEL_TURN;
+        else if (_Aux2 == up)
+            currentMode = MODE_SEMI_MANUAL;
         else    currentMode = MODE_MANUAL;
     }
 

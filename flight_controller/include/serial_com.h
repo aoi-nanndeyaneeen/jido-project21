@@ -3,6 +3,14 @@
 #include <cmath>
 #include "Config.h"
 
+bool reset(){
+    if (Serial.available()){
+        char c = toupper(Serial.read());
+        if( c == 'R') return true;
+    }
+    return false;
+}
+
 void print_PID(float r, float p, float y) {
     Serial.printf("|PIDRoll=%+7.3f |PIDPitch=%+7.3f |PIDYaw=%+7.3f\n", r, p, y);
 }

@@ -56,7 +56,7 @@ public:
       for(i=0;i<16;i++){
         //if(i == 1)Serial.println(_data.ch[i]);
         float val = scaleToUnit(_data.ch[i]);//取得して0-1にマッピング
-        val = (val < 0.0f) ? 0 : (val > 1.0f ? 1.0f : val);//?はif,:はelse,そのため(条件)? 結果 : 結果　みたいな感じ
+        val = (val < 0.0f) ? 0 : ((val > 1.0f) ? 1.0f : val);//?はif,:はelse,そのため(条件)? 結果 : 結果　みたいな感じ
 
         if(i!=Ch::THR) {
           val = (abs(val-0.50f)) < 0.02f ? 0.0f : val*2.0f-1.0f;

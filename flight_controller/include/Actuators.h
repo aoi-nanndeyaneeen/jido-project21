@@ -45,6 +45,12 @@ class RC_servo{
       if(input ==cen ) write(0.0);
       if(input ==down) write(-1.0);
     }
+
+    void elevon(float R_input, float P_input,float R_mix_rate, float P_mix_rate,bool R_inv, bool P_inv){
+      R_input = (R_inv == true) ? -R_input : R_input;
+      P_input = (P_inv == true) ? -P_input : P_input;
+      
+    }
 };
 
 class RC_motor{
