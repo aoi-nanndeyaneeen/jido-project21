@@ -1,12 +1,10 @@
-//センサー系
+﻿//繧ｻ繝ｳ繧ｵ繝ｼ邉ｻ
 #pragma once
 #include <Arduino.h>
 #include <Wire.h>
 #include "MPU6050.h"
 #include <MadgwickAHRS.h>
-#include "Config.h"
-
-class IMU {
+#include "Config.h" // Timing::FREQUENCY緜lass IMU {
 private:
     MPU6050 mpu;
     Madgwick filter;
@@ -22,18 +20,22 @@ public:
         wire->setClock(400000);
         mpu.initialize();
 
-        // --- スケール強制設定 MPU6050 (±2g / ±250dps) ---
-        wire->beginTransmission(0x68); wire->write(0x1C); wire->write(0x00); wire->endTransmission(); // Accel ±2g
-        wire->beginTransmission(0x68); wire->write(0x1B); wire->write(0x00); wire->endTransmission(); // Gyro ±250dps
+        // --- 繧ｹ繧ｱ繝ｼ繝ｫ蠑ｷ蛻ｶ險ｭ螳・MPU6050 (ﾂｱ2g / ﾂｱ250dps) ---
+        // main_test.txt 縺ｨ蜷檎ｭ峨・險ｭ螳・
+        wire->beginTransmission(0x68); wire->write(0x1C); wire->write(0x00); wire->endTransmission(); // Accel ﾂｱ2g
+        wire->beginTransmission(0x68); wire->write(0x1B); wire->write(0x00); wire->endTransmission(); // Gyro ﾂｱ250dps
 
         filter.begin(Config::Timing::MAIN_Hz);
+        
+        // 繝上・繝峨え繧ｧ繧｢繧ｪ繝輔そ繝・ヨ縺ｯ荳榊・蜷医・蜴溷屏縺ｫ縺ｪ繧九◆繧∬ｨｭ螳壹＠縺ｪ縺・(0縺ｮ縺ｾ縺ｾ縺ｫ縺吶ｋ)
+        // mpu.setXAccelOffset(0); ... 縺ｪ縺ｩ縺ｯ陦後ｏ縺ｪ縺・
     }
 
     void update() {
-        // センサから生データを読み出す
+        // 繧ｻ繝ｳ繧ｵ縺九ｉ逕溘ョ繝ｼ繧ｿ繧定ｪｭ縺ｿ蜃ｺ縺・
         mpu.getMotion6(&ax_raw, &ay_raw, &az_raw, &gx_raw, &gy_raw, &gz_raw);
 
-        // --- ソフトウェア・キャリブレーション補正 ---
+        // --- 繧ｽ繝輔ヨ繧ｦ繧ｧ繧｢繝ｻ繧ｭ繝｣繝ｪ繝悶Ξ繝ｼ繧ｷ繝ｧ繝ｳ陬懈ｭ｣ (monitor.py 莠呈鋤) ---
         float c_ax = getAccX();
         float c_ay = getAccY();
         float c_az = getAccZ();
@@ -41,11 +43,19 @@ public:
         float c_gy = getGyroY();
         float c_gz = getGyroZ();
 
-        // Madgwickフィルタの更新
+        // Madgwick繝輔ぅ繝ｫ繧ｿ縺ｮ譖ｴ譁ｰ
         filter.updateIMU(c_gx, c_gy, c_gz, c_ax, c_ay, c_az);
+
+        // 1遘偵♀縺阪↓繝・ヰ繝・げ蜃ｺ蜉・(ax縺悟・縺ｪ縺・撫鬘後・蛻・ｊ蛻・￠逕ｨ)
+        static uint32_t last_dbg = 0;
+        if (millis() - last_dbg > 1000) {
+            Serial.printf("DEBUG: raw_ax=%d, raw_ay=%d, raw_az=%d | c_ax=%.4f\n", 
+                            ax_raw, ay_raw, az_raw, c_ax);
+            last_dbg = millis();
+        }
     }
 
-    // 生データスケール変換のみ (Raw Scaled)
+    // 逕溘ョ繝ｼ繧ｿ繧ｹ繧ｱ繝ｼ繝ｫ螟画鋤縺ｮ縺ｿ (Raw Scaled)
     float getAccX_Raw() { return (float)ax_raw / Config::sensor::ACCEL_SCALE; }
     float getAccY_Raw() { return (float)ay_raw / Config::sensor::ACCEL_SCALE; }
     float getAccZ_Raw() { return (float)az_raw / Config::sensor::ACCEL_SCALE; }
@@ -53,9 +63,9 @@ public:
     float getGyroY_Raw() { return (float)gy_raw / Config::sensor::GYRO_SCALE; }
     float getGyroZ_Raw() { return (float)gz_raw / Config::sensor::GYRO_SCALE; }
     
-    // ソフトウェア補正適用済みの値
+    // 繧ｽ繝輔ヨ繧ｦ繧ｧ繧｢陬懈ｭ｣驕ｩ逕ｨ貂医∩縺ｮ蛟､ (monitor.py 縺ｨ蜷後§險育ｮ怜ｼ・
     float getAccX() { return (getAccX_Raw() - Config::sensor::s_ax_bias); }
-    float getAccY() { return -(getAccY_Raw() - Config::sensor::s_ay_bias); } // Y軸反転
+    float getAccY() { return -(getAccY_Raw() - Config::sensor::s_ay_bias); } // Y霆ｸ蜿崎ｻ｢
     float getAccZ() { return (getAccZ_Raw() - Config::sensor::s_az_bias); }
 
     float getGyroX() { return getGyroX_Raw() - Config::sensor::s_gx_bias; }
@@ -67,9 +77,9 @@ public:
     float getYaw()   { return filter.getYaw(); }
 
     void recalibrate() {
-        Serial.println("INFO: MPU6050 Recalibration (ax=0, ay=0, az=1 mode)...");
+        Serial.println("INFO: MPU6050 Calibration (monitor.py mode)...");
         
-        // バイアスを一旦リセット
+        // 繧ｪ繝輔そ繝・ヨ繝ｪ繧ｻ繝・ヨ
         Config::sensor::s_ax_bias = 0.0f;
         Config::sensor::s_ay_bias = 0.0f;
         Config::sensor::s_az_bias = 0.0f;
@@ -79,7 +89,7 @@ public:
 
         double sum_ax=0, sum_ay=0, sum_az=0;
         double sum_gx=0, sum_gy=0, sum_gz=0;
-        const int samples = 400;
+        const int samples = 500;
         
         for(int i=0; i<samples; i++) {
             int16_t r_ax, r_ay, r_az, r_gx, r_gy, r_gz;
@@ -95,23 +105,36 @@ public:
         }
         Serial.println(" Done.");
 
-        // 平均をバイアスに設定
+        // monitor.py 縺ｨ蜷後§繝舌う繧｢繧ｹ險育ｮ・
         Config::sensor::s_ax_bias = (float)(sum_ax / samples);
         Config::sensor::s_ay_bias = (float)(sum_ay / samples);
-        // az を 1.0 にするように設定 (s_az_bias = mean_az - 1.0)
+        // az 縺ｯ 1.0g 蛻・ｒ谿九☆
         Config::sensor::s_az_bias = (float)(sum_az / samples - 1.0f);
         
         Config::sensor::s_gx_bias = (float)(sum_gx / samples);
         Config::sensor::s_gy_bias = (float)(sum_gy / samples);
         Config::sensor::s_gz_bias = (float)(sum_gz / samples);
 
+        Serial.printf("DEBUG: Offsets: ax=%.4f, ay=%.4f, az=%.4f\n", 
+                        Config::sensor::s_ax_bias, Config::sensor::s_ay_bias, Config::sensor::s_az_bias);
+
         filter.reset();
         filter.begin(Config::Timing::MAIN_Hz);
-        Serial.println("INFO: MPU6050 Recalibration Finished.");
+        Serial.println("INFO: Calibration Finished.");
+    }
+};
+%.4f], Mag: %.4f\n", avg_ax, avg_ay, avg_az, magnitude);
+        Serial.printf("DEBUG: Software Offsets: ax=%.4f, ay=%.4f, az=%.4f, scale=%.4f\n", 
+                        Config::sensor::s_ax_bias, Config::sensor::s_ay_bias, Config::sensor::s_az_bias, Config::sensor::s_mag_scale);
+
+        // 繝輔ぅ繝ｫ繧ｿ蜀・Κ迥ｶ諷九ｂ繝ｪ繧ｻ繝・ヨ
+        filter.reset();
+        filter.begin(Config::Timing::MAIN_Hz);
+        Serial.println("INFO: MPU6050 Calibration Finished.");
     }
 };
 
-// --- 気圧センサ クラス ---
+// --- 豌怜悸繧ｻ繝ｳ繧ｵ 繧ｯ繝ｩ繧ｹ ---
 class BarometerSensor {
 private:
     Adafruit_BMP280 bmp; 
@@ -122,7 +145,7 @@ private:
 
     float sea_level_pressure; 
     float alpha;              
-    float baseline_altitude; // 相対高度のためのベースライン
+    float baseline_altitude; // 逶ｸ蟇ｾ鬮伜ｺｦ縺ｮ縺溘ａ縺ｮ繝吶・繧ｹ繝ｩ繧､繝ｳ
 
 public:
     BarometerSensor(float sea_level = 1013.25, float filter_alpha = 0.1, TwoWire *wire_i = &Wire1) : bmp(wire_i) {
@@ -136,15 +159,18 @@ public:
     }
 
     bool begin() {
+        // 笘・0x76 縺ｨ 0x77 縺ｮ荳｡譁ｹ繧定・蜍輔〒隧ｦ縺呎怙蠑ｷ縺ｮ蛻晄悄蛹・
         bool status = bmp.begin(0x76);
-        if (!status) status = bmp.begin(0x77);
+        if (!status) {
+            status = bmp.begin(0x77);
+        }
         
         if (!status) {
-            Serial.println("【エラー】BMP280未検出！");
+            Serial.println("縲舌お繝ｩ繝ｼ縲腺MP280縺瑚ｦ九▽縺九ｊ縺ｾ縺帙ｓ・・・邱壹ｒ遒ｺ隱阪＠縺ｦ縺上□縺輔＞・・);
             return false; 
         }
         
-        Serial.println("【成功】BMP280接続完了！");
+        Serial.println("縲先・蜉溘腺MP280縺ｮ謗･邯壹ｒ遒ｺ隱阪＠縺ｾ縺励◆・・);
         
         bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     
                         Config::sensor::BMP_SAMP_T,     
@@ -154,22 +180,15 @@ public:
         return true;
     }
 
+// ... 莉･荳狗払 (update髢｢謨ｰ縺ｪ縺ｩ縺ｯ縺昴・縺ｾ縺ｾ) ...
     void update() {
         temperature = bmp.readTemperature();
         pressure = bmp.readPressure() / 100.0F; 
-        float alt = bmp.readAltitude(sea_level_pressure);
+        raw_altitude = bmp.readAltitude(sea_level_pressure);
 
-        // NaN or Inf guard
-        if (isnan(alt) || isinf(alt)) {
-            // エラー時は前回の値を保持するか、0にする
-            if (raw_altitude == 0.0) raw_altitude = 0.0; 
-        } else {
-            raw_altitude = alt;
-        }
-
-        if (smoothed_altitude == 0.0 && !isnan(raw_altitude) && !isinf(raw_altitude)) {
+        if (smoothed_altitude == 0.0) {
             smoothed_altitude = raw_altitude; 
-        } else if (!isnan(raw_altitude) && !isinf(raw_altitude)) {
+        } else {
             smoothed_altitude = (alpha * raw_altitude) + ((1.0 - alpha) * smoothed_altitude);
         }
     }
@@ -180,8 +199,9 @@ public:
     float get_smoothed_altitude() { return smoothed_altitude - baseline_altitude; }
 
     void reset() {
+        // 迴ｾ蝨ｨ縺ｮ豌怜悸鬮伜ｺｦ繧偵・繝ｼ繧ｹ繝ｩ繧､繝ｳ縺ｫ險ｭ螳・
         baseline_altitude = raw_altitude;
-        smoothed_altitude = raw_altitude;
-        Serial.println("INFO: Barometer Baseline Reset.");
+        smoothed_altitude = raw_altitude; // 繝輔ぅ繝ｫ繧ｿ繧ょ酔譛溘＆縺帙ｋ
+        Serial.println("INFO: Barometer Baseline Reset to 0.0m.");
     }
 };

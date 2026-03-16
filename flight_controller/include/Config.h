@@ -107,9 +107,23 @@ namespace Config {
         // MPU6050のスケール (±2g, ±250dps)
         constexpr float ACCEL_SCALE = 16384.0f;
         constexpr float GYRO_SCALE  = 131.0f;
+
+        // ---- ソフトウェア・キャリブレーション補正値 ----
+        // monitor.py と同じ仕組み: 
+        // 1. 各軸のバイアスを引く
+        // 2. ay は符号を反転する
+        // 3. az は 1.0g 分を残すようにオフセット計算する
+        inline float s_ax_bias = 0.0f;
+        inline float s_ay_bias = 0.0f;
+        inline float s_az_bias = 0.0f;
+        
+        inline float s_gx_bias = 0.0f;
+        inline float s_gy_bias = 0.0f;
+        inline float s_gz_bias = 0.0f;
         
         // monitor.pyのキャリブレーション(Rキー)で得られたオフセット値を入力する
         // デフォルトは0に設定。機体ごとに調整すること
+        // ハードウェアオフセット(レジスタ書き込み)は不具合の原因になるため使用しない
         constexpr int16_t ACCEL_X_OFFSET = 0;
         constexpr int16_t ACCEL_Y_OFFSET = 0;
         constexpr int16_t ACCEL_Z_OFFSET = 0;
@@ -117,11 +131,14 @@ namespace Config {
         constexpr int16_t GYRO_Y_OFFSET  = 0;
         constexpr int16_t GYRO_Z_OFFSET  = 0;
 
+        // 気圧センサ設定
+        constexpr float BARO_SEA_LEVEL_HPA = 1013.25f;
+        constexpr float BARO_ALPHA         = 0.1f;
         // BMP280 気圧センサー設定 (main_test の実績値に合わせる)
-        constexpr auto BMP_STANDBY = Adafruit_BMP280::STANDBY_MS_1;
+        constexpr auto BMP_STANDBY = Adafruit_BMP280::STANDBY_MS_500;
         constexpr auto BMP_FILTER  = Adafruit_BMP280::FILTER_X16;
-        constexpr auto BMP_SAMP_P  = Adafruit_BMP280::SAMPLING_X4;
-        constexpr auto BMP_SAMP_T  = Adafruit_BMP280::SAMPLING_X1;
+        constexpr auto BMP_SAMP_P  = Adafruit_BMP280::SAMPLING_X16;
+        constexpr auto BMP_SAMP_T  = Adafruit_BMP280::SAMPLING_X2;
     }
 
     namespace Timing {

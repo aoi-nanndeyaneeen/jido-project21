@@ -11,8 +11,8 @@ class PID {
 
 public:
     PID(float kp_i = 0, float ki_i = 0, float kd_i = 0,float d_alpha_i = 0.7f, float i_limit_i = 200.0f) : 
-        kp(kp_i), ki(ki_i), kd(kd_i),
         kp_ori(kp_i), ki_ori(ki_i), kd_ori(kd_i),
+        kp(kp_i), ki(ki_i), kd(kd_i),
         i(0), prev(0), d_lpf(0), d_alpha(d_alpha_i), i_limit(i_limit_i) {}
 
     void setgains(float kp_i, float ki_i, float kd_i, float d_alpha_i = 0.7f, float i_limit_i = 200.0f) {
