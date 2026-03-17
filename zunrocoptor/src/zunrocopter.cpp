@@ -36,10 +36,10 @@ Axis_value  Roll(ROLL_gain.kp_rate, ROLL_gain.ki_rate, ROLL_gain.kd_rate, ROLL_g
             //とってもながい
 
 IMU mpu(Config::wire::mpu);
-BarometerSensor barometer(1013.25, 0.1, Config::wire::bmp);
+//BarometerSensor barometer(1013.25, 0.1, Config::wire::bmp);
 
 Sbus sbus(Config::serial::sbus);
-IM920SL_Generic<PlaneData, GroundData> im920(Config::serial::im920);
+//IM920SL_Generic<PlaneData, GroundData> im920(Config::serial::im920);
 
 
 PlaneData  Plane_Data;
@@ -47,13 +47,11 @@ GroundData Ground_Data;
 
 Flight_mode Mode;
 
-RC_servo Ail1(1, 0.0, -1.0, 1.0),
-         Ail2(6, 0.0, -1.0, 1.0),
-         Ele (2, 0.0, -1.0, 1.0),
-         Rud (4, 0.0, -1.0, 1.0),
-         Flp1(8, 0.0, -1.0, 1.0),
-         Flp2(9, 0.0, -1.0, 1.0);
-RC_motor Thr_r(3, 1.0), Thr_l(5, 1.0);
+RC_servo Ele_von1(5, 0.0, -1.0, 1.0),
+         Ele_von2(6, 0.0, -1.0, 1.0),
+         Ele (7, 0.0, -1.0, 1.0),
+         Rud (8, 0.0, -1.0, 1.0);
+RC_motor Thr(9, 1.0);
 
 // ============================================================
 //  プロトタイプ宣言
@@ -69,14 +67,15 @@ void setup() {
     mpu.begin();
     sbus.begin();
 
-    Ail1.begin(); Ail2.begin();
-    Ele.begin();  Rud.begin();
-    Flp1.begin(); Flp2.begin();
-    Thr_r.begin(); Thr_l.begin();
 
-    im920.begin();
+    Ele_von1.begin(); Ele_von2.begin();
+    Ele.begin();
+    Rud.begin();
+    Thr.begin();
+
+    //im920.begin();
     Serial.begin(115200);
-    if (!barometer.begin()) Serial.println("Barometer init failed!");
+    //if (!barometer.begin()) Serial.println("Barometer init failed!");
 }
 
 // ============================================================
@@ -100,32 +99,27 @@ void loop() {
 
         // 4) スロットル出力 (モード問わずスティック入力)
         if (sbus.isSafe()) {
-            Thr_r.write(sbus.des[Ch::THR]);
-            Thr_l.write(sbus.des[Ch::THR]);
+            Thr.write(sbus.des[Ch::THR]);
         } else {
-            Thr_r.write(0);
-            Thr_l.write(0);
+            Thr.write(0);
         }
-
-        // 5) フラップ
-        Flp1.flap(sbus.Ch_state(Aux1));
-        Flp2.flap(sbus.Ch_state(Aux1));
 
         // 6) テレメトリ・デバッグ (1000Hz ÷ 100 = 10Hz)
         //    ★ 1000Hzブロック内に配置し、Serial出力がループをブロックしないようにする
         static int dbg_cnt = 0;
         if (++dbg_cnt >= 100) {
             dbg_cnt = 0;
-            barometer.update();
+            //barometer.update();
             Plane_Data.update(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
                              mpu.getGyroX(), mpu.getGyroY(), mpu.getGyroZ(),
-                             barometer.get_smoothed_altitude());
+                             //barometer.get_smoothed_altitude()
+                             0.0f);
 
             // モード表示
             print_flightmode(int(Mode.get_mode()), BANK_ANGLE, TURN_MS);
 
             Serial.print("\033[2J\033[H"); // ターミナルクリア
-            im920.write(Plane_Data);
+            //im920.write(Plane_Data);
 
             print_PID(Roll.pid, Pitch.pid, Yaw.pid);
             print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
@@ -156,22 +150,22 @@ void updateSensorsAndComms() {
     // --- シリアルコマンド (PCモニタからのRキー等) ---
     if (reset()) {
         mpu.recalibrate();
-        barometer.reset();
+        //barometer.reset();
         Config::Timing::resetTiming();
         Roll.pid_reset(); Pitch.pid_reset(); Yaw.pid_reset();
         Serial.println("INFO: System-wide Reset Complete.");
     }
 
     // 地上局からパラメータ受信
-    if (im920.read(Ground_Data)) {
-        if (Ground_Data.roll  != 0.0f) BANK_ANGLE = fabsf(Ground_Data.roll);
-        if (Ground_Data.pitch != 0.0f) TURN_MS    = (unsigned long)(Ground_Data.pitch * 1000.0f);//これやってることすごい
-        // PIDゲイン調整 (Rollのレートゲインに適用)
-        if (Ground_Data.p_adj != 0.0f || Ground_Data.i_adj != 0.0f || Ground_Data.d_adj != 0.0f) {
-            Roll.Rate_PID_adj(Ground_Data.p_adj, Ground_Data.i_adj, Ground_Data.d_adj);
-            //Pitch.Rate_PID_adj(Ground_Data.p_adj, Ground_Data.i_adj, Ground_Data.d_adj);
-        }
-    }
+    // if (im920.read(Ground_Data)) {
+    //     if (Ground_Data.roll  != 0.0f) BANK_ANGLE = fabsf(Ground_Data.roll);
+    //     if (Ground_Data.pitch != 0.0f) TURN_MS    = (unsigned long)(Ground_Data.pitch * 1000.0f);//これやってることすごい
+    //     // PIDゲイン調整 (Rollのレートゲインに適用)
+    //     if (Ground_Data.p_adj != 0.0f || Ground_Data.i_adj != 0.0f || Ground_Data.d_adj != 0.0f) {
+    //         Roll.Rate_PID_adj(Ground_Data.p_adj, Ground_Data.i_adj, Ground_Data.d_adj);
+    //         //Pitch.Rate_PID_adj(Ground_Data.p_adj, Ground_Data.i_adj, Ground_Data.d_adj);
+    //     }
+    // }
 }
 
 // ============================================================
@@ -231,8 +225,8 @@ void autonomousControl() {
 }
 
 void writeServos() {
-    Ail1.write(Roll.cmd);
-    Ail2.write(Roll.cmd);
+    Ele_von1.write(Roll.cmd);
+    Ele_von2.write(Roll.cmd);
     Ele.write(Pitch.cmd);
     Rud.write(Yaw.cmd);
 }

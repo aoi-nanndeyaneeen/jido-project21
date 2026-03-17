@@ -46,10 +46,12 @@ class RC_servo{
       if(input ==down) write(-1.0);
     }
 
-    void elevon(float R_input, float P_input,float R_mix_rate, float P_mix_rate,bool R_inv, bool P_inv){
+    void elevon(float R_input, float P_input,float R_mix_rate =0.5, float P_mix_rate=0.5,bool R_inv = false, bool P_inv = false){
       R_input = (R_inv == true) ? -R_input : R_input;
       P_input = (P_inv == true) ? -P_input : P_input;
-      
+      constrain(R_mix_rate, 0.0f, 1.0f);
+      constrain(P_mix_rate, 0.0f, 1.0f);  
+      write(R_input*R_mix_rate + P_input*P_mix_rate);
     }
 };
 
