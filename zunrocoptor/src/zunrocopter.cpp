@@ -46,11 +46,11 @@ PlaneData  Plane_Data;
 GroundData Ground_Data;
 
 Flight_mode Mode;
-
+//RC_servo(int pin,float offset, float end1, float end2,bool reverse = false, int minPWM = 1000, int maxPWM = 2000) 
 RC_servo Ele_von1(5, 0.0, -1.0, 1.0),
-         Ele_von2(6, 0.0, -1.0, 1.0),
-         Ele (7, 0.0, -1.0, 1.0),
-         Rud (8, 0.0, -1.0, 1.0);
+         Ele_von2(6, 0.0, -1.0, 1.0,true),
+         Ele (24, 0.0, -1.0, 1.0),
+         Rud (25, 0.0, -1.0, 1.0);
 RC_motor Thr(9, 1.0);
 
 // ============================================================
@@ -225,9 +225,11 @@ void autonomousControl() {
 }
 
 void writeServos() {
-    Ele_von1.write(Roll.cmd);
-    Ele_von2.write(Roll.cmd);
-    Ele.write(Pitch.cmd);
+    Ele_von1.elevon(Roll.cmd, Pitch.cmd,
+                    -1.0,1.0,-0.9,0.85);
+    Ele_von2.elevon(Roll.cmd, Pitch.cmd,
+                    -1.0,0.5,-0.9,1.0,true);
+    //Ele.write(Pitch.cmd);
     Rud.write(Yaw.cmd);
 }
 

@@ -63,7 +63,7 @@ enum FlightMode : uint8_t {
     MODE_MANUAL     = 0,  // プロポ直接操作
     MODE_LEVEL_TURN = 1,  // 自動水平旋回
     MODE_FIGURE_8   = 2,  // 8の字飛行
-    MODE_SEMI_MANUAL= 4,
+    MODE_SEMI_MANUAL= 3,
 };
 
 
@@ -94,13 +94,13 @@ PID_Gains   ROLL_gain  = {1.2f, 0.5f, 0.01f, 4.5f, 0.0f, 0.0f, 1.0f, 0.7f, 200.0
 namespace Config {
 
     namespace serial{
-        inline HardwareSerial* const im920 = &Serial3; // IM920SL用シリアルポート
-        inline HardwareSerial* const sbus  = &Serial2; // S.BUS用シリアルポート
+        //inline HardwareSerial* const im920 = &Serial3; // IM920SL用シリアルポート
+        inline HardwareSerial* const sbus  = &Serial5; // S.BUS用シリアルポート
     }
 
     namespace wire {
         inline TwoWire *const mpu = &Wire;   // MPU用I2Cポート
-        inline TwoWire *const bmp = &Wire1;  // 気圧センサ用I2Cポート
+        inline TwoWire *const bmp = &Wire;  // 気圧センサ用I2Cポート
     }
 
     // ==== センサ・キャリブレーション定数 ====

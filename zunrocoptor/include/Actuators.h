@@ -11,7 +11,15 @@ class RC_servo{
   Servo _servo;
 
   float float_to_microsec(float in) { return in*500+1500; }
-  
+  float sbus_constrain(float input,float offset,float end1,float end2){
+      if(input<0){
+        input = input*fabs(end1-offset);
+      }
+      else{
+        input = input*fabs(end2-offset);
+      }
+      return input;
+  }
   public:
   // コンストラクタで設定を流し込む
     RC_servo(int pin,float offset, float end1, float end2,bool reverse = false, int minPWM = 1000, int maxPWM = 2000) 
@@ -23,12 +31,8 @@ class RC_servo{
     }
 
     void write(float input){
-      if(input<0){
-        input = input*fabs(_end1-_offset);
-      }
-      else{
-        input = input*fabs(_end2-_offset);
-      }
+      input = sbus_constrain(input,_offset,_end1,_end2);
+
       _des = float_to_microsec(input*_inv + _offset);
 
       _servo.writeMicroseconds(int(_des));
@@ -46,12 +50,14 @@ class RC_servo{
       if(input ==down) write(-1.0);
     }
 
-    void elevon(float R_input, float P_input,float R_mix_rate =0.5, float P_mix_rate=0.5,bool R_inv = false, bool P_inv = false){
+    void elevon(float R_input, float P_input,
+                float R_end1, float R_end2,
+                float P_end1, float P_end2,bool R_inv = false,bool P_inv = false){
+      R_input = sbus_constrain(R_input,0,R_end1,R_end2);
+      P_input = sbus_constrain(P_input,0,P_end1,P_end2);
       R_input = (R_inv == true) ? -R_input : R_input;
       P_input = (P_inv == true) ? -P_input : P_input;
-      constrain(R_mix_rate, 0.0f, 1.0f);
-      constrain(P_mix_rate, 0.0f, 1.0f);  
-      write(R_input*R_mix_rate + P_input*P_mix_rate);
+      write(R_input + P_input);
     }
 };
 
