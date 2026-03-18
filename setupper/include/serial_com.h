@@ -38,3 +38,4 @@ void print_ACC(float ax, float ay, float az) {
 void print_timing(unsigned long dt_us) {
     Serial.printf("Timing: dt=%6lu us (%6.1f Hz)\n", dt_us, 1000000.0f / dt_us);
 }
+

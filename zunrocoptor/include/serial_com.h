@@ -26,7 +26,7 @@ void print_sbus(float Roll_des, float Pitch_des, float Thr_des, float Yaw_des, f
 }
 
 void print_flightmode(int currentMode, float bankAngle, unsigned long turnMs) {
-    const char* modeStr[] = {"MANUAL    ", "LEVEL_TURN ", "FIGURE_8  "};
+    const char* modeStr[] = {"MANUAL    ", "LEVEL_TURN ", "FIGURE_8  ", "SEMI_MANUAL"};
     Serial.printf("Mode: %s  BankAngle: %+6.1f deg  TurnMs: %5lu ms\n", modeStr[currentMode], bankAngle, turnMs);
 }
 

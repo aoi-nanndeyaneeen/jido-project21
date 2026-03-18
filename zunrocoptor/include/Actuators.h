@@ -52,13 +52,12 @@ class RC_servo{
       if(input ==down) write(-1.0);
     }
 
-    void elevon(float R_input, float P_input){
-      R_input = sbus_constrain(R_input,_offset,_end1,_end2);
-      P_input = sbus_constrain(P_input,_offset,_endp1,_endp2);
-      R_input = (_inv == true) ? -R_input : R_input;
-      P_input = (_invp == true) ? -P_input : P_input;
+    void elevon(float R_input, float P_input) {
+      R_input = sbus_constrain(R_input, _offset, _end1, _end2);
+      P_input = sbus_constrain(P_input, _offset, _endp1, _endp2);
 
-      float output = constrain(R_input + P_input, -1.0, 1.0);
+
+      float output = constrain(R_input*_inv + P_input*_invp, -1.0, 1.0);
       _des = float_to_microsec(output + _offset);
 
       _servo.writeMicroseconds(int(_des));
