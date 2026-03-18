@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include <cctype>
 #include <cmath>
+#include <math.h>
 #include "Config.h"
 #include "Telemetry.h"
 #include "Control.h"
@@ -26,6 +27,7 @@ Axis_value  Roll(ROLL_gain.kp_rate, ROLL_gain.ki_rate, ROLL_gain.kd_rate, ROLL_g
 
 IMU mpu(Config::wire::mpu);
 BarometerSensor barometer(1013.25, 0.1, Config::wire::bmp);
+EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA);
 
 Sbus sbus(Config::serial::sbus);
 IM920SL_Generic<PlaneData, GroundData> im920(Config::serial::im920);
@@ -65,6 +67,7 @@ void setup() {
     im920.begin();
     Serial.begin(115200);
     if (!barometer.begin()) Serial.println("Barometer init failed!");
+    ez2.begin();
 }
 
 // ============================================================
@@ -73,6 +76,7 @@ void setup() {
 void loop() {
     if (T::freq<T::MAIN_Hz>(T::Main_dt)) { // 周期制御 (1000Hz)
         // 1) センサ・受信機・通信の更新
+        ez2.update();
         updateSensorsAndComms();
 
         // モード切替時にPIリセット
@@ -103,28 +107,40 @@ void loop() {
         if (++dbg_cnt >= 100) {
             dbg_cnt = 0;
             barometer.update();
-            Plane_Data.update(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
-                             Roll.ang, Pitch.ang, Yaw.ang,
-                             barometer.get_smoothed_altitude());
+
+            float fused_alt = barometer.get_smoothed_altitude();
+            float ez2_alt = ez2.get_distance_m();
+
+            // 高度3m以下 かつ バンク角/ピッチ角が一定値以下なら超音波センサ優先
+            bool stable = (fabs(mpu.getRoll()) < Config::sensor::ALT_BANK_LIMIT_DEG) && 
+                          (fabs(mpu.getPitch()) < Config::sensor::ALT_BANK_LIMIT_DEG);
             
-            im920.write(Plane_Data);
+            if (ez2_alt < Config::sensor::ALT_SWITCH_THRESHOLD_M && stable && ez2_alt > 0.05f) {
+                fused_alt = ez2_alt;
+            }
 
-            Serial.print("\033[2J\033[H"); // 常にシリアルモニタの上に表示する
-
-            print_flightmode(int(Mode.get_mode()), BANK_ANGLE, TURN_MS);
-
-            Serial.print("\033[2J\033[H"); // ターミナルクリア
-            im920.write(Plane_Data);
-
-            print_PID(Roll.pid, Pitch.pid, Yaw.pid);
-            print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
-            print_ACC(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ());
-            print_sbus(sbus.des[Ch::ROLL], sbus.des[Ch::PITCH], sbus.des[Ch::THR], sbus.des[Ch::YAW], sbus.des[Ch::Aux1], sbus.des[Ch::Aux2], sbus.des[Ch::Aux3]);
-            Ground_Data.print();
-            
-            Serial.printf("Alt: %+7.2f m\n", Plane_Data.altitude);
-            print_timing(T::Main_dt);
-        }
+             Plane_Data.update(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
+                              Roll.ang, Pitch.ang, Yaw.ang,
+                              fused_alt);
+             
+             im920.write(Plane_Data);
+ 
+             Serial.print("\033[2J\033[H"); // 常にシリアルモニタの上に表示する
+ 
+             print_flightmode(int(Mode.get_mode()), BANK_ANGLE, TURN_MS);
+ 
+             Serial.print("\033[2J\033[H"); // ターミナルクリア
+             im920.write(Plane_Data);
+ 
+             print_PID(Roll.pid, Pitch.pid, Yaw.pid);
+             print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
+             print_ACC(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ());
+             print_sbus(sbus.des[Ch::ROLL], sbus.des[Ch::PITCH], sbus.des[Ch::THR], sbus.des[Ch::YAW], sbus.des[Ch::Aux1], sbus.des[Ch::Aux2], sbus.des[Ch::Aux3]);
+             Ground_Data.print();
+             
+             Serial.printf("Alt: %+7.2f m\n", Plane_Data.altitude);
+             print_timing(T::Main_dt);
+         }
     }
 }
 
