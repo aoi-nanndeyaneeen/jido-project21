@@ -126,35 +126,7 @@ public:
     Serial.println("--------------------");
   }
 
-  // --- コピペ用コードを出力するメソッド ---
-  void exportConfig(const char* instanceName) {
-    Serial.print("RC_servo ");
-    Serial.print(instanceName);
-    
-    if (!elevon_flag) {
-      // 標準サーボ形式: (pin, offset, end1, end2, reverse)
-      Serial.print("(");
-      Serial.print(_pin); Serial.print(", ");
-      Serial.print(_offset, 3); Serial.print(", ");
-      Serial.print(_end1, 2); Serial.print(", ");
-      Serial.print(_end2, 2); Serial.print(", ");
-      Serial.print(_inv < 0 ? "true" : "false");
-      Serial.println(");");
-    } else {
-      // エレボン形式: (pin, offset, end1, end2, endp1, endp2, reverse, p_reverse)
-      Serial.print("(");
-      Serial.print(_pin); Serial.print(", ");
-      Serial.print(_offset, 3); Serial.print(", ");
-      Serial.print(_end1, 2); Serial.print(", ");
-      Serial.print(_end2, 2); Serial.print(", ");
-      Serial.print(_endp1, 2); Serial.print(", ");
-      Serial.print(_endp2, 2); Serial.print(", ");
-      Serial.print(_inv < 0 ? "true" : "false"); Serial.print(", ");
-      Serial.print(_invp < 0 ? "true" : "false");
-      Serial.println(");");
-    }
-  }
-  
+
   void flap(Sw input) {
     if (input == up)
       write(1.0);
