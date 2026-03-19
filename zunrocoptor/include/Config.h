@@ -86,7 +86,7 @@ inline unsigned long TURN_MS    = 4000UL;   // 8の字の片道時間 [ms]
     //  3. kd_rateを足して振動を抑える
     //  4. ki_rateは最後に少しだけ足す
 
-PID_Gains   ROLL_gain  = {1.2f, 0.5f, 0.01f, 4.5f, 0.0f, 0.0f, 1.0f, 0.7f, 200.0f, 0.7f, 200.0f},
+PID_Gains   ROLL_gain  = {0.005f, 0.0f, 0.00f, 0.0f, 0.0f, 0.0f, 500.0f, 0.7f, 200.0f, 0.7f, 200.0f},
             PITCH_gain = {1.2f, 0.5f, 0.01f, 4.5f, 0.0f, 0.0f, 1.0f},//デフォルト値は書かなくてもいいよ
             YAW_gain   = {1.2f, 0.5f, 0.01f, 4.5f, 0.0f, 0.0f, 1.0f};
             //kp_rate, ki_rate, kd_rate, kp_angle, ki_angle, kd_angle, sensitivity, rate_d_alpha, rate_i_limit, angle_d_alpha, angle_i_limit
