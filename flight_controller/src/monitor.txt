@@ -1,0 +1,37 @@
+#include <Arduino.h>
+#include "Sensors.h"
+#include "Control.h"
+#include "Config.h"
+
+IMU mpu(Config::wire::mpu);
+Axis_value Roll(ROLL_gain.kp_rate, ROLL_gain.ki_rate, ROLL_gain.kd_rate,
+                ROLL_gain.kp_angle, ROLL_gain.ki_angle, ROLL_gain.kd_angle,
+                ROLL_gain.sensitivity);
+Axis_value Pitch(PITCH_gain.kp_rate, PITCH_gain.ki_rate, PITCH_gain.kd_rate,
+                 PITCH_gain.kp_angle, PITCH_gain.ki_angle, PITCH_gain.kd_angle,
+                 PITCH_gain.sensitivity);
+
+void setup() {
+    Serial.begin(115200);
+    mpu.begin();
+    Roll.tar  = 0.0f; // 目標角 0° で固定
+    Pitch.tar = 0.0f;
+}
+
+void loop() {
+    if (Config::Timing::freq<1000>(Config::Timing::Main_dt)) {
+        mpu.update();
+        Roll.update_value(0, -mpu.getRoll(), mpu.getAccX(), mpu.getGyroX());
+        Pitch.update_value(0, -mpu.getPitch(), mpu.getAccY(), mpu.getGyroY());
+        Roll.update_RateAnglePID();
+        Pitch.update_RateAnglePID();
+
+        // 10Hzで表示
+        static int cnt = 0;
+        if (++cnt >= 100) {
+            cnt = 0;
+            Serial.printf("Roll  ang:%+7.2f  cmd:%+7.3f\n", Roll.ang,  Roll.cmd);
+            Serial.printf("Pitch ang:%+7.2f  cmd:%+7.3f\n", Pitch.ang, Pitch.cmd);
+        }
+    }
+}

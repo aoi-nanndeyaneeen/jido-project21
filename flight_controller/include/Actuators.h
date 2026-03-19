@@ -6,29 +6,35 @@
 class RC_servo{
   private:
   int _pin;
-  float _des=1500,_offset,_end1,_end2,_inv;
+  float _des=1500,_offset,_end1,_end2,_endp1,_endp2,_inv,_invp;
   int _minPWM, _maxPWM ;
   Servo _servo;
 
   float float_to_microsec(float in) { return in*500+1500; }
-  
+  float sbus_constrain(float input,float offset,float end1,float end2){
+      if(input<0){
+        input = input*fabs(end1-offset);
+      }
+      else{
+        input = input*fabs(end2-offset);
+      }
+      return input;
+  }
   public:
   // コンストラクタで設定を流し込む
     RC_servo(int pin,float offset, float end1, float end2,bool reverse = false, int minPWM = 1000, int maxPWM = 2000) 
     : _pin(pin), _offset(offset), _end1(end1), _end2(end2),  _inv(reverse ? -1 : 1), _minPWM(minPWM),_maxPWM(maxPWM){}
-    
+
+    RC_servo(int pin,float offset, float end1, float end2,float endp1,float endp2,bool reverse = false,bool p_reverse = false, int minPWM = 1000, int maxPWM = 2000) 
+    : _pin(pin), _offset(offset), _end1(end1), _end2(end2), _endp1(endp1), _endp2(endp2),  _inv(reverse ? -1 : 1), _invp(p_reverse ? -1 : 1), _minPWM(minPWM),_maxPWM(maxPWM){}
 
     void begin() {
       _servo.attach(_pin, _minPWM, _maxPWM); // ここで先ほどの3引数attachを活用！
     }
 
     void write(float input){
-      if(input<0){
-        input = input*fabs(_end1-_offset);
-      }
-      else{
-        input = input*fabs(_end2-_offset);
-      }
+      input = sbus_constrain(input,_offset,_end1,_end2);
+
       _des = float_to_microsec(input*_inv + _offset);
 
       _servo.writeMicroseconds(int(_des));
@@ -46,10 +52,16 @@ class RC_servo{
       if(input ==down) write(-1.0);
     }
 
-    void elevon(float R_input, float P_input,float R_mix_rate, float P_mix_rate,bool R_inv, bool P_inv){
-      R_input = (R_inv == true) ? -R_input : R_input;
-      P_input = (P_inv == true) ? -P_input : P_input;
-      
+    void elevon(float R_input, float P_input){
+      R_input = sbus_constrain(R_input,_offset,_end1,_end2);
+      P_input = sbus_constrain(P_input,_offset,_endp1,_endp2);
+      R_input = (_inv == true) ? -R_input : R_input;
+      P_input = (_invp == true) ? -P_input : P_input;
+
+      float output = constrain(R_input + P_input, -1.0, 1.0);
+      _des = float_to_microsec(output + _offset);
+
+      _servo.writeMicroseconds(int(_des));
     }
 };
 
