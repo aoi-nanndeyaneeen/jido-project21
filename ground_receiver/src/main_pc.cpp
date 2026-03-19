@@ -3,7 +3,6 @@
 #include "Telemetry.h"
 #include "Serial_monitor.h"
 #include "Serial_com.h"
-#include "Logger.h"
 
 unsigned long dt;
 int counter;
@@ -12,48 +11,32 @@ PlaneData Plane_Data;
 GroundData Ground_Data;
 IM920SL_Generic<GroundData, PlaneData> im920(&Serial1);
 Serial_monitor serial(GROUND_DATA_NUM);
-FlashLogger logger;
 
 void setup() {
   im920.begin();
   Serial.begin(115200);
   while(!Serial && millis() < 3000); // Wait for Serial to initialize
-  Serial.println("\n\n[NEW FIRMWARE V2.1] STARTING...");
-  
-  if (logger.begin()) {
-    logger.start(); // 自動で記録開始
-  }
-
+  Serial.println("\n\n[RECEIVER START]");
   serial.begin(115200);
 }
 
 void loop() {
   if (!frec())  return; 
 
-  // --- PCからのシリアル入力チェック ---
+  // --- PCからのシリアル入力チェック (Rキーでリモートリセット) ---
   if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    cmd.toUpperCase();
-
-    if (cmd == "R") {
+    char c = toupper(Serial.peek());
+    if (c == 'R') {
+      Serial.read(); // 'R' を消費
       Ground_Data.reset_cmd = 1;
       Serial.println("\n>>> INFO: Sending Remote Reset to Plane...");
-    } else if (cmd == "DUMP") {
-      logger.dump();
-    } else if (cmd == "CLEAR") {
-      logger.clear();
-    } else if (cmd == "START") {
-      logger.start();
-    } else if (cmd == "STOP") {
-      logger.stop();
-    } else if (cmd.length() > 0) {
-      // 既存のゲイン調整用
-      // (Serial_monitor.h の中身に文字列を渡す必要があるが、
-      //  現状の設計では Serial.read() を奪っているので少し工夫が必要。
-      //  ここでは一旦簡易対応とする)
-      // serial.read() の代わりに cmd を直接パースする等。
-      // 今回は一旦logger優先。
+      // 改行などが残っていれば掃除（serial.read() に空行を拾わせないため）
+      while(Serial.available() > 0 && (Serial.peek() == '\n' || Serial.peek() == '\r')) {
+        Serial.read();
+      }
+    } else {
+      serial.read();
+      serial.update(&Ground_Data);
     }
   }
 
@@ -63,9 +46,6 @@ void loop() {
   if (counter % 100 == 0) {
     im920.write(Ground_Data);
     Ground_Data.reset_cmd = 0; // 送信後にクリア
-
-    // ログに記録
-    logger.log(Plane_Data, Ground_Data, millis());
     
     // 画面クリア（シリアルモニタの最上部に固定）
     Serial.print("\033[2J\033[H");
