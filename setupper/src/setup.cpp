@@ -84,9 +84,8 @@ void loop() {
                     Ele.exportConfig("Ele");
                     Rud.exportConfig("Rud");
                     Serial.println("--------------------------------------------------\n");
-                }
-                break;
-                
+                }break;
+
             default: Serial.println("ID Error (1-4)"); break;
         }
     }
