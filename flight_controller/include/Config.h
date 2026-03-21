@@ -84,10 +84,10 @@ enum FlightMode : uint8_t {
 //  4. ki_rate  は最後に少しだけ足す
 
 //                      kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle  sensitivity
-PID_Gains ROLL_gain  = { 1.0f,    0.0f,    0.0f,   1.0f,     0.0f,     0.0f,     0.0f,
+PID_Gains ROLL_gain  = { -0.05f,    0.0f,    0.0f,   -1.5f,     0.0f,     0.0f,     0.0f,
                           0.0f, 0.0f,   // rate_d_alpha, rate_i_limit
                           0.0f, 0.0f }; // angle_d_alpha, angle_i_limit
-PID_Gains PITCH_gain = { 0.0f,    0.0f,    0.00f,   0.0f,     0.0f,     0.0f,     0.0f };
+PID_Gains PITCH_gain = { 0.05f,    0.0f,    0.00f,   -1.5f,     0.0f,     0.0f,     0.0f };
 PID_Gains YAW_gain   = { 0.0f,    0.0f,    0.00f,   0.0f,     0.0f,     0.0f,     0.0f };
 
 

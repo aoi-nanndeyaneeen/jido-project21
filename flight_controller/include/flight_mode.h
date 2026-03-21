@@ -5,8 +5,8 @@
 
 class Flight_mode {
 private:
-    FlightMode currentMode = MODE_SEMI_MANUAL;
-    FlightMode prevMode = MODE_SEMI_MANUAL; // モード変化検出用
+    FlightMode currentMode = MODE_MANUAL;
+    FlightMode prevMode = MODE_MANUAL; // モード変化検出用
 public:
 
     unsigned long modeStartMs = 0;

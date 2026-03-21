@@ -38,3 +38,69 @@ void print_ACC(float ax, float ay, float az) {
 void print_timing(unsigned long dt_us) {
     Serial.printf("Timing: dt=%6lu us (%6.1f Hz)\n", dt_us, 1000000.0f / dt_us);
 }
+
+// ============================================================
+//  Live PID Tuning Menu
+// ============================================================
+#include "Control.h" // Axis_value の定義に必要
+
+void handlePIDTuning(Axis_value &roll, Axis_value &pitch, Axis_value &yaw) {
+    long old_timeout = Serial.getTimeout();
+    Serial.setTimeout(30000); // 30秒待機
+    
+    // バッファに残っている改行などを掃除
+    while(Serial.available()) Serial.read();
+
+    Serial.println("\n\n!! WARNING: CONTROL LOOP STOPPED DURING TUNING !!");
+    Serial.println("========== PID Tuning Menu ==========");
+    Serial.println("Select Parameter (ex: '1' for Roll Rate P):");
+    Serial.printf(" [1] Roll  Rate P  : % 7.4f\n", roll.c_rate.get_kp());
+    Serial.printf(" [2] Roll  Rate I  : % 7.4f\n", roll.c_rate.get_ki());
+    Serial.printf(" [3] Roll  Rate D  : % 7.4f\n", roll.c_rate.get_kd());
+    Serial.printf(" [4] Roll  Angle P : % 7.4f\n", roll.c_ang.get_kp());
+    Serial.println("------------------------------------");
+    Serial.printf(" [5] Pitch Rate P  : % 7.4f\n", pitch.c_rate.get_kp());
+    Serial.printf(" [6] Pitch Rate I  : % 7.4f\n", pitch.c_rate.get_ki());
+    Serial.printf(" [7] Pitch Rate D  : % 7.4f\n", pitch.c_rate.get_kd());
+    Serial.printf(" [8] Pitch Angle P : % 7.4f\n", pitch.c_ang.get_kp());
+    Serial.println("------------------------------------");
+    Serial.printf(" [9] Yaw   Rate P  : % 7.4f\n", yaw.c_rate.get_kp());
+    Serial.printf(" [A] Yaw   Rate I  : % 7.4f\n", yaw.c_rate.get_ki());
+    Serial.printf(" [B] Yaw   Rate D  : % 7.4f\n", yaw.c_rate.get_kd());
+    Serial.println(" [Q] Quit & Resume Control");
+    Serial.print("Selection > ");
+
+    while(!Serial.available());
+    String sel = Serial.readStringUntil('\n');
+    sel.trim();
+    sel.toUpperCase();
+    if (sel == "Q" || sel == "") {
+        Serial.setTimeout(old_timeout);
+        return;
+    }
+
+    Serial.printf("\nTarget [%s] chosen.\nEnter new value (e.g. 0.05) and press Enter > ", sel.c_str());
+    
+    // 次の数値を待つ前にバッファをもう一度クリア（改行対策）
+    // while(Serial.available()) Serial.read(); // parseFloatは前のバッファを読んでしまう可能性あり
+
+    float val = Serial.parseFloat();
+    Serial.println(val, 4);
+
+    if      (sel == "1") roll.set_rate_gains(val, roll.c_rate.get_ki(), roll.c_rate.get_kd());
+    else if (sel == "2") roll.set_rate_gains(roll.c_rate.get_kp(), val, roll.c_rate.get_kd());
+    else if (sel == "3") roll.set_rate_gains(roll.c_rate.get_kp(), roll.c_rate.get_ki(), val);
+    else if (sel == "4") roll.set_angle_gains(val, roll.c_ang.get_ki(), roll.c_ang.get_kd());
+    
+    else if (sel == "5") pitch.set_rate_gains(val, pitch.c_rate.get_ki(), pitch.c_rate.get_kd());
+    else if (sel == "6") pitch.set_rate_gains(pitch.c_rate.get_kp(), val, pitch.c_rate.get_kd());
+    else if (sel == "7") pitch.set_rate_gains(pitch.c_rate.get_kp(), pitch.c_rate.get_ki(), val);
+    else if (sel == "8") pitch.set_angle_gains(val, pitch.c_ang.get_ki(), pitch.c_ang.get_kd());
+
+    else if (sel == "9") yaw.set_rate_gains(val, yaw.c_rate.get_ki(), yaw.c_rate.get_kd());
+    else if (sel == "A") yaw.set_rate_gains(yaw.c_rate.get_kp(), val, yaw.c_rate.get_kd());
+    else if (sel == "B") yaw.set_rate_gains(yaw.c_rate.get_kp(), yaw.c_rate.get_ki(), val);
+
+    Serial.println("INFO: Parameter Updated. Resuming Control...");
+    Serial.setTimeout(old_timeout);
+}

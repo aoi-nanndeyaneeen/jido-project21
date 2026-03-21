@@ -38,6 +38,8 @@ public:
 
     Sbus(HardwareSerial *ser) {
         _sbus = new bfs::SbusRx(ser, true);
+        connection_fail = 3000;
+        for(int i=0; i<16; i++) des[i] = 0.0f;
     }
 
     void begin() {
