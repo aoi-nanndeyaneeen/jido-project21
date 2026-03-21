@@ -119,19 +119,21 @@ void loop() {
                 fused_alt = ez2_alt;
             }
 
-             Plane_Data.update(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
-                              Roll.ang, Pitch.ang, Yaw.ang,
-                              fused_alt);
+
              
-             im920.write(Plane_Data);
+            im920.write(Plane_Data);
  
-             Serial.print("\033[2J\033[H"); // 常にシリアルモニタの上に表示する
+            Serial.print("\033[2J\033[H"); // 常にシリアルモニタの上に表示する
  
-             print_flightmode(int(Mode.get_mode()), BANK_ANGLE, TURN_MS);
+            Plane_Data.update(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
+                Roll.ang, Pitch.ang, Yaw.ang,
+                fused_alt);
+
+
  
              Serial.print("\033[2J\033[H"); // ターミナルクリア
              im920.write(Plane_Data);
- 
+             print_flightmode(int(Mode.get_mode()), BANK_ANGLE, TURN_MS);
              print_PID(Roll.pid, Pitch.pid, Yaw.pid);
              print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
              print_ACC(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ());
@@ -150,7 +152,7 @@ void loop() {
 void updateSensorsAndComms() {
     mpu.update();
     sbus.update();
-    Mode.update(sbus.Ch_state(Aux2), sbus.Ch_state(Aux3));
+    Mode.update(down, up);
 
     Roll.update_value(sbus.des[Ch::ROLL],    -mpu.getRoll(),  mpu.getAccX(), mpu.getGyroX());
     Pitch.update_value(sbus.des[Ch::PITCH], -mpu.getPitch(),  mpu.getAccY(), mpu.getGyroY());

@@ -5,8 +5,8 @@
 
 class Flight_mode {
 private:
-    FlightMode currentMode = MODE_MANUAL;
-    FlightMode prevMode = MODE_MANUAL; // モード変化検出用
+    FlightMode currentMode = MODE_SEMI_MANUAL;
+    FlightMode prevMode = MODE_SEMI_MANUAL; // モード変化検出用
 public:
 
     unsigned long modeStartMs = 0;
@@ -14,7 +14,7 @@ public:
         // ============================================================
         //  モード判定 (スイッチ読み取り)
         // ============================================================
-        // 優先度: 8の字 > 水平旋回 > マニュアル
+        // 優先度: 8の字 > 水平旋回 > 加速度だけ入ってるPID > マニュアル(PIDなし)
         if (_Aux1 == up)
             currentMode = MODE_FIGURE_8;
         else if (_Aux1 == cen)
