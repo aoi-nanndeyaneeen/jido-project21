@@ -1,0 +1,23 @@
+// ============================================================
+//  minimum_test.cpp - Stability Test Firmware
+// ============================================================
+#include <Arduino.h>
+#include "Config.h"
+
+void setup() {
+    Serial.begin(115200);
+    uint32_t start_ms = millis();
+    while(!Serial && (millis() - start_ms < 2000));
+    Serial.println("\n\n--- BARE MINIMUM TEST BOOT ---");
+    Serial.println("If you see this and it doesn't repeat, the board is stable.");
+    Serial.println("--- Setup Complete. Loop start ---");
+}
+
+namespace T = Config::Timing;
+
+void loop() {
+    if (T::freq<10>(T::Main_dt)) { // 10Hz
+        Serial.println("Looping...");
+        delay(10);
+    }
+}
