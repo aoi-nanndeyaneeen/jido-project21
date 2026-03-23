@@ -175,7 +175,7 @@ void loop() {
              Serial.print("\033[2J\033[H"); // ターミナルクリア
              Serial.printf("### High-Power Triage: MPU=%s BARO=%s SBUS=%s IM920=%s SERVO=%s ###\n", 
                 USE_MPU?"ON":"OFF", USE_BARO?"ON":"OFF", USE_SBUS?"ON":"OFF", USE_IM920?"ON":"OFF", USE_SERVO?"ON":"OFF");
-            //print_flightmode(Mode.get_mode(),BANK_ANGLE,TURN_MS);
+            print_flightmode(Mode.get_mode(), BANK_ANGLE, TURN_MS);
              if (USE_MPU) print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
              if (USE_SBUS) print_sbus(sbus.des[Ch::ROLL], sbus.des[Ch::PITCH], sbus.des[Ch::THR], sbus.des[Ch::YAW], sbus.des[Ch::Aux1], sbus.des[Ch::Aux2], sbus.des[Ch::Aux3]);
              
@@ -191,7 +191,7 @@ void loop() {
 void updateSensorsAndComms() {
     mpu.update();
     sbus.update();
-    Mode.update(down,down);
+    Mode.update(sbus.Ch_state(Ch::Aux2), sbus.Ch_state(Ch::Aux3));
 
     Roll.update_value(sbus.des[Ch::ROLL],    -mpu.getRoll(),  mpu.getAccX(), mpu.getGyroX());
     Pitch.update_value(sbus.des[Ch::PITCH], -mpu.getPitch(),  mpu.getAccY(), mpu.getGyroY());
