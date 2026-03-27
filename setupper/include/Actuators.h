@@ -1,6 +1,5 @@
 // 出力系
 #pragma once
-#include "Config.h"
 #include <Arduino.h>
 #include <Servo.h>
 class RC_servo {
@@ -126,24 +125,6 @@ public:
     Serial.println("--------------------");
   }
 
-
-  void flap(Sw input) {
-    if (input == up)
-      write(1.0);
-    if (input == cen)
-      write(0.0);
-    if (input == down)
-      write(-1.0);
-  }
-
-  void flapelon(Sw input, float off_up, float off_cen, float off_down) {
-    if (input == up)
-      write(1.0);
-    if (input == cen)
-      write(0.0);
-    if (input == down)
-      write(-1.0);
-  }
 
   void elevon(float R_input, float P_input) {
     R_input = sbus_constrain(R_input, _offset, _end1, _end2);
