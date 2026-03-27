@@ -5,23 +5,27 @@
 
 class Flight_mode {
 private:
-    FlightMode currentMode = MODE_MANUAL;
-    FlightMode prevMode = MODE_MANUAL; // モード変化検出用
+    FlightMode currentMode = MODE_MANUAL; // 初期モードをMANUALに変更
+    FlightMode prevMode = MODE_MANUAL;    // モード変化検出用
 public:
 
     unsigned long modeStartMs = 0;
-    void update(Sw _Aux1,Sw _Aux2) {
+    
+    // main.cpp から Mode.update(Aux2, Aux3) として呼ばれる
+    void update(Sw switch_Turn, Sw switch_Fig8) {
         // ============================================================
-        //  モード判定 (スイッチ読み取り)
+        //  モード判定 (独立スイッチ版)
         // ============================================================
-        // 優先度: 8の字 > 水平旋回 > 加速度だけ入ってるPID > マニュアル(PIDなし)
-        if (_Aux1 == up)
-            currentMode = MODE_FIGURE_8;
-        else if (_Aux1 == cen)
-            currentMode = MODE_LEVEL_TURN;
-        else if (_Aux2 == up)
-            currentMode = MODE_SEMI_MANUAL;
-        else    currentMode = MODE_MANUAL;
+        // 優先度: 8の字 > 水平旋回 > マニュアル(基本モード)
+        if (switch_Fig8 == up) {
+            currentMode = MODE_FIGURE_8;   // Aux3 が上なら8の字
+        }
+        else if (switch_Turn == up) {
+            currentMode = MODE_LEVEL_TURN; // Aux2 が上なら水平旋回
+        }
+        else {
+            currentMode = MODE_MANUAL;     // どちらもオフならマニュアル
+        }
     }
 
     bool change(){
