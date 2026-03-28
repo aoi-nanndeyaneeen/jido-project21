@@ -11,41 +11,29 @@
 //  § 共通型定義  (構造体・列挙型)
 // ============================================================
 
-// ==== 通信用の構造体 ====
+// 構造体のパディング/アライメントによるマイコン間のクラッシュ・通信不良を防ぐため、
+// 4バイト(int32_t)とfloat配列で構成します。(合計 36 bytes)
 struct __attribute__((__packed__)) PlaneData {
-    float ax, ay, az;
-    float gx, gy, gz;
-    float altitude;
-
-    void update(float ax_in, float ay_in, float az_in, float gx_in, float gy_in, float gz_in, float alt_in) {
-        ax = ax_in; ay = ay_in; az = az_in;
-        gx = gx_in; gy = gy_in; gz = gz_in;
-        altitude = alt_in;
-    }
-
-    void print() const {
-        Serial.printf("Accel: [%.2f, %.2f, %.2f] g\n", ax, ay, az);
-        Serial.printf("Gyro : [%.2f, %.2f, %.2f] deg/s\n", gx, gy, gz);
-        Serial.printf("Alt  : %.2f m\n", altitude);
-    }
+    int32_t packet_type; // 0: 姿勢データ, 1: ゲインデータ
+    float data[8];       // 最大32バイト (姿勢は7個、ゲインは8個使用)
 };
 
 struct __attribute__((__packed__)) GroundData {
-    float p_adj, i_adj, d_adj;
-    float roll, pitch, yaw;
-    uint8_t reset_cmd; // 1: Reset trigger
-
-    void update(float p, float i, float d, float r, float pt, float y, uint8_t reset = 0) {
-        p_adj = p; i_adj = i; d_adj = d;
-        roll = r; pitch = pt; yaw = y;
-    }
-
+    float p_adj, i_adj, d_adj; 
+    float roll, pitch, yaw;    
+    uint8_t reset_cmd;         
+    uint8_t param_sel;         
+    // 0=なし 1=RollRate 2=PitchRate 3=YawRate 4=RollAngle 5=PitchAngle
+    // 10 = テレメトリ一時停止 ＆ 現在のゲイン送信要求
+    // 11 = テレメトリ再開
+    
     void print() const {
         Serial.println("=== Ground Data ===");
-        Serial.printf("PID Adjust: P=%.3f, I=%.3f, D=%.3f\n", p_adj, i_adj, d_adj);
+        Serial.printf("PID Adjust: P=%.4f, I=%.4f, D=%.4f  sel=%d\n", p_adj, i_adj, d_adj, param_sel);
         Serial.printf("Attitude  : Roll=%.1f, Pitch=%.1f, Yaw=%.1f\n", roll, pitch, yaw);
     }
 };
+constexpr int GROUND_DATA_NUM = 6;
 
 // ゲインの構造体
 struct PID_Gains {
@@ -67,7 +55,7 @@ enum FlightMode : uint8_t {
     MODE_MANUAL      = 0,  // プロポ直接操作
     MODE_LEVEL_TURN  = 1,  // 自動水平旋回
     MODE_FIGURE_8    = 2,  // 8の字飛行
-    MODE_SEMI_MANUAL = 4,
+    MODE_SEMI_MANUAL = 3,  //4にするな範囲外アクセスになる
 };
 
 
@@ -79,23 +67,26 @@ enum FlightMode : uint8_t {
 // [重要] 全て0からスタートし、必ず地上で手持ちしながら少しずつ上げること
 //  手順:
 //  1. kp_angle を上げて機体が目標角に向かうか確認
-//  2. kp_rate  を上げてサーボの追従速度を上げる
+//  2. kp_rate  を上げてサーボの追従速度pを上げる
 //  3. kd_rate  を足して振動を抑える
 //  4. ki_rate  は最後に少しだけ足す
 
 //                      kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle  sensitivity
-PID_Gains ROLL_gain  = { -0.05f,    0.0f,    0.0f,   -1.5f,     0.0f,     0.0f,     0.0f,
+PID_Gains ROLL_gain  = { -0.03f,    0.0f,    0.0f,   -1.5f,     0.0f,     0.0f,     1.0f,
                           0.0f, 0.0f,   // rate_d_alpha, rate_i_limit
                           0.0f, 0.0f }; // angle_d_alpha, angle_i_limit
-PID_Gains PITCH_gain = { 0.05f,    0.0f,    0.00f,   -1.5f,     0.0f,     0.0f,     0.0f };
-PID_Gains YAW_gain   = { 0.0f,    0.0f,    0.00f,   0.0f,     0.0f,     0.0f,     0.0f };
+PID_Gains PITCH_gain = { 0.02f,    0.0f,    0.00f,   -1.5f,     0.0f,     0.0f,     1.0f,
+                          0.0f, 0.0f, 0.0f, 0.0f };
+PID_Gains YAW_gain   = { 0.0f,    0.0f,    0.00f,   0.0f,     0.0f,     0.0f,     1.0f,
+                          0.0f, 0.0f, 0.0f, 0.0f };
 
 
 // ============================================================
 //  § 2  自律飛行パラメータ
 // ============================================================
-inline float         BANK_ANGLE = 40.0f;   // バンク角 [deg]
-inline unsigned long TURN_MS    = 4000UL;  // 8の字の片道時間 [ms]
+inline float         BANK_ANGLE    = 1.0f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
+inline unsigned long TURN_MS       = 4000UL; // 8 of 8 or a single trip time [ms]
+inline float         RUDDER_COORD  = 0.5f;   // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
 
 
 // ============================================================
