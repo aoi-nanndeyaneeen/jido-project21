@@ -6,10 +6,11 @@ import numpy as np
 class CameraTracker:
     def __init__(self, camera_id=0, width=1920, height=1080):
         """カメラの初期化（1080p高画質設定）"""
-        self.cap = cv2.VideoCapture(camera_id)
+        # cv2.CAP_DSHOW を追加（Windowsでの起動高速化とMJPG安定化のため）
+        self.cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
         
-        # 1080pとMJPGフォーマットを要求（USB3.0の帯域を活かして高画質・高FPSを出すため）
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        # DSHOWの場合、MJPG設定を先に書くのがコツです
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 

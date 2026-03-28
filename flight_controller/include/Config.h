@@ -15,7 +15,7 @@
 // 4バイト(int32_t)とfloat配列で構成します。(合計 36 bytes)
 struct __attribute__((__packed__)) PlaneData {
     int32_t packet_type; // 0: 姿勢データ, 1: ゲインデータ
-    float data[8];       // 最大32バイト (姿勢は7個、ゲインは8個使用)
+    float data[6];       // 最大32バイト (姿勢は7個、ゲインは8個使用)
 };
 
 struct __attribute__((__packed__)) GroundData {
@@ -72,21 +72,21 @@ enum FlightMode : uint8_t {
 //  4. ki_rate  は最後に少しだけ足す
 
 //                      kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle  sensitivity
-PID_Gains ROLL_gain  = { -0.03f,    0.0f,    0.0f,   -1.5f,     0.0f,     0.0f,     1.0f,
-                          0.0f, 0.0f,   // rate_d_alpha, rate_i_limit
+PID_Gains ROLL_gain  = { 0.15f,    0.0f,    0.0f,   10.0f,     0.0f,     0.0f,     1.0f,
+                          0.8f, 0.0f,   // rate_d_alpha, rate_i_limit
                           0.0f, 0.0f }; // angle_d_alpha, angle_i_limit
-PID_Gains PITCH_gain = { 0.02f,    0.0f,    0.00f,   -1.5f,     0.0f,     0.0f,     1.0f,
-                          0.0f, 0.0f, 0.0f, 0.0f };
+PID_Gains PITCH_gain = { 0.1f,    0.001f,    0.00f,  7.0f,     0.0f,     0.0f,     1.0f,
+                          0.8f, 0.0f, 0.0f, 0.0f };
 PID_Gains YAW_gain   = { 0.0f,    0.0f,    0.00f,   0.0f,     0.0f,     0.0f,     1.0f,
-                          0.0f, 0.0f, 0.0f, 0.0f };
+                          0.8f, 0.0f, 0.0f, 0.0f };
 
 
 // ============================================================
 //  § 2  自律飛行パラメータ
 // ============================================================
-inline float         BANK_ANGLE    = 1.0f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
+inline float         BANK_ANGLE    = -0.1f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
 inline unsigned long TURN_MS       = 4000UL; // 8 of 8 or a single trip time [ms]
-inline float         RUDDER_COORD  = 0.5f;   // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
+inline float         RUDDER_COORD  = 0.7;   // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
 
 
 // ============================================================

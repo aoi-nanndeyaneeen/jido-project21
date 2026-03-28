@@ -9,7 +9,7 @@
 // 4バイト(int32_t)とfloat配列で構成します。(合計 36 bytes)
 struct __attribute__((__packed__)) PlaneData {
     int32_t packet_type; // 0: 姿勢データ, 1: ゲインデータ
-    float data[8];       // 最大32バイト (姿勢は7個、ゲインは8個使用)
+    float data[6];      // 最大32バイト (姿勢は7個、ゲインは8個使用)
 };
 
 struct __attribute__((__packed__)) GroundData {

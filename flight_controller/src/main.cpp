@@ -181,7 +181,7 @@ void loop() {
                 att_packet.data[4]       = Pitch.ang; 
                 att_packet.data[5]       = Yaw.ang;
                 att_packet.data[6]       = fused_alt;
-                att_packet.data[7]       = 0.0f; // unused
+
                 im920.write(att_packet);
             }
 
@@ -207,8 +207,8 @@ void updateSensorsAndComms() {
     sbus.update();
     Mode.update(sbus.Ch_state(Ch::Aux2), sbus.Ch_state(Ch::Aux3));
 
-    Roll.update_value(sbus.des[Ch::ROLL],    -mpu.getRoll(),  mpu.getAccX(), mpu.getGyroX());
-    Pitch.update_value(sbus.des[Ch::PITCH], -mpu.getPitch(),  mpu.getAccY(), mpu.getGyroY());
+    Roll.update_value(sbus.des[Ch::ROLL],    -mpu.getRoll(),  mpu.getAccX(), -mpu.getGyroX());
+    Pitch.update_value(sbus.des[Ch::PITCH], mpu.getPitch(),  mpu.getAccY(), mpu.getGyroY());
     Yaw.update_value(sbus.des[Ch::YAW],        mpu.getYaw(),  mpu.getAccZ(), mpu.getGyroZ());
 
     // --- シリアルコマンド (PCモニタからのRキー等) ---
@@ -259,8 +259,8 @@ void updateSensorsAndComms() {
             gain_packet.data[3]       = Pitch.c_rate.get_kp();
             gain_packet.data[4]       = Pitch.c_rate.get_ki();
             gain_packet.data[5]       = Pitch.c_rate.get_kd();
-            gain_packet.data[6]       = Roll.c_ang.get_kp();
-            gain_packet.data[7]       = Pitch.c_ang.get_kp();
+            // gain_packet.data[6]       = Roll.c_ang.get_kp();
+            // gain_packet.data[7]       = Pitch.c_ang.get_kp();
             im920.write(gain_packet);
             Serial.println("INFO: Sent current gains to Ground Station.");
             Ground_Data.param_sel = 0;
