@@ -72,6 +72,9 @@ public:
       memcpy(&data, buffer, sizeof(Reciver));
       return true;
     }
+    else{
+      Serial.print("check sum fail");
+    }
 
     return false;
   }
@@ -107,6 +110,7 @@ public:
 
       // 十分な長さがあるかチェック (データ部 + チェックサム4バイト(8文字))
       if (_temp.length() >= (sizeof(Reciver) * 2 + 8)) {
+        Serial.print("line check");
         return true;
       }
     }

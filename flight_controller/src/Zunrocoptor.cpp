@@ -37,12 +37,13 @@ GroundData Ground_Data;
 
 Flight_mode Mode;
 
-RC_servo Ail1(1, 0.0, -1.0, 1.0), // 1番ピンに戻しました
-         Ail2(6, 0.0, -1.0, 1.0),
-         Ele (2, 0.0, -1.0, 1.0),
-         Rud (10, 0.0, -1.0, 1.0), // 4番(EZ2)と被るので10番へ
-         Flp1(11, 0.0, -1.0, 1.0), // 8番(SBUS TX)と被るので11番へ
-         Flp2(9, 0.0, -1.0, 1.0);
+        //ピン・サブトリム(-1~1)・エンドポイント・エンドポイント・リバース(trueが反転する)
+RC_servo Ail1(1, 0.0, -1.0, 1.0, false), // 1番ピンに戻しました
+         Ail2(6, 0.0, -1.0, 1.0, false),
+         Ele (2, 0.5, -1.0, 1.0, false),
+         Rud (10, 0.0, -1.0, 1.0, false), // 4番(EZ2)と被るので10番へ
+         Flp1(11, 0.0, -1.0, 1.0, false), // 8番(SBUS TX)と被るので11番へ
+         Flp2(9, 0.0, -1.0, 1.0, false);
 RC_motor Thr_r(3, 1.0), Thr_l(5, 1.0);
 
 // ============================================================
@@ -180,7 +181,7 @@ void loop() {
                 att_packet.data[4]       = Pitch.ang; 
                 att_packet.data[5]       = Yaw.ang;
                 att_packet.data[6]       = fused_alt;
-                att_packet.data[7]       = 0.0f; // unused
+
                 im920.write(att_packet);
             }
 
@@ -206,8 +207,8 @@ void updateSensorsAndComms() {
     sbus.update();
     Mode.update(sbus.Ch_state(Ch::Aux2), sbus.Ch_state(Ch::Aux3));
 
-    Roll.update_value(sbus.des[Ch::ROLL],    -mpu.getRoll(),  mpu.getAccX(), mpu.getGyroX());
-    Pitch.update_value(sbus.des[Ch::PITCH], -mpu.getPitch(),  mpu.getAccY(), mpu.getGyroY());
+    Roll.update_value(sbus.des[Ch::ROLL],    -mpu.getRoll(),  mpu.getAccX(), -mpu.getGyroX());
+    Pitch.update_value(sbus.des[Ch::PITCH], mpu.getPitch(),  mpu.getAccY(), mpu.getGyroY());
     Yaw.update_value(sbus.des[Ch::YAW],        mpu.getYaw(),  mpu.getAccZ(), mpu.getGyroZ());
 
     // --- シリアルコマンド (PCモニタからのRキー等) ---
@@ -258,8 +259,8 @@ void updateSensorsAndComms() {
             gain_packet.data[3]       = Pitch.c_rate.get_kp();
             gain_packet.data[4]       = Pitch.c_rate.get_ki();
             gain_packet.data[5]       = Pitch.c_rate.get_kd();
-            gain_packet.data[6]       = Roll.c_ang.get_kp();
-            gain_packet.data[7]       = Pitch.c_ang.get_kp();
+            // gain_packet.data[6]       = Roll.c_ang.get_kp();
+            // gain_packet.data[7]       = Pitch.c_ang.get_kp();
             im920.write(gain_packet);
             Serial.println("INFO: Sent current gains to Ground Station.");
             Ground_Data.param_sel = 0;
