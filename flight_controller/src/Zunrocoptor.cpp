@@ -33,7 +33,8 @@ namespace T = Config::Timing;
 //  3. kd_rate  を足して振動を抑える
 //  4. ki_rate  は最後に少しだけ足す
 
-//                      kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle  sensitivity
+// kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle  
+//  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
 Axis_value Roll(0.03f, 0.0f, 0.0f, 1.5f, 0.0f, 0.0f,
                 1.0f, 0.0f, 0.0f, 0.0f, 0.0f),
@@ -41,7 +42,14 @@ Axis_value Roll(0.03f, 0.0f, 0.0f, 1.5f, 0.0f, 0.0f,
                 1.0f, 0.0f, 0.0f, 0.0f, 0.0f),
             Yaw(0.03f, 0.0f, 0.0f, 1.5f, 0.0f, 0.0f,
                 1.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+
                 
+float         BANK_ANGLE    = -0.1f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
+unsigned long TURN_MS       = 4000UL; // 8 of 8 or a single trip time [ms]
+float         RUDDER_COORD  = 0.7;   // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
+                
+
+
 IMU mpu(&Wire);
 BarometerSensor barometer(1013.25, 0.1, &Wire);
 // EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA); // 停止中 (搭載無し)
@@ -221,8 +229,10 @@ void loop()
             Serial.print("\033[2J\033[H"); // ターミナルクリア
             Serial.printf("### Triage: MPU=%s BARO=%s SBUS=%s IM920=%s SERVO=%s TEL=%s ###\n",
                           USE_MPU ? "ON" : "OFF", USE_BARO ? "ON" : "OFF", USE_SBUS ? "ON" : "OFF", USE_IM920 ? "ON" : "OFF", USE_SERVO ? "ON" : "OFF", is_telemetry_active ? "ON" : "OFF");
-            Serial.printf("[TIME: %lu ms] PlaneData=%d GroundData=%d\n", millis(), (int)sizeof(PlaneData), (int)sizeof(GroundData));
+           
+                          Serial.printf("[TIME: %lu ms] PlaneData=%d GroundData=%d\n", millis(), (int)sizeof(PlaneData), (int)sizeof(GroundData));
             print_flightmode(Mode.get_mode(), BANK_ANGLE, TURN_MS);
+            
             if (USE_MPU)
                 print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
             if (USE_SBUS)
@@ -230,6 +240,7 @@ void loop()
 
             if (USE_BARO)
                 Serial.printf("Alt: %+7.2f m\n", fused_alt);
+                
             print_timing(T::Main_dt);
         }
     }

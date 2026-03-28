@@ -33,14 +33,19 @@ namespace T = Config::Timing;
 //  3. kd_rate  を足して振動を抑える
 //  4. ki_rate  は最後に少しだけ足す
 
-//                      kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle  sensitivity
+// kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle  
+//  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(-0.03f, 0.0f, 0.0f, -1.5f, 0.0f, 0.0f,
-                1.0f, 0.0f, 0.0f, 0.0f, 0.0f),
-            Pitch(0.02f, 0.0f, 0.0f, -1.5f, 0.0f, 0.0f,
-                1.0f, 0.0f, 0.0f, 0.0f, 0.0f),
+Axis_value Roll(0.15f, 0.0f, 0.0f, 10.0f, 0.0f, 0.0f,
+                1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
+            Pitch(0.1f, 0.001f, 0.0f, 7.0f, 0.0f, 0.0f,
+                1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
             Yaw(-0.03f, 0.0f, 0.0f, -1.5f, 0.0f, 0.0f,
-                1.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+                1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
+
+float         BANK_ANGLE    = -0.1f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
+unsigned long TURN_MS       = 4000UL; // 8 of 8 or a single trip time [ms]
+float         RUDDER_COORD  = 0.7;   // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
                 
 IMU mpu(&Wire);
 BarometerSensor barometer(1013.25, 0.1, &Wire1);
