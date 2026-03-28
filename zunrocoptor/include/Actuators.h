@@ -10,7 +10,7 @@ class RC_servo{
   int _minPWM, _maxPWM ;
   Servo _servo;
 
-  float float_to_microsec(float in) { return in*500+1500; }
+  float float_to_microsec(float in) { return map(in*1000, -1000, 1000, _minPWM-1500, _maxPWM-1500) + 1500; }
   float sbus_constrain(float input,float offset,float end1,float end2){
       if(input<0){
         input = input*fabs(end1-offset);

@@ -48,10 +48,10 @@ GroundData Ground_Data;
 Flight_mode Mode;
 //RC_servo(int pin,float offset, float end1, float end2,bool reverse = false, int minPWM = 1000, int maxPWM = 2000)
 //RC_servo(int pin,float offset, float end1, float end2,float endp1,float endp2,bool reverse = false,bool p_reverse = false, int minPWM = 1000, int maxPWM = 2000)  
-RC_servo Ele_von1(5, 0.0, -1.0, 1.0,-0.9,0.85,false),
-         Ele_von2(6, 0.0, -1.0,0.5,-0.9,1.0,false,true),
+RC_servo Ele_von1(5, 0.0, -1.0, 0.9,-1.0,1.0,false,false,500,2400),
+         Ele_von2(6, -0.15, -1.0, 1.0,-1.0,1.0,false,true,500,2400),
          Ele (24, +0.7, -1.0, 1.0),
-         Rud (25, 0.0, -1.0, 1.0);
+         Rud (25, 0.2, -1.0, 1.0);
 RC_motor Thr(9, 1.0);
 
 // ============================================================
