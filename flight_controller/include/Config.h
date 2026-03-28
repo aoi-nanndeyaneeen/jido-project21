@@ -35,14 +35,6 @@ struct __attribute__((__packed__)) GroundData {
 };
 constexpr int GROUND_DATA_NUM = 6;
 
-// ゲインの構造体
-struct PID_Gains {
-    float kp_rate, ki_rate, kd_rate;
-    float kp_angle, ki_angle, kd_angle;
-    float sensitivity;
-    float rate_d_alpha  = 0.7f,  rate_i_limit  = 200.0f;
-    float angle_d_alpha = 0.7f,  angle_i_limit = 200.0f;
-};
 
 // ==== スイッチやチャンネルの定義 ====
 enum Sw { up, cen, down };
@@ -57,28 +49,6 @@ enum FlightMode : uint8_t {
     MODE_FIGURE_8    = 2,  // 8の字飛行
     MODE_SEMI_MANUAL = 3,  //4にするな範囲外アクセスになる
 };
-
-
-// ============================================================
-//  § 1  PIDゲイン
-// ============================================================
-// setgains(kp_rate, ki_rate, kd_rate, kp_angle, ki_angle, kd_angle, sensitivity)
-//
-// [重要] 全て0からスタートし、必ず地上で手持ちしながら少しずつ上げること
-//  手順:
-//  1. kp_angle を上げて機体が目標角に向かうか確認
-//  2. kp_rate  を上げてサーボの追従速度pを上げる
-//  3. kd_rate  を足して振動を抑える
-//  4. ki_rate  は最後に少しだけ足す
-
-//                      kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle  sensitivity
-PID_Gains ROLL_gain  = { -0.03f,    0.0f,    0.0f,   -1.5f,     0.0f,     0.0f,     1.0f,
-                          0.0f, 0.0f,   // rate_d_alpha, rate_i_limit
-                          0.0f, 0.0f }; // angle_d_alpha, angle_i_limit
-PID_Gains PITCH_gain = { 0.02f,    0.0f,    0.00f,   -1.5f,     0.0f,     0.0f,     1.0f,
-                          0.0f, 0.0f, 0.0f, 0.0f };
-PID_Gains YAW_gain   = { 0.0f,    0.0f,    0.00f,   0.0f,     0.0f,     0.0f,     1.0f,
-                          0.0f, 0.0f, 0.0f, 0.0f };
 
 
 // ============================================================
@@ -181,18 +151,4 @@ namespace Config {
             Main_dt = 1000000UL / MAIN_Hz;
         }
     }
-
-    // ============================================================
-    //  § 5  通信ピン設定
-    // ============================================================
-    namespace serial {
-        inline HardwareSerial* const im920 = &Serial3; // IM920SL用シリアルポート
-        inline HardwareSerial* const sbus  = &Serial2; // S.BUS用シリアルポート
-    }
-
-    namespace wire {
-        inline TwoWire* const mpu = &Wire;   // MPU6050 用 I2C ポート
-        inline TwoWire* const bmp = &Wire1;  // 気圧センサ用 I2C ポート
-    }
-
 } // namespace Config
