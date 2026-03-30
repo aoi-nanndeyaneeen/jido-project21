@@ -11,26 +11,24 @@
 //  § 共通型定義  (構造体・列挙型)
 // ============================================================
 
-// 構造体のパディング/アライメントによるマイコン間のクラッシュ・通信不良を防ぐため、
-// 4バイト(int32_t)とfloat配列で構成します。(合計 36 bytes)
 struct __attribute__((__packed__)) PlaneData {
-    int32_t packet_type; // 0: 姿勢データ, 1: ゲインデータ
-    float data[6];       // 最大32バイト (姿勢は7個、ゲインは8個使用)
+    float ax, ay, az;       // 加速度 [g]
+    float roll, pitch, yaw; // 姿勢角 [deg]
+    float altitude;         // 高度 [m]
+    // 合計 28 bytes
 };
 
 struct __attribute__((__packed__)) GroundData {
-    float p_adj, i_adj, d_adj; 
-    float roll, pitch, yaw;    
-    uint8_t reset_cmd;         
-    uint8_t param_sel;         
-    // 0=なし 1=RollRate 2=PitchRate 3=YawRate 4=RollAngle 5=PitchAngle
-    // 10 = テレメトリ一時停止 ＆ 現在のゲイン送信要求
-    // 11 = テレメトリ再開
-    
+    float p_adj, i_adj, d_adj; // PIDゲイン絶対値
+    float roll, pitch, yaw;    // BANK_ANGLE / TURN_MS 調整用
+    uint8_t reset_cmd;         // 1: リセット
+    uint8_t param_sel;         // 0=なし 1=RollRate 2=PitchRate 3=YawRate 4=RollAngle 5=PitchAngle
+    // 合計 26 bytes
+
     void print() const {
         Serial.println("=== Ground Data ===");
-        Serial.printf("PID Adjust: P=%.4f, I=%.4f, D=%.4f  sel=%d\n", p_adj, i_adj, d_adj, param_sel);
-        Serial.printf("Attitude  : Roll=%.1f, Pitch=%.1f, Yaw=%.1f\n", roll, pitch, yaw);
+        Serial.printf("PID: P=%.4f I=%.4f D=%.4f  sel=%d\n", p_adj, i_adj, d_adj, param_sel);
+        Serial.printf("Att: Roll=%.1f Pitch=%.1f Yaw=%.1f\n", roll, pitch, yaw);
     }
 };
 constexpr int GROUND_DATA_NUM = 6;
@@ -86,7 +84,7 @@ namespace Config {
         constexpr int16_t ACCEL_Z_OFFSET = 0;
         constexpr int16_t GYRO_X_OFFSET  = 0;
         constexpr int16_t GYRO_Y_OFFSET  = 0;
-        constexpr int16_t GYRO_Z_OFFSET _ = 0;
+        constexpr int16_t GYRO_Z_OFFSET  = 0;
 
         // BMP280 気圧センサー設定 (main_test の実績値に合わせる)
         constexpr float BARO_SEA_LEVEL_HPA = 1013.25f;
