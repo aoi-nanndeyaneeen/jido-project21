@@ -86,7 +86,7 @@ namespace Config {
         constexpr int16_t ACCEL_Z_OFFSET = 0;
         constexpr int16_t GYRO_X_OFFSET  = 0;
         constexpr int16_t GYRO_Y_OFFSET  = 0;
-        constexpr int16_t GYRO_Z_OFFSET  = 0;
+        constexpr int16_t GYRO_Z_OFFSET _ = 0;
 
         // BMP280 気圧センサー設定 (main_test の実績値に合わせる)
         constexpr float BARO_SEA_LEVEL_HPA = 1013.25f;
