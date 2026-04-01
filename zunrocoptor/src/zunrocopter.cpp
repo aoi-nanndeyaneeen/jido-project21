@@ -228,7 +228,7 @@ void autonomousControl() {
 void writeServos() {
     Ele_von1.elevon(Roll.cmd, Pitch.sbus);
     Ele_von2.elevon(Roll.cmd, Pitch.sbus);
-    Ele.write(0.0);
+    Ele.write(Pitch.sbus);
     Rud.write(Yaw.sbus);
 }
 
