@@ -52,10 +52,7 @@ BarometerSensor barometer(1013.25, 0.1, &Wire1);
 // EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA); // 停止中 (搭載無し)
 
 Sbus sbus(&Serial2);
-IM920SL_Generic<PlaneData, GroundData> im920(&Serial3);
-
-PlaneData Plane_Data;
-GroundData Ground_Data;
+FlightTelemetry telemetry(&Serial3);
 
 Flight_mode Mode;
 
@@ -95,8 +92,6 @@ void setup()
     while (!Serial && (millis() - start_ms < 2000))
         ;
     Serial.println("\n\n--- TEENSY SYSTEM BOOT (High-Power Triage) ---");
-    Serial.printf("sizeof(PlaneData)=%d  sizeof(GroundData)=%d\n",
-                  sizeof(PlaneData), sizeof(GroundData));
 
     if (USE_MPU)
     {
@@ -126,7 +121,7 @@ void setup()
     if (USE_IM920)
     {
         Serial.println("Init IM920...");
-        im920.begin();
+        telemetry.begin();
     }
 
     if (USE_BARO)
@@ -218,22 +213,16 @@ void loop()
 
             // 姿勢データ送信 (28 bytes = float 7個、10Hz)
             if (USE_IM920) {
-                Plane_Data.ax       = mpu.getAccX();
-                Plane_Data.ay       = mpu.getAccY();
-                Plane_Data.az       = mpu.getAccZ();
-                Plane_Data.roll     = Roll.ang;
-                Plane_Data.pitch    = Pitch.ang;
-                Plane_Data.yaw      = Yaw.ang;
-                Plane_Data.altitude = fused_alt;
-                im920.write(Plane_Data);
+                telemetry.sendAttitude(
+                    mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
+                    Roll.ang, Pitch.ang, Yaw.ang, fused_alt
+                );
             }
 
             Serial.print("\033[2J\033[H");
             Serial.printf("### MPU=%s BARO=%s SBUS=%s IM920=%s SERVO=%s ###\n",
                 USE_MPU?"ON":"OFF", USE_BARO?"ON":"OFF", USE_SBUS?"ON":"OFF",
                 USE_IM920?"ON":"OFF", USE_SERVO?"ON":"OFF");
-            Serial.printf("[SIZE] PlaneData=%d GroundData=%d\n",
-                (int)sizeof(PlaneData), (int)sizeof(GroundData));
             print_flightmode(Mode.get_mode(), BANK_ANGLE, TURN_MS);
             if (USE_MPU)  print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
             if (USE_SBUS) print_sbus(sbus.des[Ch::ROLL], sbus.des[Ch::PITCH], sbus.des[Ch::THR],
@@ -284,42 +273,8 @@ void updateSensorsAndComms()
     }
 
     // 地上局からパラメータ受信
-    if (im920.read(Ground_Data)) {
-
-        // リモートリセット
-        if (Ground_Data.reset_cmd == 1) {
-            mpu.recalibrate();
-            barometer.reset();
-            Config::Timing::resetTiming();
-            Roll.pid_reset(); Pitch.pid_reset(); Yaw.pid_reset();
-            Serial.println("INFO: Remote Reset Complete.");
-            Ground_Data.reset_cmd = 0;
-        }
-
-        // BANK_ANGLE / TURN_MS 更新
-        if (Ground_Data.roll  != 0.0f) BANK_ANGLE = fabsf(Ground_Data.roll);
-        if (Ground_Data.pitch != 0.0f) TURN_MS    = (unsigned long)(Ground_Data.pitch * 1000.0f);
-
-        // PIDゲイン更新
-        if (Ground_Data.param_sel != 0) {
-            float p = Ground_Data.p_adj;
-            float i = Ground_Data.i_adj;
-            float d = Ground_Data.d_adj;
-            switch (Ground_Data.param_sel) {
-                case 1: Roll.set_rate_gains(p, i, d);
-                        Serial.printf("INFO: Roll  Rate  P=%.4f I=%.4f D=%.4f\n", p, i, d); break;
-                case 2: Pitch.set_rate_gains(p, i, d);
-                        Serial.printf("INFO: Pitch Rate  P=%.4f I=%.4f D=%.4f\n", p, i, d); break;
-                case 3: Yaw.set_rate_gains(p, i, d);
-                        Serial.printf("INFO: Yaw   Rate  P=%.4f I=%.4f D=%.4f\n", p, i, d); break;
-                case 4: Roll.set_angle_gains(p, i, d);
-                        Serial.printf("INFO: Roll  Angle P=%.4f I=%.4f D=%.4f\n", p, i, d); break;
-                case 5: Pitch.set_angle_gains(p, i, d);
-                        Serial.printf("INFO: Pitch Angle P=%.4f I=%.4f D=%.4f\n", p, i, d); break;
-                default: break;
-            }
-            Ground_Data.param_sel = 0;
-        }
+    if (USE_IM920) {
+        telemetry.receiveAndProcess(Roll, Pitch, Yaw, mpu, barometer, BANK_ANGLE, TURN_MS);
     }
 }
 
