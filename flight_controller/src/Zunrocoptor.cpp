@@ -36,35 +36,29 @@ namespace T = Config::Timing;
 // kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle  
 //  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(0.03f, 0.0f, 0.0f, 1.5f, 0.0f, 0.0f,
-                1.0f, 0.0f, 0.0f, 0.0f, 0.0f),
-            Pitch(0.02f, 0.0f, 0.0f, 1.5f, 0.0f, 0.0f,
-                1.0f, 0.0f, 0.0f, 0.0f, 0.0f),
-            Yaw(0.03f, 0.0f, 0.0f, 1.5f, 0.0f, 0.0f,
-                1.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+Axis_value Roll(0.005f, 0.0f, 0.00f, 0.0f, 0.0f, 0.0f, 
+                500.0f, 0.7f, 200.0f, 0.7f, 200.0f),
+            Pitch(0.005f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
+            Yaw(1.2f, 0.5f, 0.01f, 4.5f, 0.0f, 0.0f,
+                1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
 
-                
-float         BANK_ANGLE    = -0.1f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
+float         BANK_ANGLE    = 1.0f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
 unsigned long TURN_MS       = 4000UL; // 8 of 8 or a single trip time [ms]
-float         RUDDER_COORD  = 0.7;   // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
+float         RUDDER_COORD  = 0.66;   // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
                 
-
-
 IMU mpu(&Wire);
 BarometerSensor barometer(1013.25, 0.1, &Wire);
 // EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA); // 停止中 (搭載無し)
 
 Sbus sbus(&Serial5);
-IM920SL_Generic<PlaneData, GroundData> im920(&Serial3);
-
-PlaneData Plane_Data;
-GroundData Ground_Data;
+FlightTelemetry telemetry(&Serial3);
 
 Flight_mode Mode;
 
-RC_servo Ele_von1(5, 0.0, -1.0, 0.9,-1.0,1.0,false,false,500,2400),
-         Ele_von2(6, -0.15, -1.0, 1.0,-1.0,1.0,false,true,500,2400),
-         Ele (24, +0.7, -1.0, 1.0),
+RC_servo Ele_von1(5, 0.5, -1.0, 1.0,-1.0,1.0,false,false,500,2400),
+         Ele_von2(6, -0.5, -1.0, 1.0,-1.0,1.0,false,true,500,2400),
+         Ele (24, +0.4, -1.0, 1.0),
          Rud (25, 0.2, -1.0, 1.0);
 RC_motor Thr(9, 1.0);
 
@@ -87,17 +81,14 @@ bool USE_SBUS = true;  // 受信機 (SBUS)
 bool USE_IM920 = true; // 無線モジュール (IM920)
 bool USE_SERVO = true; // サーボ・アンプ出力 (Servo/ESC)
 
-static bool is_telemetry_active = true; // テレメトリ送信フラグ
+
 
 void setup()
 {
     Serial.begin(115200);
     uint32_t start_ms = millis();
-    while (!Serial && (millis() - start_ms < 2000))
-        ;
+    while (!Serial && (millis() - start_ms < 2000));
     Serial.println("\n\n--- TEENSY SYSTEM BOOT (High-Power Triage) ---");
-    Serial.printf("sizeof(PlaneData)=%d  sizeof(GroundData)=%d\n",
-                  sizeof(PlaneData), sizeof(GroundData));
 
     if (USE_MPU)
     {
@@ -114,17 +105,16 @@ void setup()
     if (USE_SERVO)
     {
         Serial.println("Init Actuators...");
-
-    Ele_von1.begin(); Ele_von2.begin();
-    Ele.begin();
-    Rud.begin();
-    Thr.begin();
+        Ele_von1.begin(); Ele_von2.begin();
+        Ele.begin();
+        Rud.begin();
+        Thr.begin();
     }
 
     if (USE_IM920)
     {
         Serial.println("Init IM920...");
-        im920.begin();
+        telemetry.begin();
     }
 
     if (USE_BARO)
@@ -191,7 +181,6 @@ void loop()
             if (sbus.isSafe())
             {
                 Thr.write(sbus.des[Ch::THR]);
-
             }
             else
             {
@@ -199,48 +188,30 @@ void loop()
             }
         }
 
-
         // 6) テレメトリ・デバッグ (10Hz)
         static int dbg_cnt = 0;
-        if (++dbg_cnt >= 100)
-        {
+        if (++dbg_cnt >= 100) {
             dbg_cnt = 0;
-            if (USE_BARO)
-                barometer.update();
-
+            if (USE_BARO) barometer.update();
             float fused_alt = (USE_BARO) ? barometer.get_smoothed_altitude() : 0.0f;
 
-            // 🌟 姿勢データを送る (is_telemetry_active が true の時だけ)
-            if (USE_IM920 && is_telemetry_active)
-            {
-                PlaneData att_packet;
-                att_packet.packet_type = 0; // 姿勢データとして送信
-                att_packet.data[0] = mpu.getAccX();
-                att_packet.data[1] = mpu.getAccY();
-                att_packet.data[2] = mpu.getAccZ();
-                att_packet.data[3] = Roll.ang;
-                att_packet.data[4] = Pitch.ang;
-                att_packet.data[5] = Yaw.ang;
-                att_packet.data[6] = fused_alt;
-                att_packet.data[7] = 0.0f; // unused
-                im920.write(att_packet);
+            // 姿勢データ送信 (28 bytes = float 7個、10Hz)
+            if (USE_IM920) {
+                telemetry.sendAttitude(
+                    mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
+                    Roll.ang, Pitch.ang, Yaw.ang, fused_alt
+                );
             }
 
-            Serial.print("\033[2J\033[H"); // ターミナルクリア
-            Serial.printf("### Triage: MPU=%s BARO=%s SBUS=%s IM920=%s SERVO=%s TEL=%s ###\n",
-                          USE_MPU ? "ON" : "OFF", USE_BARO ? "ON" : "OFF", USE_SBUS ? "ON" : "OFF", USE_IM920 ? "ON" : "OFF", USE_SERVO ? "ON" : "OFF", is_telemetry_active ? "ON" : "OFF");
-           
-                          Serial.printf("[TIME: %lu ms] PlaneData=%d GroundData=%d\n", millis(), (int)sizeof(PlaneData), (int)sizeof(GroundData));
+            Serial.print("\033[2J\033[H\n\n");
+            Serial.printf("### MPU=%s BARO=%s SBUS=%s IM920=%s SERVO=%s ###\n",
+                USE_MPU?"ON":"OFF", USE_BARO?"ON":"OFF", USE_SBUS?"ON":"OFF",
+                USE_IM920?"ON":"OFF", USE_SERVO?"ON":"OFF");
             print_flightmode(Mode.get_mode(), BANK_ANGLE, TURN_MS);
-            
-            if (USE_MPU)
-                print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
-            if (USE_SBUS)
-                print_sbus(sbus.des[Ch::ROLL], sbus.des[Ch::PITCH], sbus.des[Ch::THR], sbus.des[Ch::YAW], sbus.des[Ch::Aux1], sbus.des[Ch::Aux2], sbus.des[Ch::Aux3]);
-
-            if (USE_BARO)
-                Serial.printf("Alt: %+7.2f m\n", fused_alt);
-                
+            if (USE_MPU)  print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
+            if (USE_SBUS) print_sbus(sbus.des[Ch::ROLL], sbus.des[Ch::PITCH], sbus.des[Ch::THR],
+                                     sbus.des[Ch::YAW], sbus.des[Ch::Aux1], sbus.des[Ch::Aux2], sbus.des[Ch::Aux3]);
+            if (USE_BARO) Serial.printf("Alt: %+7.2f m\n", fused_alt);
             print_timing(T::Main_dt);
         }
     }
@@ -255,7 +226,7 @@ void updateSensorsAndComms()
     sbus.update();
     Mode.update(sbus.Ch_state(Ch::Aux2), sbus.Ch_state(Ch::Aux3));
 
-    Roll.update_value(sbus.des[Ch::ROLL], -mpu.getRoll(), mpu.getAccX(), mpu.getGyroX());
+    Roll.update_value(sbus.des[Ch::ROLL], -mpu.getRoll(), mpu.getAccX(), -mpu.getGyroX());
     Pitch.update_value(sbus.des[Ch::PITCH], -mpu.getPitch(), mpu.getAccY(), mpu.getGyroY());
     Yaw.update_value(sbus.des[Ch::YAW], mpu.getYaw(), mpu.getAccZ(), mpu.getGyroZ());
 
@@ -286,85 +257,8 @@ void updateSensorsAndComms()
     }
 
     // 地上局からパラメータ受信
-    if (im920.read(Ground_Data))
-    {
-
-        // リモートリセット
-        if (Ground_Data.reset_cmd == 1)
-        {
-            mpu.recalibrate();
-            barometer.reset();
-            Config::Timing::resetTiming();
-            Roll.pid_reset();
-            Pitch.pid_reset();
-            Yaw.pid_reset();
-            Serial.println("INFO: Remote Reset Complete.");
-            Ground_Data.reset_cmd = 0;
-        }
-
-        // BANK_ANGLE / TURN_MS 更新
-        if (Ground_Data.roll != 0.0f)
-            BANK_ANGLE = fabsf(Ground_Data.roll);
-        if (Ground_Data.pitch != 0.0f)
-            TURN_MS = (unsigned long)(Ground_Data.pitch * 1000.0f);
-
-        if (Ground_Data.param_sel == 10)
-        {
-            // テレメトリ停止 ＆ 現在のゲインを1回だけ送り返す
-            is_telemetry_active = false;
-            PlaneData gain_packet;
-            gain_packet.packet_type = 1; // ゲインデータとして送信
-            gain_packet.data[0] = Roll.c_rate.get_kp();
-            gain_packet.data[1] = Roll.c_rate.get_ki();
-            gain_packet.data[2] = Roll.c_rate.get_kd();
-            gain_packet.data[3] = Pitch.c_rate.get_kp();
-            gain_packet.data[4] = Pitch.c_rate.get_ki();
-            gain_packet.data[5] = Pitch.c_rate.get_kd();
-            gain_packet.data[6] = Roll.c_ang.get_kp();
-            gain_packet.data[7] = Pitch.c_ang.get_kp();
-            im920.write(gain_packet);
-            Serial.println("INFO: Sent current gains to Ground Station.");
-            Ground_Data.param_sel = 0;
-        }
-        else if (Ground_Data.param_sel == 11)
-        {
-            // テレメトリ再開
-            is_telemetry_active = true;
-            Serial.println("INFO: Telemetry Resumed.");
-            Ground_Data.param_sel = 0;
-        }
-        else if (Ground_Data.param_sel != 0)
-        {
-            float p = Ground_Data.p_adj;
-            float i = Ground_Data.i_adj;
-            float d = Ground_Data.d_adj;
-            switch (Ground_Data.param_sel)
-            {
-            case 1:
-                Roll.set_rate_gains(p, i, d);
-                Serial.printf("INFO: Roll  Rate  P=%.4f I=%.4f D=%.4f\n", p, i, d);
-                break;
-            case 2:
-                Pitch.set_rate_gains(p, i, d);
-                Serial.printf("INFO: Pitch Rate  P=%.4f I=%.4f D=%.4f\n", p, i, d);
-                break;
-            case 3:
-                Yaw.set_rate_gains(p, i, d);
-                Serial.printf("INFO: Yaw   Rate  P=%.4f I=%.4f D=%.4f\n", p, i, d);
-                break;
-            case 4:
-                Roll.set_angle_gains(p, i, d);
-                Serial.printf("INFO: Roll  Angle P=%.4f I=%.4f D=%.4f\n", p, i, d);
-                break;
-            case 5:
-                Pitch.set_angle_gains(p, i, d);
-                Serial.printf("INFO: Pitch Angle P=%.4f I=%.4f D=%.4f\n", p, i, d);
-                break;
-            default:
-                break;
-            }
-            Ground_Data.param_sel = 0; // 処理済みクリア
-        }
+    if (USE_IM920) {
+        telemetry.receiveAndProcess(Roll, Pitch, Yaw, mpu, barometer, BANK_ANGLE, TURN_MS);
     }
 }
 
@@ -453,12 +347,13 @@ void autonomousControl()
     else if (Roll.tar < -0.1f)
         Yaw.cmd = -RUDDER_COORD;
     else
-        Yaw.cmd = 0.0f;
+        Yaw.cmd = RUDDER_COORD;
 }
 
-void writeServos(){
+void writeServos() {
     Ele_von1.elevon(Roll.cmd, Pitch.sbus);
     Ele_von2.elevon(Roll.cmd, Pitch.sbus);
-    Ele.write(0.0);
+    Ele.write(Pitch.sbus);
     Rud.write(Yaw.sbus);
 }
+

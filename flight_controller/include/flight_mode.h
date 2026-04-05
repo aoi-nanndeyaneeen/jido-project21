@@ -23,6 +23,9 @@ public:
         else if (switch_Turn == up) {
             currentMode = MODE_LEVEL_TURN; // Aux2 が上なら水平旋回
         }
+        else if(switch_Fig8 == cen && switch_Turn == cen){
+            currentMode = MODE_SEMI_MANUAL; // どちらもセンターならセミマニュアル
+        }
         else {
             currentMode = MODE_MANUAL;     // どちらもオフならマニュアル
         }
@@ -36,5 +39,8 @@ public:
         }
     }
 
+    void set_mode(FlightMode mode){
+        currentMode = mode;
+    }
     FlightMode get_mode() {return currentMode;}
 };
