@@ -196,13 +196,8 @@ void loop()
             float fused_alt = (USE_BARO) ? barometer.get_smoothed_altitude() : 0.0f;
 
             // 姿勢データ送信 (28 bytes = float 7個、10Hz)
-            if (USE_IM920) {
-                telemetry.sendAttitude(
-                    mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
-                    Roll.ang, Pitch.ang, Yaw.ang, fused_alt
-                );
-            }
-
+            if (USE_IM920)  telemetry.sendAttitude(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),Roll.ang, Pitch.ang, Yaw.ang, fused_alt);
+            
             Serial.print("\033[2J\033[H\n\n");
             Serial.printf("### MPU=%s BARO=%s SBUS=%s IM920=%s SERVO=%s ###\n",
                 USE_MPU?"ON":"OFF", USE_BARO?"ON":"OFF", USE_SBUS?"ON":"OFF",
