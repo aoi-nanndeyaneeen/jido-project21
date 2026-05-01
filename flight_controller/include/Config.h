@@ -143,7 +143,3 @@ namespace Config {
         }
     }
 } // namespace Config
-//簡単な関数
-    int sign(float val) {  
-        return (val > 0) - (val < 0);   
-    }
