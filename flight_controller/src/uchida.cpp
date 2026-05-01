@@ -58,13 +58,14 @@ FlightTelemetry telemetry(&Serial3);
 
 Flight_mode Mode;
 
-RC_servo Ail1(1, 0.0, -1.0, 1.0), // 1番ピンに戻しました
-    Ail2(6, 0.0, -1.0, 1.0),
-    Ele(2, 0.5, -1.0, 1.0),
-    Rud(10, 0.0, -1.0, 1.0),  // 4番(EZ2)と被るので10番へ
-    Flp1(11, 0.0, -1.0, 1.0), // 8番(SBUS TX)と被るので11番へ
-    Flp2(9, 0.0, -1.0, 1.0);
-RC_motor Thr_r(3, 1.0), Thr_l(5, 1.0);
+RC_servo 
+        Spo1(12, 0.0, -1.0, 1.0), // 1番ピンに戻しました
+        Spo2(24, 0.0, -1.0, 1.0),
+        Ele(2, 0.5, -1.0, 1.0),
+        Rud(11, 0.0, -1.0, 1.0),  // 4番(EZ2)と被るので10番へ
+        Flp1(5, 0.0, -1.0, 1.0), // 8番(SBUS TX)と被るので11番へ
+        Flp2(10, 0.0, -1.0, 1.0);
+RC_motor Thr_r(8, 1.0), Thr_l(9, 1.0);
 
 // ============================================================
 //  プロトタイプ宣言
@@ -72,17 +73,17 @@ RC_motor Thr_r(3, 1.0), Thr_l(5, 1.0);
 void updateSensorsAndComms();
 void autonomousControl();
 void writeServos();
-void reset_all();
+
 // ============================================================
 //  setup
 // ============================================================
 // ============================================================
 //  § 組み合わせテスト用フラグ (ここを true/false で切り替えてください)
 // ============================================================
-bool USE_MPU = true;   // 加速度センサー (MPU6050)
-bool USE_BARO = true;  // 気圧センサー (BMP280)
+bool USE_MPU = false;   // 加速度センサー (MPU6050)
+bool USE_BARO = false;  // 気圧センサー (BMP280)
 bool USE_SBUS = true;  // 受信機 (SBUS)
-bool USE_IM920 = true; // 無線モジュール (IM920)
+bool USE_IM920 = false; // 無線モジュール (IM920)
 bool USE_SERVO = true; // サーボ・アンプ出力 (Servo/ESC)
 
 
@@ -110,8 +111,8 @@ void setup()
     if (USE_SERVO)
     {
         Serial.println("Init Actuators...");
-        Ail1.begin();
-        Ail2.begin();
+        Spo1.begin();
+        Spo2.begin();
         Ele.begin();
         Rud.begin();
         Flp1.begin();
@@ -222,6 +223,7 @@ void loop()
             }
 
             Serial.print("\033[2J\033[H");
+            
             Serial.printf("### MPU=%s BARO=%s SBUS=%s IM920=%s SERVO=%s ###\n",
                     USE_MPU?"ON":"OFF", USE_BARO?"ON":"OFF", USE_SBUS?"ON":"OFF",
                     USE_IM920?"ON":"OFF", USE_SERVO?"ON":"OFF");
@@ -248,8 +250,8 @@ void updateSensorsAndComms()
     Pitch.update_value(sbus.des[Ch::PITCH], -mpu.getPitch(), mpu.getAccY(), mpu.getGyroY());
     Yaw.update_value(sbus.des[Ch::YAW], mpu.getYaw(), mpu.getAccZ(), mpu.getGyroZ());
 
-   
-    switch (Update_SerialCommand())
+    char cmd = Update_SerialCommand();
+    switch (cmd)
     {
     case 'R':
         reset_all();
@@ -367,8 +369,6 @@ void reset_all()
 
 void writeServos()
 {
-    Ail1.write(Roll.cmd);
-    Ail2.write(Roll.cmd);
     Ele.write(Pitch.cmd);
     Rud.write(Yaw.cmd);
 }
