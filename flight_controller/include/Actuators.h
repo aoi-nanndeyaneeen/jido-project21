@@ -11,22 +11,16 @@ class RC_servo{
 
   float float_to_microsec(float in);
   float sbus_constrain(float input,float offset,float end1,float end2);
+
   public:
   // コンストラクタで設定を流し込む
     RC_servo(int pin,float offset, float end1, float end2,bool reverse = false, int minPWM = 1000, int maxPWM = 2000);
-    
-
     RC_servo(int pin,float offset, float end1, float end2,float endp1,float endp2,bool reverse = false,bool p_reverse = false, int minPWM = 1000, int maxPWM = 2000);
    
-
     void begin();
-
     void write(float input);
-
     void flap(Sw input);
     void flapelon(Sw input,float off_up,float off_cen,float off_down);
-
-
     void elevon(float R_input, float P_input);
 };
 
@@ -45,4 +39,22 @@ class RC_motor{
     void begin();
 
     void write(float input);
+};
+
+class mixer{
+  public:
+  class aileron{
+    public:
+    float mix(float offset,float end1,float end2,float input);
+  };
+  class elevator{
+    public:
+    float mix(float offset,float end1,float end2,float input);
+  };
+  class rudder{
+    public:
+    float mix(float offset,float end1,float end2,float input);
+  };
+
+  private:
 };
