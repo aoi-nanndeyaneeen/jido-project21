@@ -36,14 +36,14 @@ namespace T = Config::Timing;
 // kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle  
 //  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(0.003f, 0.0f, 0.0f, 80.0f, 0.0f, 0.0f,
+Axis_value Roll(-0.005f, 0.0f, 0.0f, 15.0f, 0.0f, 0.0f,
                 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
-            Pitch(-0.001f, 0.001f, 0.0f, 80.0f, 0.0f, 0.0f,
+            Pitch(0.003f, 0.0f, 0.0f, 8.0f, 0.0f, 0.0f,
                 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
             Yaw(-0.03f, 0.0f, 0.0f, -1.5f, 0.0f, 0.0f,
                 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
 
-float         BANK_ANGLE    = 1.0f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
+float         BANK_ANGLE    = 25.0f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
 unsigned long TURN_MS       = 4000UL; // 8 of 8 or a single trip time [ms]
 float         RUDDER_COORD  = 0.66;   // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
                 
@@ -58,8 +58,8 @@ Flight_mode Mode;
 
 RC_servo Ail1(1, 0.0, -1.0, 1.0), // 1番ピンに戻しました
     Ail2(6, 0.0, -1.0, 1.0),
-    Ele(2, 0.5, -1.0, 1.0),
-    Rud(10, 0.0, -1.0, 1.0),  // 4番(EZ2)と被るので10番へ
+    Ele(2, 0.5, -1.0, 1.0, false), // リバースをtrueに設定
+    Rud(10, 0.0, -1.0, 1.0, true), // リバースをtrueに設定
     Flp1(11, 0.0, -1.0, 1.0), // 8番(SBUS TX)と被るので11番へ
     Flp2(9, 0.0, -1.0, 1.0);
 RC_motor Thr_r(3, 1.0), Thr_l(5, 1.0);
@@ -293,7 +293,7 @@ void autonomousControl()
         // 角度＆レートPIDを計算してコマンドを出力
         Roll.update_RateAnglePID();
         Pitch.update_RateAnglePID();
-        Yaw.cmd = 0.0f; // 手持ちテスト中、ラダーは暴れないよう0固定
+        Yaw.cmd = Yaw.sbus; // 0固定ではなく、プロポのトリム位置（または受信機のフェイルセーフ位置）を維持
 
         return; // 通常のフライトモード判定をスキップしてここで終了
     }
@@ -306,11 +306,9 @@ void autonomousControl()
         Roll.tar = +BANK_ANGLE;
         break;
 
-    case MODE_FIGURE_8:
+    case MODE_LEVEL_FLIGHT:
     {
-        unsigned long elapsed = millis() - Mode.modeStartMs;
-        int phase = (int)(elapsed / TURN_MS) % 2;
-        Roll.tar = (phase == 0) ? +BANK_ANGLE : -BANK_ANGLE;
+        Roll.tar = 0.0f;
         break;
     }
 
@@ -341,7 +339,7 @@ void autonomousControl()
         {
             Roll.cmd = 0.0f;
             Pitch.cmd = 0.0f;
-            Yaw.cmd = 0.0f;
+            Yaw.cmd = Yaw.sbus; // トリム維持
         }
         return; // これもここで戻す
     }
@@ -359,11 +357,11 @@ void autonomousControl()
     // --- 協調ラダー: バンク方向にRUDDER_COORD量のラダーを打つ ---
     // Config.h の RUDDER_COORD で量を調整 (1.0=全開, 0.5=半分, 0=なし)
     if (Roll.tar > 0.1f)
-        Yaw.cmd = RUDDER_COORD;
+        Yaw.cmd = Yaw.sbus + RUDDER_COORD;
     else if (Roll.tar < -0.1f)
-        Yaw.cmd = -RUDDER_COORD;
+        Yaw.cmd = Yaw.sbus - RUDDER_COORD;
     else
-        Yaw.cmd = RUDDER_COORD;
+        Yaw.cmd = Yaw.sbus; // 0固定ではなく、プロポのトリム値をベースにする
 }
 
 void writeServos()

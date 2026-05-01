@@ -44,7 +44,7 @@ enum Ch {
 enum FlightMode : uint8_t {
     MODE_MANUAL      = 0,  // プロポ直接操作
     MODE_LEVEL_TURN  = 1,  // 自動水平旋回
-    MODE_FIGURE_8    = 2,  // 8の字飛行
+    MODE_LEVEL_FLIGHT= 2,  // 水平飛行
     MODE_SEMI_MANUAL = 3,  //4にするな範囲外アクセスになる
 };
 

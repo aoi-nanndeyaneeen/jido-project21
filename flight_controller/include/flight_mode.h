@@ -16,12 +16,12 @@ public:
         // ============================================================
         //  モード判定 (独立スイッチ版)
         // ============================================================
-        // 優先度: 8の字 > 水平旋回 > マニュアル(基本モード)
+        // 優先度: 水平飛行 > 水平旋回 > マニュアル(基本モード)
         if (switch_Fig8 == up) {
-            currentMode = MODE_FIGURE_8;   // Aux3 が上なら8の字
+            currentMode = MODE_LEVEL_FLIGHT; // Aux3 が上なら水平飛行
         }
         else if (switch_Turn == up) {
-            currentMode = MODE_LEVEL_TURN; // Aux2 が上なら水平旋回
+            currentMode = MODE_LEVEL_TURN;   // Aux2 が上なら水平旋回
         }
         else if(switch_Fig8 == cen && switch_Turn == cen){
             currentMode = MODE_SEMI_MANUAL; // どちらもセンターならセミマニュアル
