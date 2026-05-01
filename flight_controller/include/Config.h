@@ -111,7 +111,7 @@ namespace Config {
         constexpr int MAIN_Hz  = 1000;  // 制御ループ周期 [Hz] ← とっても大事！！！
         constexpr int DEBUG_Hz = 10;    // デバッグ出力周期 [Hz]
         constexpr unsigned long MAIN_PERIOD = 1000000UL / MAIN_Hz; // 周期 [us]
-        inline   unsigned long  Main_dt     = 1000000UL / MAIN_Hz; // センサ更新周期 [us]
+        inline    unsigned long Main_dt     = 1000000UL / MAIN_Hz; // センサ更新周期 [us]
 
         template <int Hz>
         bool freq(unsigned long &dt) {

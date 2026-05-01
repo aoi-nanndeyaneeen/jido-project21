@@ -104,3 +104,28 @@ void handlePIDTuning(Axis_value &roll, Axis_value &pitch, Axis_value &yaw) {
     Serial.println("INFO: Parameter Updated. Resuming Control...");
     Serial.setTimeout(old_timeout);
 }
+
+char Update_SerialCommand(){
+    // --- シリアルコマンド (PCモニタからのRキー等) ---
+    if (Serial.available())
+    {
+        char c = toupper(Serial.peek());
+        if (c == 'R')
+        {
+            Serial.read(); // 'R' を消費
+            return 'R'; // システム全体のリセットへ
+        }
+        else if (c == 'P')
+        {   
+           
+            Serial.read(); // 'P' を消費
+            return 'P'; // PIDチューニングモードへ
+        }
+        else
+        {
+            Serial.read(); // その他の文字は捨てる
+        }
+    }
+
+    return '\0';    
+}
