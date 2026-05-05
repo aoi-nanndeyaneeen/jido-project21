@@ -58,13 +58,9 @@ FlightTelemetry telemetry(&Serial3);
 
 Flight_mode Mode;
 
-RC_servo Ail1(1, 0.0, -1.0, 1.0), // 1番ピンに戻しました
-    Ail2(6, 0.0, -1.0, 1.0),
-    Ele(2, 0.5, -1.0, 1.0, false), // リバースをtrueに設定
-    Rud(10, 0.0, -1.0, 1.0, true), // リバースをtrueに設定
-    Flp1(11, 0.0, -1.0, 1.0), // 8番(SBUS TX)と被るので11番へ
-    Flp2(9, 0.0, -1.0, 1.0);
-RC_motor Thr_r(3, 1.0), Thr_l(5, 1.0);
+Norm_Servo Ail1, Ail2, Ele, Rud;
+Flap_Servo Flp1, Flp2;
+motor Thr_r, Thr_l;
 
 // ============================================================
 //  プロトタイプ宣言
@@ -88,7 +84,36 @@ bool USE_SERVO = true; // サーボ・アンプ出力 (Servo/ESC)
 
 
 void setup()
-{
+{   
+    //サーボの宣言
+    Ail1.set_pin(1)
+        .set_endpoints(-1.0, 1.0)
+        .begin();
+
+    Ail2.set_pin(6)
+        .set_endpoints(1.0, -1.0)  // リバース
+        .begin();
+
+    Ele.set_pin(2)
+        .set_offset(0.5)
+        .set_endpoints(-1.0, 1.0)
+        .begin();
+
+    Rud.set_pin(10)
+        .set_endpoints(1.0, -1.0)  // リバース
+        .begin();
+
+    Flp1.set_pin(11)
+        .set_endpoints(-1.0, 1.0)
+        .begin();
+
+    Flp2.set_pin(9)
+        .set_endpoints(-1.0, 1.0)
+        .begin();
+
+    Thr_r.set_pin(3).set_minPWM(600).set_maxPWM(2000).begin();
+    Thr_l.set_pin(5).set_minPWM(600).set_maxPWM(2000).begin();
+
     Serial.begin(115200);
     uint32_t start_ms = millis();
     while (!Serial && (millis() - start_ms < 2000))
@@ -202,8 +227,8 @@ void loop()
         // 5) フラップ (ONの場合のみ)
         if (USE_SERVO)
         {
-            Flp1.flap(sbus.Ch_state(Aux1));
-            Flp2.flap(sbus.Ch_state(Aux1));
+            Flp1.write(sbus.Ch_state(Aux1));
+            Flp2.write(sbus.Ch_state(Aux1));
         }
 
         // 6) テレメトリ・デバッグ (10Hz)

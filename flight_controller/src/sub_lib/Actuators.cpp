@@ -2,88 +2,41 @@
 #include "Config.h"
 #include <Arduino.h>
 #include <Servo.h>
-
-float RC_servo::float_to_microsec(float in) { return in * 500 + 1500; }
-
-float RC_servo::sbus_constrain(float input, float offset, float end1,
-                               float end2) {
-  if (input < 0) {
-    input = input * fabs(end1 - offset);
-  } else {
-    input = input * fabs(end2 - offset);
-  }
-  return input;
-}
-RC_servo::RC_servo(int pin, float offset, float end1, float end2,
-                   bool reverse, int minPWM, int maxPWM)
-    : _pin(pin), _offset(offset), _end1(end1), _end2(end2),
-      _inv(reverse ? -1 : 1), _minPWM(minPWM), _maxPWM(maxPWM) {}
-
-RC_servo::RC_servo::RC_servo(int pin, float offset, float end1, float end2,
-                             float endp1, float endp2, bool reverse,
-                             bool p_reverse, int minPWM,
-                             int maxPWM)
-    : _pin(pin), _offset(offset), _end1(end1), _end2(end2), _endp1(endp1),
-      _endp2(endp2), _inv(reverse ? -1 : 1), _invp(p_reverse ? -1 : 1),
-      _minPWM(minPWM), _maxPWM(maxPWM) {}
-
-void RC_servo::begin() {
-  _servo.attach(_pin, _minPWM, _maxPWM); // ここで先ほどの3引数attachを活用！
+float s_map(float input,float offset, float end1, float end2){
+    if(input>0) return offset + input * (end2 - offset);
+    else        return offset + input * (offset - end1);
 }
 
-void RC_servo::write(float input) {
-  input = sbus_constrain(input, _offset, _end1, _end2);
-
-  _des = float_to_microsec(input * _inv + _offset);
-
-  _servo.writeMicroseconds(int(_des));
+int s_float_to_microseconds(float input,int minPWM, int maxPWM){
+    float cenPWM = (minPWM + maxPWM) / 2;
+    return (int)(input * (maxPWM - cenPWM) + cenPWM);
 }
 
-void RC_servo::flap(Sw input) {
-  if (input == up)
-    write(1.0);
-  if (input == cen)
-    write(0.0);
-  if (input == down)
-    write(-1.0);
+void Norm_Servo::write(float input){
+    if(is_ready()) _servo.writeMicroseconds(s_float_to_microseconds(s_map(input, _off, _end_1, _end_2), _minPWM, _maxPWM));
 }
 
-void RC_servo::flapelon(Sw input, float off_up, float off_cen, float off_down) {
-  if (input == up)
-    write(1.0);
-  if (input == cen)
-    write(0.0);
-  if (input == down)
-    write(-1.0);
+void Elevon_Servo::write(float p_input,float r_input){
+        if(!is_ready()) return;
+        float mixed = p_input * p_ratio + r_input * r_ratio;
+        mixed = constrain(mixed, -1.0f, 1.0f);
+        _servo.writeMicroseconds(
+            s_float_to_microseconds(
+                s_map(mixed, _off, _end_1, _end_2),_minPWM, _maxPWM
+            )
+        );
 }
 
-void RC_servo::elevon(float R_input, float P_input) {
-  R_input = sbus_constrain(R_input, _offset, _end1, _end2);
-  P_input = sbus_constrain(P_input, _offset, _endp1, _endp2);
-
-  float output = constrain(R_input * _inv + P_input * _invp, -1.0, 1.0);
-  _des = float_to_microsec(output + _offset);
-
-  _servo.writeMicroseconds(int(_des));
+void Flap_Servo::write(Sw input){
+    if(!is_ready()) return;
+    float val = (input == up) ? 1.0f : (input == cen) ? 0.0f : -1.0f; // upで1.0、cenで0.0、downで-1.0
+    _servo.writeMicroseconds(
+        s_float_to_microseconds(
+            s_map(val, _off, _end_1, _end_2),_minPWM, _maxPWM
+        )
+    );
 }
 
-float RC_motor::float_to_microsec(float in) { return in * 1000 + 1000; }
-
-// コンストラクタで設定を流し込む
-RC_motor::RC_motor(int pin, float end2, int minPWM,
-                   int maxPWM)
-    : _pin(pin), _minPWM(minPWM), _maxPWM(maxPWM), _end2(end2) {
-} // リミットend2(end2_)
-
-void RC_motor::begin() {
-  _servo.attach(_pin, _minPWM, _maxPWM); // ここで先ほどの3引数attachを活用！
-}
-
-void RC_motor::write(float input) {
-
-  input = input * fabs(_end2);
-
-  _des = float_to_microsec(input);
-
-  _servo.writeMicroseconds(int(_des));
+void motor::write(float input){
+    if(is_ready()) _servo.writeMicroseconds(input*(_maxPWM - _minPWM) + _minPWM);
 }
