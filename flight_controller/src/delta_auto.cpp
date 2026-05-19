@@ -38,9 +38,9 @@ namespace T = Config::Timing;
 // kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle  
 //  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(-0.005f, 0.0f, 0.0f, 15.0f, 0.0f, 0.0f,
+Axis_value Roll(-0.01f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
                 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
-            Pitch(0.003f, 0.0f, 0.0f, 8.0f, 0.0f, 0.0f,
+            Pitch(-0.01f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
                 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
             Yaw(-0.03f, 0.0f, 0.0f, -1.5f, 0.0f, 0.0f,
                 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
@@ -88,12 +88,13 @@ void setup()
     //サーボの宣言
     Elev1.set_pin(1)
         .set_endpoints(-1.0, 1.0)
+        .set_offset(0.2)
         .set_ratio(0.5,0.5)
         .begin();
 
     Elev2.set_pin(6)
         .set_endpoints(1.0, -1.0)  // リバース
-        .set_ratio(0.5,0.5)
+        .set_ratio(0.5,-0.5)
         .begin();
 
     Ele.set_pin(2)
@@ -102,11 +103,11 @@ void setup()
         .begin();
 
     Rud.set_pin(10)
-        .set_endpoints(1.0, -1.0)  // リバース
+        .set_endpoints(-1.0, 1.0)  // リバース
         .begin();
 
-    Thr_r.set_pin(3).set_minPWM(600).set_maxPWM(2000).begin();
-    Thr_l.set_pin(5).set_minPWM(600).set_maxPWM(2000).begin();
+    Thr_r.set_pin(3).set_minPWM(1000).set_maxPWM(2000).begin();
+    Thr_l.set_pin(5).set_minPWM(1000).set_maxPWM(2000).begin();
 
     Serial.begin(115200);
     uint32_t start_ms = millis();
