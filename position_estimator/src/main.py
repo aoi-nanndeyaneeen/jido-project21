@@ -30,7 +30,7 @@ plot_data = {
 # ─────────────────────────────────────────────────────────────
 #  キャリブレーション関数
 # ─────────────────────────────────────────────────────────────
-
+# camera1用
 def run_calibration_single(cam: CameraTracker, cam_label: str):
     """
     指定されたカメラに対してキャリブレーションを実施する。
@@ -96,6 +96,76 @@ def run_calibration_single(cam: CameraTracker, cam_label: str):
 
     return K, R, tvec
 
+#camera2用
+def run_calibration_remote(remote_cam: RemoteCamera, cam_label: str):
+    """
+    RemoteCameraのプレビューストリームを表示しながらキャリブレーション。
+    フレームはRPi側でスケールダウンされているので、
+    クリック座標をフル解像度にスケールバックして使う。
+    """
+    points_2d = []
+    window_name = f"Calibration: {cam_label}"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    # スケール比（プレビューはSEND_PREVIEW_SCALEで縮小済み）
+    PREVIEW_SCALE = 0.5  # camera_server.pyのPREVIEW_SCALEと合わせる
+
+    def on_click(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(points_2d) < 5:
+            # プレビュー座標 → フル解像度座標に変換
+            full_x = x / PREVIEW_SCALE
+            full_y = y / PREVIEW_SCALE
+            points_2d.append([full_x, full_y])
+            print(f"  [{cam_label}] 点{len(points_2d)}/5: "
+                  f"preview({x},{y}) → full({full_x:.0f},{full_y:.0f})")
+
+    cv2.setMouseCallback(window_name, on_click)
+    print(f"\n  【{cam_label}】 基準点5箇所をクリックしてください")
+    print(f"       順序: 左下→右下→右上→左上→左上の2m上")
+
+    while True:
+        frame, _ = remote_cam.read_and_track()
+        if frame is None:
+            continue
+
+        disp = frame.copy()
+        for i, p in enumerate(points_2d):
+            # フル解像度座標をプレビュースケールに変換して描画
+            px = int(p[0] * PREVIEW_SCALE)
+            py = int(p[1] * PREVIEW_SCALE)
+            cv2.circle(disp, (px, py), 6, (0, 0, 255), -1)
+            cv2.putText(disp, str(i+1), (px+10, py-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+
+        remaining = 5 - len(points_2d)
+        status = f"残り{remaining}点 | Enter確定" if remaining > 0 else "Enter を押して確定"
+        cv2.putText(disp, status, (10, disp.shape[0]-20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+        cv2.imshow(window_name, disp)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == 13 and len(points_2d) == 5:
+            break
+        elif key == ord('q'):
+            raise RuntimeError(f"[{cam_label}] キャリブレーションキャンセル")
+
+    K = remote_cam.get_approx_camera_matrix()
+    pts2d = np.array(points_2d, dtype=np.float32)
+    ret_pnp, rvec, tvec = cv2.solvePnP(
+        FIELD_POINTS, pts2d, K, None, flags=cv2.SOLVEPNP_EPNP)
+    if not ret_pnp:
+        raise RuntimeError(f"[{cam_label}] solvePnP失敗")
+
+    R, _ = cv2.Rodrigues(rvec)
+    cam_pos = -R.T.dot(tvec)
+    print(f"  [{cam_label}] キャリブ完了 "
+          f"X={cam_pos[0,0]:.2f} Y={cam_pos[1,0]:.2f} Z={cam_pos[2,0]:.2f}m")
+    cv2.destroyWindow(window_name)
+    return K, R, tvec
+
+
+
+
 
 # ─────────────────────────────────────────────────────────────
 #  メイン
@@ -160,7 +230,7 @@ def main():
         K1, R1, tvec1 = run_calibration_single(cam1, "Camera1")
 
         print("\n  ─── Camera2 キャリブレーション ───")
-        K2, R2, tvec2 = run_calibration_single(cam2, "Camera2")
+        K2, R2, tvec2 = run_calibration_remote(cam2, "Camera2")
     except RuntimeError as e:
         print(f"\n  [ERROR] {e}")
         cam1.release(); cam2.release()

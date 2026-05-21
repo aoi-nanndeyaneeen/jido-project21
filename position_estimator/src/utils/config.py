@@ -24,8 +24,9 @@ LOG_DIR  = ROOT_DIR / "logs"
 #   CAMERA_1_URL = 0
 #   CAMERA_2_URL = 1
 #
-CAMERA_1_URL = "http://192.168.1.100:8080/?action=stream"   # カメラ1 (ラズパイ接続)
-CAMERA_2_URL = "http://192.168.1.100:8081/?action=stream"   # カメラ2 (ラズパイ接続)
+CAMERA_1_URL = 0                    # ラップトップUSBカメラ
+RPI_HOST     = "192.168.11.13"      # ラズパイIP
+RPI_PORT     = 5555  # カメラ2 (ラズパイ接続)
 
 CAMERA_W = 1280   # 要求解像度 (幅)
 CAMERA_H =  720   # 要求解像度 (高さ)

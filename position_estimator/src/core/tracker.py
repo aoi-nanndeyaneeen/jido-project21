@@ -54,9 +54,14 @@ def camera_thread_func(cam1, cam2,
             frame1, uv1 = cam1.read_and_track()
             frame2, uv2 = cam2.read_and_track()
 
-            if frame1 is None or frame2 is None:
-                print("[Tracker] カメラからフレームを取得できませんでした。")
+            # 変更後（frame2はNoneでもOK）
+            if frame1 is None:
+                print("[Tracker] Camera1からフレームを取得できませんでした。")
                 break
+
+            # Camera2ウィンドウはフレームがある時だけ表示
+            if frame2 is not None:
+                cv2.imshow("Camera 2", frame2)
 
             # ── 3D位置推定 ──────────────────────────────────────────────
             P_vec    = None
