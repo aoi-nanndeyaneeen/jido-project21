@@ -3,14 +3,19 @@ import numpy as np
 import threading
 import datetime
 import time
+import msvcrt
 
-from utils.config import (CAMERA_1_URL, CAMERA_2_URL, CAMERA_W, CAMERA_H,
+from utils.config import (CAMERA_1_URL, 
+                          RPI_HOST, RPI_PORT, 
+                          CAMERA_W, CAMERA_H,
                           SERIAL_ENABLED, SERIAL_PORT, SERIAL_BAUD,
-                          FIELD_POINTS, LOG_DIR)
+                          FIELD_POINTS, LOG_DIR,
+                          DISP_W, DISP_H)
 from core.camera import CameraTracker
 from core.tracker import camera_thread_func
 from ui.dashboard import Dashboard
 from core.controller import AltitudeController
+from core.remote_camera import RemoteCamera
 
 # ── オプション: シリアル通信 ─────────────────────────────
 if SERIAL_ENABLED:
@@ -42,6 +47,7 @@ def run_calibration_single(cam: CameraTracker, cam_label: str):
     points_2d = []
     window_name = f"Calibration: {cam_label}"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, DISP_W, DISP_H)
 
     def on_click(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN and len(points_2d) < 5:
@@ -66,8 +72,8 @@ def run_calibration_single(cam: CameraTracker, cam_label: str):
             cv2.putText(disp, str(i + 1), (p[0] + 12, p[1] - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
 
-        remaining = 5 - len(points_2d)
-        status = f"残り {remaining} 点 | Enter で確定" if remaining > 0 else "Enter を押して確定"
+        remaining = 5 - len(points_2d)   
+        status = f"Click {remaining} more pts | Enter to confirm" if remaining > 0 else "Press Enter to confirm"
         cv2.putText(disp, status, (10, disp.shape[0] - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
         cv2.imshow(window_name, disp)
@@ -106,6 +112,7 @@ def run_calibration_remote(remote_cam: RemoteCamera, cam_label: str):
     points_2d = []
     window_name = f"Calibration: {cam_label}"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, DISP_W, DISP_H)
 
     # スケール比（プレビューはSEND_PREVIEW_SCALEで縮小済み）
     PREVIEW_SCALE = 0.5  # camera_server.pyのPREVIEW_SCALEと合わせる
@@ -138,7 +145,7 @@ def run_calibration_remote(remote_cam: RemoteCamera, cam_label: str):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
 
         remaining = 5 - len(points_2d)
-        status = f"残り{remaining}点 | Enter確定" if remaining > 0 else "Enter を押して確定"
+        status = f"Click {remaining} more pts | Enter to confirm" if remaining > 0 else "Press Enter to confirm"
         cv2.putText(disp, status, (10, disp.shape[0]-20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
         cv2.imshow(window_name, disp)
@@ -181,18 +188,22 @@ def main():
     # ── [1/4] カメラ初期化 ────────────────────────────────────
     print("\n[INIT 1/4]  カメラ起動中...")
     cam1 = CameraTracker(CAMERA_1_URL, width=CAMERA_W, height=CAMERA_H, label="Camera1")
-    cam2 = CameraTracker(CAMERA_2_URL, width=CAMERA_W, height=CAMERA_H, label="Camera2")
+    cam2 = RemoteCamera(RPI_HOST, RPI_PORT)
+    cam2.connect()
 
     # 接続チェック
-    for cam, name in [(cam1, "Camera1"), (cam2, "Camera2")]:
-        ret, test_frame = cam.cap.read()
-        if not ret or test_frame is None:
-            print(f"  [ERROR] {name} の映像取得に失敗しました。URLまたは接続を確認してください。")
-            print(f"          URL: {cam.camera_url}")
-            cam1.release(); cam2.release()
-            return
-        h, w = test_frame.shape[:2]
-        print(f"  [OK]    {name}  解像度: {w} x {h}")
+    # Camera1
+    ret, test_frame = cam1.cap.read()
+    if not ret or test_frame is None:
+        print("Camera1 接続失敗")
+        return
+
+    # Camera2
+    test_frame, _ = cam2.read_and_track()
+    if test_frame is None:
+        print("Camera2 接続失敗")
+        return
+
     time.sleep(0.2)
 
     # ── [2/4] シリアル通信 (オプション) ──────────────────────
@@ -251,6 +262,30 @@ def main():
         "quit":        False,
     }
 
+    # ── カメラウィンドウをメインスレッドで作成 ────────────────
+    cv2.namedWindow("Camera 1", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Camera 1", DISP_W, DISP_H)
+    cv2.moveWindow("Camera 1", 0, 0)
+
+    cv2.namedWindow("Camera 2", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Camera 2", DISP_W, DISP_H)
+    cv2.moveWindow("Camera 2", DISP_W + 10, 0)   # 横に並べる
+
+    # ── ターミナルフォーカス時のキー入力スレッド ─────────────
+    def keyboard_thread():
+        while not shared.get("quit", False):
+            if msvcrt.kbhit():
+                key = msvcrt.getch().lower()
+                if key == b'q':
+                    print("[KEY] Q → 終了")
+                    shared["quit"] = True
+                elif key == b'b':
+                    print("[KEY] B → 背景リセット")
+                    shared["do_bg_reset"] = True
+            time.sleep(0.05)
+
+    threading.Thread(target=keyboard_thread, daemon=True).start()
+
     # ── カメラスレッド起動 ─────────────────────────────────────
     cam_thread = threading.Thread(
         target=camera_thread_func,
@@ -258,7 +293,7 @@ def main():
               K1, R1, tvec1,
               K2, R2, tvec2,
               log_path, shared, plot_lock, plot_data),
-        daemon=True)
+        daemon=True)    
     cam_thread.start()
 
     # ── ダッシュボード準備 ────────────────────────────────────
@@ -276,17 +311,29 @@ def main():
             if updated:
                 plot_data["updated"] = False
 
-        if updated and O1 is not None:
-            # ダッシュボード描画 (roll/pitch は 0.0 固定 — IMU レス)
-            target_alt = controller.get_target()
-            dashboard.render_and_show(P, O1, 0.0, 0.0, current_z, target_alt)
+        if updated:
+            # フレーム表示（両カメラ）
+            with plot_lock:
+                f1 = plot_data.get("frame1")
+                f2 = plot_data.get("frame2")
 
-            # シリアル送信 (有効な場合のみ)
-            if alt_sensor is not None and P is not None:
-                pitch_cmd = controller.calc_pitch_command(current_z)
-                alt_sensor.send_target_altitude(pitch_cmd)
+            if f1 is not None:
+                disp1 = cv2.resize(f1, (DISP_W, DISP_H))
+                cv2.imshow("Camera 1", disp1)
 
-        # ── キー入力 ─────────────────────────────────────────
+            if f2 is not None:
+                disp2 = cv2.resize(f2, (DISP_W, DISP_H))
+                cv2.imshow("Camera 2", disp2)
+
+            if O1 is not None:
+                target_alt = controller.get_target()
+                dashboard.render_and_show(P, O1, 0.0, 0.0, current_z, target_alt)
+
+                if alt_sensor is not None and P is not None:
+                    pitch_cmd = controller.calc_pitch_command(current_z)
+                    alt_sensor.send_target_altitude(pitch_cmd)
+
+        # waitKeyはメインスレッドで（既存のキー処理と統合）
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             shared["quit"] = True
