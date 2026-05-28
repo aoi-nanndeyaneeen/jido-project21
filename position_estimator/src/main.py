@@ -10,12 +10,15 @@ from utils.config import (CAMERA_1_URL,
                           CAMERA_W, CAMERA_H,
                           SERIAL_ENABLED, SERIAL_PORT, SERIAL_BAUD,
                           FIELD_POINTS, LOG_DIR,
-                          DISP_W, DISP_H)
+                          DISP_W, DISP_H,
+                          VELOCITY_W,VELOCITY_H)
 from core.camera import CameraTracker
 from core.tracker import camera_thread_func
 from ui.dashboard import Dashboard
 from core.controller import AltitudeController
 from core.remote_camera import RemoteCamera
+from ui.view_velocity import ViewVelocity                  
+from core.geometry import accel_to_angles                  
 
 # ── オプション: シリアル通信 ─────────────────────────────
 if SERIAL_ENABLED:
@@ -188,42 +191,72 @@ def main():
     # ── [1/4] カメラ初期化 ────────────────────────────────────
     print("\n[INIT 1/4]  カメラ起動中...")
     cam1 = CameraTracker(CAMERA_1_URL, width=CAMERA_W, height=CAMERA_H, label="Camera1")
-    cam2 = RemoteCamera(RPI_HOST, RPI_PORT)
-    cam2.connect()
+    cam2 = None
 
-    # 接続チェック
-    # Camera1
+    # Camera1 接続チェック
     ret, test_frame = cam1.cap.read()
     if not ret or test_frame is None:
-        print("Camera1 接続失敗")
-        return
+        print("  [WARN] Camera1 映像取得失敗。ダミーモードで続行します。")
 
-    # Camera2
-    test_frame, _ = cam2.read_and_track()
-    if test_frame is None:
-        print("Camera2 接続失敗")
-        return
+    # Camera2 接続チェック（失敗してもスキップ）
+    try:
+        cam2 = RemoteCamera(RPI_HOST, RPI_PORT)
+        cam2.connect()
+        test_frame2, _ = cam2.read_and_track()
+        if test_frame2 is None:
+            print("  [WARN] Camera2 フレーム取得失敗。ダミーモードで続行します。")
+    except Exception as e:
+        print(f"  [WARN] Camera2 接続失敗: {e}")
+        print("         ダミーモードで続行します。")
+        cam2 = None
+
+    # Camera2がNoneの場合はダミー用スタブを作成
+    if cam2 is None:
+        from core.remote_camera import RemoteCamera as _RC
+        class _DummyCam2:
+            width, height = 1280, 720
+            def read_and_track(self): return None, None
+            def reset_background(self): pass
+            def release(self): pass
+            def get_approx_camera_matrix(self):
+                import numpy as np
+                f = self.width
+                return np.array([[f,0,self.width/2],[0,f,self.height/2],[0,0,1]],
+                                dtype=np.float32)
+        cam2 = _DummyCam2()
+        print("  [INFO] Camera2 スタブを使用します。")
 
     time.sleep(0.2)
 
-    # ── [2/4] シリアル通信 (オプション) ──────────────────────
+
+    # ── [2/4] シリアル通信（自動検出・失敗時はスキップ） ─────────
     alt_sensor = None
+    print(f"\n[INIT 2/4]  センサ接続試行中...  ({SERIAL_PORT} @ {SERIAL_BAUD}bps)")
+
     if SERIAL_ENABLED:
-        print(f"\n[INIT 2/4]  センサ受信モジュール起動中...  ({SERIAL_PORT} @ {SERIAL_BAUD}bps)")
+        from core.communication import SerialReceiver
         alt_sensor = SerialReceiver(port=SERIAL_PORT, baudrate=SERIAL_BAUD)
-        print("  [WAIT]   データ受信待ち...", end="", flush=True)
-        for _ in range(20):
-            time.sleep(0.1)
-            alt = alt_sensor.get_altitude()
-            acc = alt_sensor.get_accel()
-            if acc != (0.0, 0.0, 0.0) or alt != 0.0:
-                print(" [OK]")
-                break
-            print(".", end="", flush=True)
+
+        if not alt_sensor.is_running:
+            # ポートが開けなかった（デバイス未接続など）
+            print("  [SKIP] ポートを開けませんでした。センサなしで続行します。")
+            alt_sensor = None
         else:
-            print(" [TIMEOUT]  センサデータ未受信（スキップして続行）")
+            # データが来るまで最大2秒待つ
+            print("  [WAIT] データ受信待ち...", end="", flush=True)
+            for _ in range(20):
+                time.sleep(0.1)
+                if (alt_sensor.get_accel() != (0.0, 0.0, 0.0)
+                        or alt_sensor.get_altitude() != 0.0):
+                    print(" [OK]")
+                    break
+                print(".", end="", flush=True)
+            else:
+                print(" [TIMEOUT] データ未受信。センサなしで続行します。")
+                alt_sensor.stop()
+                alt_sensor = None
     else:
-        print("\n[INIT 2/4]  シリアル通信: 無効 (config.py で SERIAL_ENABLED=True にすると有効)")
+        print("  [SKIP] SERIAL_ENABLED=False のためスキップ")
 
     # ── [3/4] ログファイル準備 ────────────────────────────────
     print("\n[INIT 3/4]  ログファイル準備中...")
@@ -232,16 +265,37 @@ def main():
     print(f"  [OK]    ログ保存先: {log_path}")
     time.sleep(0.2)
 
-    # ── [4/4] 2カメラキャリブレーション ──────────────────────
+    # ── [4/4] キャリブレーション ──────────────────────────────
     print("\n[INIT 4/4]  フィールドキャリブレーション")
-    print("           ★ Camera1 と Camera2 の順に各5点をクリックします")
+
+    def dummy_calib(label, cam_pos_xyz):
+        """ダミーカメラ行列（位置だけ指定した簡易キャリブ）"""
+        import numpy as np
+        K = np.array([[1280, 0, 640],[0, 1280, 360],[0, 0, 1]],
+                     dtype=np.float32)
+        # カメラ位置からtvec/Rを逆算
+        cam_pos = np.array(cam_pos_xyz, dtype=np.float64).reshape(3,1)
+        R = np.eye(3, dtype=np.float64)
+        tvec = -R @ cam_pos
+        print(f"  [DUMMY] {label} ダミーキャリブ使用 pos={cam_pos_xyz}")
+        return K, R, tvec
+
+    cam1_ok = cam1.cap.isOpened() and cam1.width > 0
+    cam2_ok = hasattr(cam2, 'sock')   # RemoteCameraはsockを持つ
 
     try:
-        print("\n  ─── Camera1 キャリブレーション ───")
-        K1, R1, tvec1 = run_calibration_single(cam1, "Camera1")
+        if cam1_ok:
+            print("\n  ─── Camera1 キャリブレーション ───")
+            K1, R1, tvec1 = run_calibration_single(cam1, "Camera1")
+        else:
+            K1, R1, tvec1 = dummy_calib("Camera1", [-8, -8, 2])
 
-        print("\n  ─── Camera2 キャリブレーション ───")
-        K2, R2, tvec2 = run_calibration_remote(cam2, "Camera2")
+        if cam2_ok:
+            print("\n  ─── Camera2 キャリブレーション ───")
+            K2, R2, tvec2 = run_calibration_remote(cam2, "Camera2")
+        else:
+            K2, R2, tvec2 = dummy_calib("Camera2", [8, -8, 2])
+
     except RuntimeError as e:
         print(f"\n  [ERROR] {e}")
         cam1.release(); cam2.release()
@@ -300,40 +354,54 @@ def main():
     dashboard = Dashboard(FIELD_POINTS)
     controller = AltitudeController(p_gain=5.0)
 
+    velocity_view = ViewVelocity(FIELD_POINTS)
+
+    cv2.namedWindow("Velocity", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Velocity", VELOCITY_W, VELOCITY_H)
+    cv2.moveWindow("Velocity", 0, DISP_H + 40)
+
     # ── メインループ ──────────────────────────────────────────
+    last_mpl_render = 0.0
+    MPL_RENDER_HZ   = 5          # matplotlibは最大5fps
+
     while not shared.get("quit", False):
         with plot_lock:
             updated   = plot_data["updated"]
             P         = plot_data["P"]
             O1        = plot_data["O1"]
             current_z = plot_data["current_z"]
-            residual  = plot_data["residual"]
             if updated:
                 plot_data["updated"] = False
 
         if updated:
-            # フレーム表示（両カメラ）
+            # カメラ映像はフルレートで表示
             with plot_lock:
                 f1 = plot_data.get("frame1")
                 f2 = plot_data.get("frame2")
-
             if f1 is not None:
-                disp1 = cv2.resize(f1, (DISP_W, DISP_H))
-                cv2.imshow("Camera 1", disp1)
-
+                cv2.imshow("Camera 1", cv2.resize(f1, (DISP_W, DISP_H)))
             if f2 is not None:
-                disp2 = cv2.resize(f2, (DISP_W, DISP_H))
-                cv2.imshow("Camera 2", disp2)
+                cv2.imshow("Camera 2", cv2.resize(f2, (DISP_W, DISP_H)))
 
-            if O1 is not None:
-                target_alt = controller.get_target()
-                dashboard.render_and_show(P, O1, 0.0, 0.0, current_z, target_alt)
+            # matplotlibビューはレートを制限
+            now = time.time()
+            if now - last_mpl_render > 1.0 / MPL_RENDER_HZ:
+                last_mpl_render = now
 
-                if alt_sensor is not None and P is not None:
-                    pitch_cmd = controller.calc_pitch_command(current_z)
-                    alt_sensor.send_target_altitude(pitch_cmd)
+                roll_deg, pitch_deg = 0.0, 0.0
+                if alt_sensor is not None:
+                    roll_deg, pitch_deg = accel_to_angles(alt_sensor.get_accel())
 
-        # waitKeyはメインスレッドで（既存のキー処理と統合）
+                vel_img = velocity_view.get_image(P, roll_deg, pitch_deg)
+                cv2.imshow("Velocity", vel_img)
+
+                if O1 is not None:
+                    target_alt = controller.get_target()
+                    dashboard.render_and_show(P, O1, 0.0, 0.0, current_z, target_alt)
+                    if alt_sensor is not None and P is not None:
+                        pitch_cmd = controller.calc_pitch_command(current_z)
+                        alt_sensor.send_target_altitude(pitch_cmd)
+
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             shared["quit"] = True
@@ -353,6 +421,7 @@ def main():
     if alt_sensor is not None:
         alt_sensor.stop()
     dashboard.close()
+    velocity_view.close()
     cv2.destroyAllWindows()
     for _ in range(10):
         cv2.waitKey(1)

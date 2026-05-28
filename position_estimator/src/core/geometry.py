@@ -2,7 +2,6 @@
 
 import cv2
 import numpy as np
-from utils.config import VALID_X, VALID_Y, VALID_Z
 
 
 def get_ray(u, v, K, R, tvec):
@@ -76,10 +75,3 @@ def calc_tilt(accel, ref_roll, ref_pitch):
     """加速度からキャリブ基準を引いた相対 roll/pitch を返す"""
     roll, pitch = accel_to_angles(accel)
     return roll - ref_roll, pitch - ref_pitch
-
-
-def is_valid_position(P):
-    """座標がフィールド有効範囲内かチェック"""
-    return (VALID_X[0] <= P[0] <= VALID_X[1] and
-            VALID_Y[0] <= P[1] <= VALID_Y[1] and
-            VALID_Z[0] <= P[2] <= VALID_Z[1])
