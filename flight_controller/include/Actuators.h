@@ -59,6 +59,7 @@ class Actuator {
     void begin() {
         if(_pin==-1) return;
         _servo.attach(_pin, _minPWM, _maxPWM);
+        _servo.writeMicroseconds(1000);
         _built = true;
     }
     bool is_ready() { return _built; }
