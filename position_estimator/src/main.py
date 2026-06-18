@@ -18,7 +18,10 @@ from ui.dashboard import Dashboard
 from core.controller import AltitudeController
 from core.remote_camera import RemoteCamera
 from ui.view_velocity import ViewVelocity                  
-from core.geometry import accel_to_angles                  
+from core.geometry import accel_to_angles          
+from collections import deque
+from core.autopilot import SquarePatrol, RCCommand
+from ui.view_rc     import ViewRC     
 
 # ── オプション: シリアル通信 ─────────────────────────────
 if SERIAL_ENABLED:
@@ -353,8 +356,20 @@ def main():
     # ── ダッシュボード準備 ────────────────────────────────────
     dashboard = Dashboard(FIELD_POINTS)
     controller = AltitudeController(p_gain=5.0)
-
     velocity_view = ViewVelocity(FIELD_POINTS)
+    patrol   = SquarePatrol(start_x=0.0, start_y=0.0)
+    view_rc  = ViewRC()
+
+    cv2.namedWindow("RC Command", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("RC Command", ViewRC.W, ViewRC.H)
+    cv2.moveWindow("RC Command", VELOCITY_W + 640, DISP_H + 40)
+    # 初期表示（灰色ではなく黒で起動）
+    cv2.imshow("RC Command", np.zeros((ViewRC.H, ViewRC.W, 3), dtype=np.uint8))
+
+    # 速度推定用の位置履歴（main.py内で簡易計算）
+    _pos_hist  = deque(maxlen=6)   # (time, np.array)
+    _last_cmd  = RCCommand()       # 最後のコマンド（未検出時に保持）
+    _ap_time   = time.time()       # オートパイロット前回呼出し時刻
 
     cv2.namedWindow("Velocity", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Velocity", VELOCITY_W, VELOCITY_H)
@@ -395,6 +410,33 @@ def main():
                 vel_img = velocity_view.get_image(P, roll_deg, pitch_deg)
                 cv2.imshow("Velocity", vel_img)
 
+                # ── オートパイロット計算 ──────────────────────────────
+                now_ap = time.time()
+                dt_ap  = now_ap - _ap_time
+                _ap_time = now_ap
+
+                if P is not None:
+                    _pos_hist.append((now_ap, P.copy()))
+
+                # 速度推定（posHistから有限差分）
+                vel_ap = np.zeros(3)
+                if len(_pos_hist) >= 2:
+                    t0, p0 = _pos_hist[0]
+                    t1, p1 = _pos_hist[-1]
+                    dt_v = t1 - t0
+                    if dt_v > 1e-4:
+                        vel_ap = (p1 - p0) / dt_v
+
+                if P is not None and dt_ap > 0:
+                    _last_cmd = patrol.update(
+                        pos=P,
+                        vel=vel_ap,
+                        dt=dt_ap
+                    )
+
+                rc_img = view_rc.get_image(_last_cmd)
+                cv2.imshow("RC Command", rc_img)
+
                 if O1 is not None:
                     target_alt = controller.get_target()
                     dashboard.render_and_show(P, O1, 0.0, 0.0, current_z, target_alt)
@@ -420,6 +462,7 @@ def main():
     # ── 終了処理 ──────────────────────────────────────────────
     if alt_sensor is not None:
         alt_sensor.stop()
+    view_rc.close() if hasattr(view_rc, 'close') else None
     dashboard.close()
     velocity_view.close()
     cv2.destroyAllWindows()
