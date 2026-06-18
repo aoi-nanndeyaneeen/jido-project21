@@ -31,7 +31,26 @@ def detect_plane(prev_gray, curr_gray):
     return (M["m10"] / M["m00"], M["m01"] / M["m00"])
 
 
-def serve_client(conn, cap, w, h):
+def init_local_display():
+    """ローカルディスプレイへのフルスクリーン表示を初期化。
+    ディスプレイが使えない場合は False を返す。"""
+    try:
+        cv2.namedWindow("RPi Camera", cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty("RPi Camera",
+                              cv2.WND_PROP_FULLSCREEN,
+                              cv2.WINDOW_FULLSCREEN)
+        # テスト描画で表示可能か確認
+        test = np.zeros((100, 100, 3), dtype=np.uint8)
+        cv2.imshow("RPi Camera", test)
+        cv2.waitKey(1)
+        print("[RPi] ローカルディスプレイ: 有効")
+        return True
+    except Exception as e:
+        print(f"[RPi] ローカルディスプレイ: 無効 ({e})")
+        return False
+
+
+def serve_client(conn, cap, w, h, use_display):
     """1クライアントへの送信ループ。切断されたらreturnする。"""
     ret, frame = cap.read()
     if not ret:
@@ -48,14 +67,38 @@ def serve_client(conn, cap, w, h):
         pt = detect_plane(prev_gray, curr_gray)
         prev_gray = curr_gray
 
+        # ── ローカル表示（フルスクリーン） ────────────────────────
+        if use_display:
+            disp = frame.copy()
+            if pt:
+                cx, cy = int(pt[0]), int(pt[1])
+                cv2.circle(disp, (cx, cy), 12, (0, 255, 0), 2)
+                cv2.circle(disp, (cx, cy),  3, (0, 255, 0), -1)
+                cv2.putText(disp, f"({cx}, {cy})",
+                            (cx + 16, cy - 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                cv2.putText(disp, "NO TARGET",
+                            (20, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (80, 80, 80), 2)
+            cv2.putText(disp, "RPi Camera Server  [Q] quit",
+                        (20, h - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            cv2.imshow("RPi Camera", disp)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("[RPi] ローカルQキーで終了")
+                return
+
+        # ── ネットワーク送信 ──────────────────────────────────────
         payload = {"pt": pt}
 
         if SEND_PREVIEW:
             small = cv2.resize(frame, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE)
             if pt:
-                cx = int(pt[0] * PREVIEW_SCALE)
-                cy = int(pt[1] * PREVIEW_SCALE)
-                cv2.circle(small, (cx, cy), 8, (0, 255, 0), 2)
+                sx = int(pt[0] * PREVIEW_SCALE)
+                sy = int(pt[1] * PREVIEW_SCALE)
+                cv2.circle(small, (sx, sy), 8, (0, 255, 0), 2)
             _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 60])
             payload["frame"] = base64.b64encode(buf).decode()
 
@@ -79,18 +122,22 @@ def main():
     h, w = frame.shape[:2]
     print(f"[RPi Camera] {w}x{h}  ポート {PORT} で待機中...")
 
+    use_display = init_local_display()
+
     with socket.socket() as srv:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((HOST, PORT))
         srv.listen(1)
 
-        while True:   # ← 切断後も次の接続を待つ
+        while True:
             print("[RPi] 接続待ち...")
             conn, addr = srv.accept()
             print(f"[RPi] 接続: {addr}")
             with conn:
-                serve_client(conn, cap, w, h)
+                serve_client(conn, cap, w, h, use_display)
 
+    if use_display:
+        cv2.destroyAllWindows()
     cap.release()
 
 
