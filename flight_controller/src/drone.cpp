@@ -39,10 +39,10 @@ namespace T = Config::Timing;
 // kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle
 //  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(-0.01f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f,
+Axis_value Roll(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f,
                 0.0f),
-    Pitch(-0.01f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
-    Yaw(-0.03f, 0.0f, 0.0f, -1.5f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
+    Pitch(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f),
+    Yaw(-0.03f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 
 float BANK_ANGLE = 25.0f; // バンク角 [deg]  ← 0だとラダーも動かないので要注意
 unsigned long TURN_MS = 4000UL; // 8 of 8 or a single trip time [ms]
