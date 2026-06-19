@@ -2,11 +2,13 @@
 // main.cpp  -  自律飛行対応版 (軽量化・カルマンフィルタ削除版)
 // ============================================================
 
-#include "Config.h"
 #include <Arduino.h>
+#include <math.h>
+
 #include <cctype>
 #include <cmath>
-#include <math.h>
+
+#include "Config.h"
 
 // 大量のヘッダファイル
 #include "Actuators.h"
@@ -39,27 +41,29 @@ namespace T = Config::Timing;
 // kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle
 //  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(-0.01f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f,
+Axis_value Roll(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f,
                 0.0f),
-    Pitch(-0.01f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
-    Yaw(-0.03f, 0.0f, 0.0f, -1.5f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
+    Pitch(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
+    Yaw(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
 
-float BANK_ANGLE = 25.0f; // バンク角 [deg]  ← 0だとラダーも動かないので要注意
-unsigned long TURN_MS = 4000UL; // 8 of 8 or a single trip time [ms]
-float RUDDER_COORD = 0.66;      // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
+float BANK_ANGLE = 25.0f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
+unsigned long TURN_MS = 4000UL;  // 8 of 8 or a single trip time [ms]
+float RUDDER_COORD = 0.66;       // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
 
 IMU mpu(&Wire);
 BarometerSensor barometer(1013.25, 0.1, &Wire1);
 // EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA);
 // // 停止中 (搭載無し)
 
-Sbus sbus(&Serial2);
+Sbus sbus(&Serial5);
 FlightTelemetry telemetry(&Serial3);
 
 Flight_mode Mode;
 
-motor Thr_1, Thr_2, Thr_3, Thr_4;
-
+DShot motor1(&Serial1, DShotType::DShot600);  // Teensy4.X Pin 8
+DShot motor2(&Serial2, DShotType::DShot600);  // Teensy4.X Pin 14
+DShot motor3(&Serial6, DShotType::DShot600);  // Teensy4.X Pin 17
+DShot motor4(&Serial7, DShotType::DShot600);  // Teensy4.X Pin 20
 // ============================================================
 //  プロトタイプ宣言
 // ============================================================
@@ -73,23 +77,18 @@ void reset_all();
 // ============================================================
 //  § 組み合わせテスト用フラグ (ここを true/false で切り替えてください)
 // ============================================================
-bool USE_MPU = true;   // 加速度センサー (MPU6050)
-bool USE_BARO = true;  // 気圧センサー (BMP280)
-bool USE_SBUS = true;  // 受信機 (SBUS)
-bool USE_IM920 = true; // 無線モジュール (IM920)
-bool USE_SERVO = true; // サーボ・アンプ出力 (Servo/ESC)
+bool USE_MPU = true;    // 加速度センサー (MPU6050)
+bool USE_BARO = false;  // 気圧センサー (BMP280)
+bool USE_SBUS = true;   // 受信機 (SBUS)
+bool USE_IM920 = true;  // 無線モジュール (IM920)
+bool USE_SERVO = true;  // サーボ・アンプ出力 (Servo/ESC)
 
 void setup() {
   // サーボの宣言
 
-  Thr_1.set_pin(3).set_minPWM(1000).set_maxPWM(2000).begin();
-  Thr_2.set_pin(5).set_minPWM(1000).set_maxPWM(2000).begin();
-  Thr_3.set_pin(6).set_minPWM(1000).set_maxPWM(2000).begin();
-  Thr_4.set_pin(9).set_minPWM(1000).set_maxPWM(2000).begin();
-
   Serial.begin(115200);
   uint32_t start_ms = millis();
-  while (!Serial && (millis() - start_ms < 2000)) // 多分いったん待機？
+  while (!Serial && (millis() - start_ms < 2000))  // 多分いったん待機？
     ;
   Serial.println("\n\n--- TEENSY SYSTEM BOOT (High-Power Triage) ---");
 
@@ -106,10 +105,13 @@ void setup() {
   if (USE_SERVO) {
     Serial.println("Init Actuators...");
 
-    Thr_1.begin();
-    Thr_2.begin();
-    Thr_3.begin();
-    Thr_4.begin();
+    for (size_t i = 0; i < 4000; i++) {
+      motor1.sendCommand(0, false);
+      motor2.sendCommand(0, false);
+      motor3.sendCommand(0, false);
+      motor4.sendCommand(0, false);
+      delayMicroseconds(1'000);
+    }
   }
 
   if (USE_IM920) {
@@ -119,8 +121,7 @@ void setup() {
 
   if (USE_BARO) {
     Serial.println("Init Barometer...");
-    if (!barometer.begin())
-      Serial.println("Barometer init failed!");
+    if (!barometer.begin()) Serial.println("Barometer init failed!");
   }
 
   /*
@@ -144,7 +145,7 @@ void loop() {
                   USE_SBUS ? "ON" : "OFF");
   }
 
-  if (T::freq<T::MAIN_Hz>(T::Main_dt)) { // 周期制御 (1000Hz)
+  if (T::freq<T::MAIN_Hz>(T::Main_dt)) {  // 周期制御 (1000Hz)
     // 1) センサ・受信機・通信の更新
     if (USE_MPU || USE_SBUS) {
       updateSensorsAndComms();
@@ -171,15 +172,15 @@ void loop() {
     // 4) スロットル出力 (ONの場合のみ)
     if (USE_SERVO) {
       if (sbus.isSafe()) {
-        Thr_1.write(sbus.des[Ch::THR] + Roll.cmd + Pitch.cmd + Yaw.cmd);
-        Thr_2.write(sbus.des[Ch::THR] - Roll.cmd - Pitch.cmd - Yaw.cmd);
-        Thr_3.write(sbus.des[Ch::THR] - Roll.cmd - Pitch.cmd + Yaw.cmd);
-        Thr_4.write(sbus.des[Ch::THR] + Roll.cmd + Pitch.cmd - Yaw.cmd);
+        motor1.sendCommand(sbus.des[Ch::THR] + Pitch.cmd + Yaw.cmd,false);
+        motor2.sendCommand(sbus.des[Ch::THR] + Roll.cmd  - Yaw.cmd,false);
+        motor3.sendCommand(sbus.des[Ch::THR] - Pitch.cmd + Yaw.cmd,false);
+        motor4.sendCommand(sbus.des[Ch::THR]  - Roll.cmd  - Yaw.cmd,false);
       } else {
-        Thr_1.write(0);
-        Thr_2.write(0);
-        Thr_3.write(0);
-        Thr_4.write(0);
+        motor1.sendCommand(0, false);
+        motor2.sendCommand(0, false);
+        motor3.sendCommand(0, false);
+        motor4.sendCommand(0, false);
       }
     }
 
@@ -187,8 +188,7 @@ void loop() {
     static int dbg_cnt = 0;
     if (++dbg_cnt >= 100) {
       dbg_cnt = 0;
-      if (USE_BARO)
-        barometer.update();
+      if (USE_BARO) barometer.update();
       float fused_alt = (USE_BARO) ? barometer.get_smoothed_altitude() : 0.0f;
 
       // 姿勢データ送信 (28 bytes = float 7個、10Hz)
@@ -209,8 +209,7 @@ void loop() {
         print_sbus(sbus.des[Ch::ROLL], sbus.des[Ch::PITCH], sbus.des[Ch::THR],
                    sbus.des[Ch::YAW], sbus.des[Ch::Aux1], sbus.des[Ch::Aux2],
                    sbus.des[Ch::Aux3]);
-      if (USE_BARO)
-        Serial.printf("Alt: %+7.2f m\n", fused_alt);
+      if (USE_BARO) Serial.printf("Alt: %+7.2f m\n", fused_alt);
       print_timing(T::Main_dt);
     }
   }
@@ -224,22 +223,22 @@ void updateSensorsAndComms() {
   sbus.update();
   Mode.update(sbus.Ch_state(Ch::Aux2), sbus.Ch_state(Ch::Aux3));
 
-  Roll.update_value(sbus.des[Ch::ROLL], -mpu.getRoll(), mpu.getAccX(),
-                    mpu.getGyroX());
-  Pitch.update_value(sbus.des[Ch::PITCH], -mpu.getPitch(), mpu.getAccY(),
-                     mpu.getGyroY());
+  Roll.update_value(sbus.des[Ch::ROLL], mpu.getRoll(), mpu.getAccY(),
+                    mpu.getGyroY());
+  Pitch.update_value(sbus.des[Ch::PITCH], mpu.getPitch(), mpu.getAccX(),
+                     mpu.getGyroX());
   Yaw.update_value(sbus.des[Ch::YAW], mpu.getYaw(), mpu.getAccZ(),
                    mpu.getGyroZ());
 
   switch (Update_SerialCommand()) {
-  case 'R':
-    reset_all();
-    break;
-  case 'P':
-    handlePIDTuning(Roll, Pitch, Yaw);
-    break;
-  default:
-    break;
+    case 'R':
+      reset_all();
+      break;
+    case 'P':
+      handlePIDTuning(Roll, Pitch, Yaw);
+      break;
+    default:
+      break;
   }
   // 地上局からパラメータ受信
   if (USE_IM920) {
@@ -252,63 +251,62 @@ void updateSensorsAndComms() {
 //  自律制御
 // ============================================================
 void autonomousControl() {
-
   // --- 🔴 電波がない場合の「地上PIDセッティングモード」
   // ---(リポが断線していてプロポの電源の5Vをサーボ用に使っていた時用)
   if (!sbus.isSafe()) {
-    Roll.tar = 0.0f;  // 目標ロール角 0度（常に水平を維持）
-    Pitch.tar = 0.0f; // 目標ピッチ角 0度（常に水平を維持）
-    Yaw.tar = 0.0f;   // ラダー目標 0
+    Roll.tar = 0.0f;   // 目標ロール角 0度（常に水平を維持）
+    Pitch.tar = 0.0f;  // 目標ピッチ角 0度（常に水平を維持）
+    Yaw.tar = 0.0f;    // ラダー目標 0
 
     // 角度＆レートPIDを計算してコマンドを出力
     Roll.update_RateAnglePID();
     Pitch.update_RateAnglePID();
     Yaw.cmd =
-        Yaw.sbus; // 0固定ではなく、プロポのトリム位置（または受信機のフェイルセーフ位置）を維持
+        Yaw.sbus;  // 0固定ではなく、プロポのトリム位置（または受信機のフェイルセーフ位置）を維持
 
-    return; // 通常のフライトモード判定をスキップしてここで終了
+    return;  // 通常のフライトモード判定をスキップしてここで終了
   }
 
   // --- 🟢 電波がある場合（ここから下は元のコードそのまま） ---
   switch (Mode.get_mode()) {
-  case MODE_LEVEL_TURN:
-    // ★ 左旋回にしたい場合は -BANK_ANGLE にする
-    Roll.tar = +BANK_ANGLE;
-    break;
+    case MODE_LEVEL_TURN:
+      // ★ 左旋回にしたい場合は -BANK_ANGLE にする
+      Roll.tar = +BANK_ANGLE;
+      break;
 
-  case MODE_LEVEL_FLIGHT: {
-    Roll.tar = 0.0f;
-    break;
-  }
-
-  case MODE_SEMI_MANUAL: {
-    // ============================================================
-    //  マニュアル制御: スティック → レートPID → サーボ
-    // ============================================================
-    Roll.tar = Roll.sbus;
-    Pitch.tar = Pitch.sbus;
-    Yaw.tar = Yaw.sbus;
-    Roll.update_RatePID();
-    Pitch.update_RatePID();
-    Yaw.update_RatePID();
-    return; // ここで戻る
-  }
-
-  case MODE_MANUAL: {
-    // SBUSが安全(通信中)ならプロポの値を、途絶しているなら0.0(ニュートラル)にする
-    if (sbus.isSafe()) {
-      Roll.cmd = Roll.sbus;
-      Pitch.cmd = Pitch.sbus;
-      Yaw.cmd = Yaw.sbus;
-    } else {
-      Roll.cmd = 0.0f;
-      Pitch.cmd = 0.0f;
-      Yaw.cmd = Yaw.sbus; // トリム維持
+    case MODE_LEVEL_FLIGHT: {
+      Roll.tar = 0.0f;
+      break;
     }
-    return; // これもここで戻す
-  }
-  default:
-    break;
+
+    case MODE_SEMI_MANUAL: {
+      // ============================================================
+      //  マニュアル制御: スティック → レートPID → サーボ
+      // ============================================================
+      Roll.tar = Roll.sbus;
+      Pitch.tar = Pitch.sbus;
+      Yaw.tar = Yaw.sbus;
+      Roll.update_RatePID();
+      Pitch.update_RatePID();
+      Yaw.update_RatePID();
+      return;  // ここで戻る
+    }
+
+    case MODE_MANUAL: {
+      // SBUSが安全(通信中)ならプロポの値を、途絶しているなら0.0(ニュートラル)にする
+      if (sbus.isSafe()) {
+        Roll.cmd = Roll.sbus;
+        Pitch.cmd = Pitch.sbus;
+        Yaw.cmd = Yaw.sbus;
+      } else {
+        Roll.cmd = 0.0f;
+        Pitch.cmd = 0.0f;
+        Yaw.cmd = Yaw.sbus;  // トリム維持
+      }
+      return;  // これもここで戻す
+    }
+    default:
+      break;
   }
 
   // --- 角度外ループ + レート内ループ (Control.hのupdate_RateAnglePID使用) ---
@@ -325,7 +323,7 @@ void autonomousControl() {
   else if (Roll.tar < -0.1f)
     Yaw.cmd = Yaw.sbus - RUDDER_COORD;
   else
-    Yaw.cmd = Yaw.sbus; // 0固定ではなく、プロポのトリム値をベースにする
+    Yaw.cmd = Yaw.sbus;  // 0固定ではなく、プロポのトリム値をベースにする
 }
 void reset_all() {
   mpu.recalibrate();

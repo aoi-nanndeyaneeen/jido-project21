@@ -3,7 +3,7 @@
 #include <SPI.h>
 
 // XIAO RP2040のD7ピン（デジタルピン番号 7）をCSに指定
-Bitcraze_PMW3901 flow(7);
+Bitcraze_PMW3901 flow(D7);
 
 int16_t deltaX, deltaY;
 
@@ -15,7 +15,7 @@ void setup() {
 
   if (!flow.begin()) {
     Serial.println("Initialization of the flow sensor failed");
-    while(1) { delay(1); }
+    while(1) { Serial.println("Initialization of the flow sensor failed"); delay(1000); } // 初期化失敗時はエラーメッセージを繰り返し表示
   }
 }
 

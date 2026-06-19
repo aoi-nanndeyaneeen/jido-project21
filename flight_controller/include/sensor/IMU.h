@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <Wire.h>
-#include "MPU6050.h"
+#include <MPU6050.h>
 #include <MadgwickAHRS.h>
 #include "Config.h"
 

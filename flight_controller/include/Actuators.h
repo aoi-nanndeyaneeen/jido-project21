@@ -1,6 +1,7 @@
 //出力系
 #pragma once
 #include <Servo.h>
+#include <DShot.h>
 #include "Config.h"
 
 // class RC_servo{
@@ -90,3 +91,4 @@ private:
 public:
     void write(float input) ;
 };
+
