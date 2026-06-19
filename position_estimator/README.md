@@ -1,3 +1,6 @@
+久しぶりに起動してimport cvwとかでエラーが出るとき:
+  ctrl+shift+pをして、そこにPython: Select Interpreterと入力し、グローバル版のpythonを選択してやるとなんかうまくいく
+
 # Position Estimator
 
 複数台のカメラ（ローカル接続およびリモート接続）を用いて対象の位置推定を行うシステムです。
