@@ -230,30 +230,29 @@ void updateSensorsAndComms() {
     case up:
       Roll.update_value(sbus.des[Ch::ROLL], 0,0,
                         0);
-      Pitch.update_value(sbus.des[Ch::PITCH], -mpu.getPitch(), mpu.getAccY(),
-                         mpu.getGyroY());
-      Yaw.update_value(sbus.des[Ch::YAW], mpu.getYaw(), mpu.getAccZ(),
-                       mpu.getGyroZ());
+      Pitch.update_value(sbus.des[Ch::PITCH], 0, 0,
+                         0);
+      Yaw.update_value(sbus.des[Ch::YAW],0, 0,
+                      0);
       break;
     case cen:
       Roll.update_value(
           constrain(sbus.des[Ch::ROLL] + Main_sbus.des[Ch::ROLL] * 1.3, 0, 1),
-          -mpu.getRoll(), mpu.getAccX(), mpu.getGyroX());
+          0, 0, 0);
       Pitch.update_value(
           constrain(sbus.des[Ch::PITCH] + Main_sbus.des[Ch::PITCH] * 1.3, 0, 1),
-          -mpu.getPitch(), mpu.getAccY(), mpu.getGyroY());
+          0, 0, 0);
       Yaw.update_value(
           constrain(sbus.des[Ch::YAW] + Main_sbus.des[Ch::YAW] * 1.3, 0, 1),
-          mpu.getYaw(), mpu.getAccZ(), mpu.getGyroZ());
+          0, 0, 0);
       break;
 
     case down:
-      Roll.update_value(Main_sbus.des[Ch::ROLL], -mpu.getRoll(), mpu.getAccX(),
-                        mpu.getGyroX());
-      Pitch.update_value(Main_sbus.des[Ch::PITCH], -mpu.getPitch(),
-                         mpu.getAccY(), mpu.getGyroY());
-      Yaw.update_value(Main_sbus.des[Ch::YAW], mpu.getYaw(), mpu.getAccZ(),
-                       mpu.getGyroZ());
+      Roll.update_value(Main_sbus.des[Ch::ROLL], 0, 0,
+                        0);
+      Pitch.update_value(Main_sbus.des[Ch::PITCH], 0, 0, 0);
+      Yaw.update_value(Main_sbus.des[Ch::YAW], 0, 0,
+                       0);
       break;
     default:
       break;
