@@ -46,7 +46,8 @@ class ViewVelocity:
         return (P1 - P0) / dt
 
     # ── メイン描画 ──────────────────────────────────────────────
-    def get_image(self, P, roll_deg=0.0, pitch_deg=0.0):
+    # 修正箇所: imu_available=False を引数に追加しました
+    def get_image(self, P, roll_deg=0.0, pitch_deg=0.0, imu_available=False):
         vel = np.zeros(3)
         if P is not None:
             vel = self._smooth_velocity(P)
@@ -58,7 +59,7 @@ class ViewVelocity:
 
         self._draw_top(P, vel)
         self._draw_metrics(speed_h, speed_3d, vz, alt)
-        self._draw_adi(roll_deg, pitch_deg)
+        self._draw_adi(roll_deg, pitch_deg, imu_available)
 
         self.fig.canvas.draw()
         img = np.asarray(self.fig.canvas.buffer_rgba())
@@ -130,7 +131,8 @@ class ViewVelocity:
         ax.set_title('Velocity & Altitude', fontsize=10)
 
     # ── 姿勢指示器（ADI） ────────────────────────────────────────
-    def _draw_adi(self, roll_deg, pitch_deg):
+    # 修正箇所: imu_available を使ってセンサ未接続時はグレーアウト等にすることも可能です
+    def _draw_adi(self, roll_deg, pitch_deg, imu_available=True):
         ax = self.ax_adi
         ax.cla()
         ax.set_xlim(-1.3, 1.3)
@@ -147,13 +149,16 @@ class ViewVelocity:
 
         clip_c = Circle((0, 0), 1.0, transform=ax.transData)
 
-        # 空（青）
-        ax.add_patch(Circle((0, 0), 1.0, fc='#5B9BD5', ec='none', zorder=1))
+        # 空（青） - センサ未接続時は色をくすませる
+        sky_color = '#5B9BD5' if imu_available else '#8AA6C1'
+        gnd_color = '#8B5E0A' if imu_available else '#7A6B53'
+        
+        ax.add_patch(Circle((0, 0), 1.0, fc=sky_color, ec='none', zorder=1))
 
         # 地面（茶）
         gnd_pts = np.array([[-2, -2], [2, -2], [2, horizon_y], [-2, horizon_y]])
         gnd_rot = (rot @ gnd_pts.T).T
-        gnd = Polygon(gnd_rot, fc='#8B5E0A', ec='none', zorder=2)
+        gnd = Polygon(gnd_rot, fc=gnd_color, ec='none', zorder=2)
         gnd.set_clip_path(clip_c)
         ax.add_patch(gnd)
 
@@ -194,8 +199,11 @@ class ViewVelocity:
         ax.add_patch(Circle((0, 0), 1.0, fill=False, ec='#555555',
                              lw=2.5, zorder=10))
 
-        ax.set_title(f'Attitude   R: {roll_deg:+.0f}°   P: {pitch_deg:+.0f}°',
-                     fontsize=9)
+        title_text = f'Attitude   R: {roll_deg:+.0f}°   P: {pitch_deg:+.0f}°'
+        if not imu_available:
+            title_text += ' (NO SENSOR)'
+            
+        ax.set_title(title_text, fontsize=9)
 
     def close(self):
         plt.close(self.fig)

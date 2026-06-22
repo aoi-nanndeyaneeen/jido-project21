@@ -1,8 +1,6 @@
-# カメラ制御
-# ネットワークストリーム (MJPEG over HTTP) およびローカルUSBカメラに対応
-
 import cv2
 import numpy as np
+from utils.config import DIFF_THRESHOLD, MIN_AREA_PX, BLUR_KERNEL, MORPH_KERNEL
 
 
 class CameraTracker:
@@ -28,12 +26,12 @@ class CameraTracker:
         self.height = int(actual_h) if actual_h > 0 else height
         self.prev_gray = None
 
-        # ── 差分パラメータ（camera_server.py と統一） ──────────
-        self.blur_size      = (5, 5)   # GaussianBlur カーネル
-        self.diff_threshold = 25       # 差分2値化の閾値
-        self.min_area       = 100      # 最小輪郭面積 [px^2]
+        # ── 差分パラメータ（config.py で調整可能） ──────────
+        self.blur_size      = (BLUR_KERNEL, BLUR_KERNEL)
+        self.diff_threshold = DIFF_THRESHOLD
+        self.min_area       = MIN_AREA_PX
         self._morph_kernel  = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (5, 5)
+            cv2.MORPH_ELLIPSE, (MORPH_KERNEL, MORPH_KERNEL)
         )
 
     def get_approx_camera_matrix(self):

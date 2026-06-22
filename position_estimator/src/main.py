@@ -4,6 +4,7 @@ import threading
 import datetime
 import time
 import msvcrt
+import socket
 
 from utils.config import (CAMERA_1_URL, 
                           RPI_HOST, RPI_PORT, 
@@ -194,40 +195,38 @@ def main():
     # ── [1/4] カメラ初期化 ────────────────────────────────────
     print("\n[INIT 1/4]  カメラ起動中...")
     cam1 = CameraTracker(CAMERA_1_URL, width=CAMERA_W, height=CAMERA_H, label="Camera1")
-    cam2 = None
 
     # Camera1 接続チェック
     ret, test_frame = cam1.cap.read()
     if not ret or test_frame is None:
         print("  [WARN] Camera1 映像取得失敗。ダミーモードで続行します。")
 
-    # Camera2 接続チェック（失敗してもスキップ）
+    # Camera2: 疎通確認のみ（STREAM 接続はキャリブ後に行う）
+    cam2_ok_rpi = False
     try:
-        cam2 = RemoteCamera(RPI_HOST, RPI_PORT)
-        cam2.connect()
-        test_frame2, _ = cam2.read_and_track()
-        if test_frame2 is None:
-            print("  [WARN] Camera2 フレーム取得失敗。ダミーモードで続行します。")
+        test_sock = socket.socket()
+        test_sock.settimeout(3.0)
+        test_sock.connect((RPI_HOST, RPI_PORT))
+        # 解像度行だけ受け取ってすぐ閉じる（サーバーは ConnectionError を無視）
+        test_sock.recv(256)
+        test_sock.close()
+        cam2_ok_rpi = True
+        print("  [OK]  Camera2 (RPi) 到達確認")
     except Exception as e:
-        print(f"  [WARN] Camera2 接続失敗: {e}")
+        print(f"  [WARN] Camera2 到達失敗: {e}")
         print("         ダミーモードで続行します。")
-        cam2 = None
 
-    # Camera2がNoneの場合はダミー用スタブを作成
-    if cam2 is None:
-        from core.remote_camera import RemoteCamera as _RC
-        class _DummyCam2:
-            width, height = 1280, 720
-            def read_and_track(self): return None, None
-            def reset_background(self): pass
-            def release(self): pass
-            def get_approx_camera_matrix(self):
-                import numpy as np
-                f = self.width
-                return np.array([[f,0,self.width/2],[0,f,self.height/2],[0,0,1]],
-                                dtype=np.float32)
-        cam2 = _DummyCam2()
-        print("  [INFO] Camera2 スタブを使用します。")
+    # ストリーム用 cam2 はキャリブ後に作成するので、ここはスタブ
+    class _DummyCam2:
+        width, height = 1280, 720
+        def read_and_track(self): return None, None
+        def reset_background(self): pass
+        def release(self): pass
+        def get_approx_camera_matrix(self):
+            f = self.width
+            return np.array([[f,0,self.width/2],[0,f,self.height/2],[0,0,1]],
+                            dtype=np.float32)
+    cam2 = _DummyCam2()
 
     time.sleep(0.2)
 
@@ -272,30 +271,43 @@ def main():
     print("\n[INIT 4/4]  フィールドキャリブレーション")
 
     def dummy_calib(label, cam_pos_xyz):
-        """ダミーカメラ行列（位置だけ指定した簡易キャリブ）"""
-        import numpy as np
-        K = np.array([[1280, 0, 640],[0, 1280, 360],[0, 0, 1]],
-                     dtype=np.float32)
-        # カメラ位置からtvec/Rを逆算
+        K = np.array([[1280,0,640],[0,1280,360],[0,0,1]], dtype=np.float32)
         cam_pos = np.array(cam_pos_xyz, dtype=np.float64).reshape(3,1)
         R = np.eye(3, dtype=np.float64)
         tvec = -R @ cam_pos
-        print(f"  [DUMMY] {label} ダミーキャリブ使用 pos={cam_pos_xyz}")
+        print(f"  [DUMMY] {label} ダミーキャリブ使用")
         return K, R, tvec
 
     cam1_ok = cam1.cap.isOpened() and cam1.width > 0
-    cam2_ok = hasattr(cam2, 'sock')   # RemoteCameraはsockを持つ
 
     try:
+        # Camera1
         if cam1_ok:
             print("\n  ─── Camera1 キャリブレーション ───")
             K1, R1, tvec1 = run_calibration_single(cam1, "Camera1")
         else:
             K1, R1, tvec1 = dummy_calib("Camera1", [-8, -8, 2])
 
-        if cam2_ok:
-            print("\n  ─── Camera2 キャリブレーション ───")
-            K2, R2, tvec2 = run_calibration_remote(cam2, "Camera2")
+        # Camera2（RPi側でクリック → 座標を受け取る）
+        if cam2_ok_rpi:
+            print("\n  ─── Camera2 キャリブレーション（ラズパイ画面でクリック）───")
+            print("       順序: 左下→右下→右上→左上→左上の2m上")
+            pts, cw, ch = RemoteCamera.request_calibration(RPI_HOST, RPI_PORT)
+            K2 = np.array([[cw,0,cw/2],[0,cw,ch/2],[0,0,1]], dtype=np.float32)
+            pts2d = np.array(pts, dtype=np.float32)
+            ret_pnp, rvec2, tvec2 = cv2.solvePnP(
+                FIELD_POINTS, pts2d, K2, None, flags=cv2.SOLVEPNP_EPNP)
+            if not ret_pnp:
+                raise RuntimeError("Camera2 solvePnP 失敗")
+            R2, _ = cv2.Rodrigues(rvec2)
+            cp = -R2.T.dot(tvec2)
+            print(f"  [Camera2] キャリブ完了 "
+                  f"X={cp[0,0]:.2f} Y={cp[1,0]:.2f} Z={cp[2,0]:.2f}m")
+
+            # キャリブ完了後に STREAM 接続
+            real_cam2 = RemoteCamera(RPI_HOST, RPI_PORT, label="Camera2")
+            real_cam2.connect(mode="STREAM")
+            cam2 = real_cam2
         else:
             K2, R2, tvec2 = dummy_calib("Camera2", [8, -8, 2])
 
@@ -389,7 +401,7 @@ def main():
                 plot_data["updated"] = False
 
         if updated:
-            # カメラ映像はフルレートで表示
+            # ── カメラ映像（フルレート） ─────────────────────────
             with plot_lock:
                 f1 = plot_data.get("frame1")
                 f2 = plot_data.get("frame2")
@@ -398,49 +410,52 @@ def main():
             if f2 is not None:
                 cv2.imshow("Camera 2", cv2.resize(f2, (DISP_W, DISP_H)))
 
-            # matplotlibビューはレートを制限
+            # ── オートパイロット計算 ─────────────────────────────
+            now_ap = time.time()
+            dt_ap  = now_ap - _ap_time
+            _ap_time = now_ap
+
+            if P is not None:
+                _pos_hist.append((now_ap, P.copy()))
+
+            vel_ap = np.zeros(3)
+            if len(_pos_hist) >= 2:
+                t0, p0 = _pos_hist[0]
+                t1, p1 = _pos_hist[-1]
+                dt_v = t1 - t0
+                if dt_v > 1e-4:
+                    vel_ap = (p1 - p0) / dt_v
+
+            if P is not None and dt_ap > 0:
+                _last_cmd = patrol.update(pos=P, vel=vel_ap, dt=dt_ap)
+
+            # ── RC Command（純OpenCV・レート制限なし） ────────────
+            rc_img = view_rc.get_image(_last_cmd)
+            cv2.imshow("RC Command", rc_img)
+
+            # ── matplotlib系（レート制限あり） ───────────────────
             now = time.time()
             if now - last_mpl_render > 1.0 / MPL_RENDER_HZ:
                 last_mpl_render = now
 
                 roll_deg, pitch_deg = 0.0, 0.0
-                if alt_sensor is not None:
-                    roll_deg, pitch_deg = accel_to_angles(alt_sensor.get_accel())
-
-                vel_img = velocity_view.get_image(P, roll_deg, pitch_deg)
-                cv2.imshow("Velocity", vel_img)
-
-                # ── オートパイロット計算 ──────────────────────────────
-                now_ap = time.time()
-                dt_ap  = now_ap - _ap_time
-                _ap_time = now_ap
-
-                if P is not None:
-                    _pos_hist.append((now_ap, P.copy()))
-
-                # 速度推定（posHistから有限差分）
-                vel_ap = np.zeros(3)
-                if len(_pos_hist) >= 2:
-                    t0, p0 = _pos_hist[0]
-                    t1, p1 = _pos_hist[-1]
-                    dt_v = t1 - t0
-                    if dt_v > 1e-4:
-                        vel_ap = (p1 - p0) / dt_v
-
-                if P is not None and dt_ap > 0:
-                    _last_cmd = patrol.update(
-                        pos=P,
-                        vel=vel_ap,
-                        dt=dt_ap
+                imu_available = alt_sensor is not None
+                if imu_available:
+                    roll_deg, pitch_deg = accel_to_angles(
+                        alt_sensor.get_accel()
                     )
 
-                rc_img = view_rc.get_image(_last_cmd)
-                cv2.imshow("RC Command", rc_img)
+                vel_img = velocity_view.get_image(
+                    P, roll_deg, pitch_deg, imu_available
+                )
+                cv2.imshow("Velocity", vel_img)
 
                 if O1 is not None:
                     target_alt = controller.get_target()
-                    dashboard.render_and_show(P, O1, 0.0, 0.0, current_z, target_alt)
-                    if alt_sensor is not None and P is not None:
+                    dashboard.render_and_show(
+                        P, O1, 0.0, 0.0, current_z, target_alt
+                    )
+                    if imu_available and P is not None:
                         pitch_cmd = controller.calc_pitch_command(current_z)
                         alt_sensor.send_target_altitude(pitch_cmd)
 

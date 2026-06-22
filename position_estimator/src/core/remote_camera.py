@@ -1,9 +1,3 @@
-"""
-remote_camera.py
-RPi上のcamera_server.pyからソケット経由で
-座標とプレビューフレームを受け取るクライアントクラス。
-CameraTrackerと同一インターフェースを持つ。
-"""
 import socket, json, base64, cv2
 import numpy as np
 
@@ -18,16 +12,67 @@ class RemoteCamera:
         self.width  = None
         self.height = None
 
-    def connect(self):
+    def connect(self, mode: str = "STREAM"):
+        """
+        サーバーに接続してモードを通知する。
+        mode: "STREAM"（通常）または "CALIB"（キャリブレーション）
+        """
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
         self.sock.settimeout(1.0)
 
-        # 最初の1行 = 解像度情報
+        # 解像度情報を受信
         info = self._readline()
         d = json.loads(info)
         self.width, self.height = d["width"], d["height"]
-        print(f"[{self.label}] 接続完了: {self.width}x{self.height}")
+
+        # モードをサーバーに通知
+        self.sock.sendall(f"{mode}\n".encode())
+        print(f"[{self.label}] 接続完了: {self.width}x{self.height} (mode={mode})")
+
+    # ── キャリブレーション専用クラスメソッド ────────────────────
+    @classmethod
+    def request_calibration(cls, host: str, port: int,
+                            timeout: float = 120.0) -> tuple[list, int, int]:
+        """
+        RPiにCALIBモードで接続し、ユーザーがRPi画面で
+        クリックした5点の座標を受け取る。
+
+        Returns:
+            pts    : [[x,y], ...] 5点のリスト（フル解像度座標）
+            width  : カメラ幅
+            height : カメラ高さ
+        """
+        print(f"[RemoteCamera] キャリブレーション接続中 ({host}:{port})...")
+        sock = socket.socket()
+        sock.connect((host, port))
+        sock.settimeout(timeout)
+
+        buf = ""
+        # 解像度受信
+        while "\n" not in buf:
+            buf += sock.recv(1024).decode()
+        line, buf = buf.split("\n", 1)
+        info = json.loads(line)
+        w, h = info["width"], info["height"]
+
+        # CALIBモードを要求
+        sock.sendall(b"CALIB\n")
+        print("[RemoteCamera] ラズパイのディスプレイで5点をクリックしてください...")
+
+        # 5点データを待つ（タイムアウトまで待機）
+        while "\n" not in buf:
+            chunk = sock.recv(4096).decode()
+            if not chunk:
+                raise ConnectionError("RPiが切断されました")
+            buf += chunk
+        line, _ = buf.split("\n", 1)
+        data = json.loads(line)
+        sock.close()
+
+        pts = data["calib_pts"]
+        print(f"[RemoteCamera] キャリブ点受信: {pts}")
+        return pts, w, h
 
     def _readline(self) -> str:
         while "\n" not in self.buf:
@@ -39,16 +84,9 @@ class RemoteCamera:
         return line
 
     def read_and_track(self):
-        """
-        CameraTrackerと同一インターフェース。
-        Returns:
-            frame (np.ndarray or None): プレビューフレーム（SEND_PREVIEW=Trueの場合）
-            center_uv (tuple or None): 検出座標
-        """
         try:
             line = self._readline()
             d = json.loads(line)
-
             pt = d.get("pt")
             center_uv = (pt[0], pt[1]) if pt else None
 
@@ -58,35 +96,29 @@ class RemoteCamera:
                 arr = np.frombuffer(img_bytes, dtype=np.uint8)
                 frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if frame is not None and center_uv:
-                    cx, cy = int(center_uv[0]), int(center_uv[1])
-                    # プレビューはスケールダウン済みなので元座標で描画するとズレる
-                    # → フル解像度座標をスケール変換して描画
                     scale_x = frame.shape[1] / self.width
                     scale_y = frame.shape[0] / self.height
-                    dx = int(cx * scale_x)
-                    dy = int(cy * scale_y)
+                    dx = int(center_uv[0] * scale_x)
+                    dy = int(center_uv[1] * scale_y)
                     cv2.circle(frame, (dx, dy), 8, (0, 255, 0), 2)
-                    cv2.rectangle(frame, (dx-10, dy-10), (dx+10, dy+10), (0,255,0), 1)
-                    cv2.putText(frame, f"({cx},{cy})",
-                                (dx+12, dy-12),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+                    cv2.putText(frame, f"({int(center_uv[0])},{int(center_uv[1])})",
+                                (dx + 12, dy - 12),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 if frame is not None:
                     cv2.putText(frame, self.label, (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,200,0), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 200, 0), 2)
             return frame, center_uv
 
         except (socket.timeout, json.JSONDecodeError):
             return None, None
 
     def get_approx_camera_matrix(self):
-        """CameraTrackerと同一インターフェース"""
         focal = self.width
-        return np.array([[focal, 0,     self.width/2],
-                         [0,     focal, self.height/2],
-                         [0,     0,     1           ]], dtype=np.float32)
+        return np.array([[focal, 0,     self.width  / 2],
+                         [0,     focal, self.height / 2],
+                         [0,     0,     1             ]], dtype=np.float32)
 
     def reset_background(self):
-        """RPi側ではサーバー内で管理のためno-op"""
         pass
 
     def release(self):

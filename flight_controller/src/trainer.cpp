@@ -50,13 +50,12 @@ float BANK_ANGLE = 25.0f;  // バンク角 [deg]  ← 0だとラダーも動か�
 unsigned long TURN_MS = 4000UL;  // 8 of 8 or a single trip time [ms]
 float RUDDER_COORD = 0.66;       // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
 
-IMU mpu(&Wire);
-BarometerSensor barometer(1013.25, 0.1, &Wire1);
+
 // EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA);
 // // 停止中 (搭載無し)
-Sbus Main_sbus(&Serial4);
-Sbus sbus(&Serial2);
-FlightTelemetry telemetry(&Serial3);
+Sbus Main_sbus(&Serial2);
+Sbus sbus(&Serial4);
+
 
 Flight_mode Mode;
 
@@ -68,7 +67,7 @@ motor Thr;
 //  プロトタイプ宣言
 // ============================================================
 void updateSensorsAndComms();
-void autonomousControl();
+
 void writeServos();
 void reset_all();
 // ============================================================
@@ -108,10 +107,6 @@ void setup() {
   while (!Serial && (millis() - start_ms < 2000));
   Serial.println("\n\n--- TEENSY SYSTEM BOOT (High-Power Triage) ---");
 
-  if (USE_MPU) {
-    Serial.println("Init MPU...");
-    mpu.begin();
-  }
 
   if (USE_SBUS) {
     Serial.println("Init SBUS...");
@@ -130,15 +125,6 @@ void setup() {
     Thr.begin();
   }
 
-  if (USE_IM920) {
-    Serial.println("Init IM920...");
-    telemetry.begin();
-  }
-
-  if (USE_BARO) {
-    Serial.println("Init Barometer...");
-    if (!barometer.begin()) Serial.println("Barometer init failed!");
-  }
 
   /*
   Serial.println("Init EZ2...");
@@ -168,18 +154,11 @@ void loop() {
     }
 
     // モード切替時にPIリセット
-    if (Mode.change()) {
-      Mode.modeStartMs = millis();
-      Roll.pid_reset();
-      Pitch.pid_reset();
-      Yaw.pid_reset();
-    }
+
 
 
     // 3) モードに応じた制御演算
-    if (USE_MPU && USE_SBUS) {
-      autonomousControl();
-    }
+
 
     // 3-2) サーボ出力 (ONの場合のみ)
     if (USE_SERVO) {
@@ -217,14 +196,7 @@ void loop() {
     static int dbg_cnt = 0;
     if (++dbg_cnt >= 100) {
       dbg_cnt = 0;
-      if (USE_BARO) barometer.update();
-      float fused_alt = (USE_BARO) ? barometer.get_smoothed_altitude() : 0.0f;
 
-      // 姿勢データ送信 (28 bytes = float 7個、10Hz)
-      if (USE_IM920) {
-        telemetry.sendAttitude(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ(),
-                               Roll.ang, Pitch.ang, Yaw.ang, fused_alt);
-      }
 
       Serial.print("\033[2J\033[H");
       Serial.printf("### MPU=%s BARO=%s SBUS=%s IM920=%s SERVO=%s ###\n",
@@ -242,7 +214,7 @@ void loop() {
                  Main_sbus.des[Ch::THR], Main_sbus.des[Ch::YAW],
                  Main_sbus.des[Ch::Aux1], Main_sbus.des[Ch::Aux2],
                  Main_sbus.des[Ch::Aux3]);
-      if (USE_BARO) Serial.printf("Alt: %+7.2f m\n", fused_alt);
+
       print_timing(T::Main_dt);
     }
   }
@@ -252,12 +224,12 @@ void loop() {
 //  センサ・受信機・無線通信の更新
 // ============================================================
 void updateSensorsAndComms() {
-  mpu.update();
+
   sbus.update();
   switch (Main_sbus.Ch_state(THR_CUT)) {
     case up:
-      Roll.update_value(sbus.des[Ch::ROLL], -mpu.getRoll(), mpu.getAccX(),
-                        mpu.getGyroX());
+      Roll.update_value(sbus.des[Ch::ROLL], 0,0,
+                        0);
       Pitch.update_value(sbus.des[Ch::PITCH], -mpu.getPitch(), mpu.getAccY(),
                          mpu.getGyroY());
       Yaw.update_value(sbus.des[Ch::YAW], mpu.getYaw(), mpu.getAccZ(),
@@ -298,15 +270,11 @@ void updateSensorsAndComms() {
       break;
   }
   // 地上局からパラメータ受信
-  if (USE_IM920) {
-    telemetry.receiveAndProcess(Roll, Pitch, Yaw, mpu, barometer, BANK_ANGLE,
-                                TURN_MS);
-  }
+
 }
 
 void reset_all() {
-  mpu.recalibrate();
-  barometer.reset();
+
   Config::Timing::resetTiming();
   Roll.pid_reset();
   Pitch.pid_reset();
