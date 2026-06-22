@@ -72,8 +72,8 @@ public:
     }
 
     Sw Ch_state(int ch) {
-        if (des[ch] > 0.25)     return up;                //ここで条件式をそのままreturnする発想は私にはなかった(´・ω・｀)
-        if (des[ch] < -0.25)    return down;
+        if (des[ch] > 0.25)     return down;                //ここで条件式をそのままreturnする発想は私にはなかった(´・ω・｀)
+        if (des[ch] < -0.25)    return up;
         return cen;
     }
 

@@ -53,8 +53,8 @@ float RUDDER_COORD = 0.66;       // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.
 
 // EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA);
 // // 停止中 (搭載無し)
-Sbus Main_sbus(&Serial2);
-Sbus sbus(&Serial4);
+Sbus Main_sbus(&Serial4);
+Sbus sbus(&Serial5);
 
 
 Flight_mode Mode;
@@ -84,16 +84,17 @@ bool USE_SERVO = true;   // サーボ・アンプ出力 (Servo/ESC)
 
 void setup() {
   // サーボの宣言
-  Ail1.set_pin(1).set_endpoints(-1.0, 1.0).begin();
+  Ail1.set_pin(1).set_endpoints(-1.0, 1.0).set_offset(-0.15).begin();
 
   Ail2.set_pin(6)
-      .set_endpoints(1.0, -1.0)  // リバース
+      .set_endpoints(-1.0, 1.0)// リバース
+      .set_offset(-0.3)  
       .begin();
 
   Ele.set_pin(2).set_offset(0.5).set_endpoints(-1.0, 1.0).begin();
 
   Rud.set_pin(10)
-      .set_endpoints(1.0, -1.0)  // リバース
+      .set_endpoints(-1.0, 1.0)  // リバース
       .begin();
 
   Flp1.set_pin(11).set_endpoints(-1.0, 1.0).begin();
@@ -168,9 +169,9 @@ void loop() {
     // 4) スロットル出力 (ONの場合のみ)
     if (USE_SERVO) {
       if (sbus.isSafe() || Main_sbus.isSafe()) {
-        if (Main_sbus.Ch_state(THR_CUT) ==down) {  // 教官側のスロットルカットがoffなら操作が教官側優先(sbus2)
+        if (Main_sbus.Ch_state(Aux2) ==up||Main_sbus.Ch_state(THR_CUT) == up) {  // 教官側のスロットルカットがoffなら操作が教官側優先(sbus2)
           Thr.write(Main_sbus.des[Ch::THR]);
-        } else if (Main_sbus.Ch_state(THR_CUT) == cen) {
+        } else if (Main_sbus.Ch_state(Aux2) == cen) {
           Thr.write(sbus.des[Ch::THR] * 0.7f + Main_sbus.des[Ch::THR] * 0.3f);
         } else {
           Thr.write(sbus.des[Ch::THR]);
@@ -181,7 +182,6 @@ void loop() {
     }
 
     // 5) フラップ (ONの場合のみ)
-    if (USE_SERVO) {
       if (sbus.Ch_state(THR_CUT) == up) {
         Flp1.write(sbus.Ch_state(Aux1));
         Flp2.write(sbus.Ch_state(Aux1));
@@ -190,7 +190,6 @@ void loop() {
         Flp1.write(Main_sbus.Ch_state(Aux1));
         Flp2.write(Main_sbus.Ch_state(Aux1));
       }
-    }
 
     // 6) テレメトリ・デバッグ (10Hz)
     static int dbg_cnt = 0;
@@ -226,8 +225,9 @@ void loop() {
 void updateSensorsAndComms() {
 
   sbus.update();
-  switch (Main_sbus.Ch_state(THR_CUT)) {
-    case up:
+  Main_sbus.update();
+  switch (Main_sbus.Ch_state(Aux2)) {
+    case down:
       Roll.update_value(sbus.des[Ch::ROLL], 0,0,
                         0);
       Pitch.update_value(sbus.des[Ch::PITCH], 0, 0,
@@ -237,17 +237,17 @@ void updateSensorsAndComms() {
       break;
     case cen:
       Roll.update_value(
-          constrain(sbus.des[Ch::ROLL] + Main_sbus.des[Ch::ROLL] * 1.3, 0, 1),
+          constrain(sbus.des[Ch::ROLL] + Main_sbus.des[Ch::ROLL] * 1.3, -1, 1),
           0, 0, 0);
       Pitch.update_value(
-          constrain(sbus.des[Ch::PITCH] + Main_sbus.des[Ch::PITCH] * 1.3, 0, 1),
+          constrain(sbus.des[Ch::PITCH] + Main_sbus.des[Ch::PITCH] * 1.3, -1, 1),
           0, 0, 0);
       Yaw.update_value(
-          constrain(sbus.des[Ch::YAW] + Main_sbus.des[Ch::YAW] * 1.3, 0, 1),
+          constrain(sbus.des[Ch::YAW] + Main_sbus.des[Ch::YAW] * 1.3, -1, 1),
           0, 0, 0);
       break;
 
-    case down:
+    case up:
       Roll.update_value(Main_sbus.des[Ch::ROLL], 0, 0,
                         0);
       Pitch.update_value(Main_sbus.des[Ch::PITCH], 0, 0, 0);
@@ -285,9 +285,15 @@ void writeServos() {
   Roll.cmd = Roll.sbus;
   Pitch.cmd = Pitch.sbus;
   Yaw.cmd = Yaw.sbus;
-
+ if(Main_sbus.Ch_state(THR_CUT) == up){
+    Ail1.write(Main_sbus.des[Ch::ROLL]);
+    Ail2.write(Main_sbus.des[Ch::ROLL]);
+    Ele.write(Main_sbus.des[Ch::PITCH]);
+    Rud.write(Main_sbus.des[Ch::YAW]);
+ }else{
   Ail1.write(Roll.cmd);
   Ail2.write(Roll.cmd);
   Ele.write(Pitch.cmd);
   Rud.write(Yaw.cmd);
+}
 }
