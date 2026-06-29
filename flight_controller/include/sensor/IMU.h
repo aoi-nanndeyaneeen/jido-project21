@@ -104,5 +104,8 @@ public:
         filter.reset();
         filter.begin(Config::Timing::MAIN_Hz);
         Serial.println("INFO: MPU6050 Recalibration Finished.");
+        Serial.printf("INFO: New Biases: ax=%.4f ay=%.4f az=%.4f gx=%.4f gy=%.4f gz=%.4f\n",
+                      Config::sensor::s_ax_bias, Config::sensor::s_ay_bias, Config::sensor::s_az_bias,
+                      Config::sensor::s_gx_bias, Config::sensor::s_gy_bias, Config::sensor::s_gz_bias);
     }
 };

@@ -72,13 +72,13 @@ namespace Config {
         // ※ monitor.py の Rキーキャリブレーションで得られた値を入力する
         // ※ デフォルトは0。機体ごとに調整すること
         // ※ ハードウェアオフセット(レジスタ書き込み)は不具合の原因になるため使用しない
-        inline float s_ax_bias = 0.0f;
-        inline float s_ay_bias = 0.0f;
-        inline float s_az_bias = 0.0f;
-        inline float s_gx_bias = 0.0f;
-        inline float s_gy_bias = 0.0f;
-        inline float s_gz_bias = 0.0f;
-
+        inline float s_ax_bias = 0.0498f;
+        inline float s_ay_bias = 0.0273f;
+        inline float s_az_bias = 0.0360f;
+        inline float s_gx_bias = -11.3956f;
+        inline float s_gy_bias = 3.8146f;
+        inline float s_gz_bias = -2.9902f;
+        //INFO: New Biases: ax=0.0498 ay=0.0273 az=0.0360 gx=-11.3956 gy=3.8146 gz=-2.9902
         constexpr int16_t ACCEL_X_OFFSET = 0;
         constexpr int16_t ACCEL_Y_OFFSET = 0;
         constexpr int16_t ACCEL_Z_OFFSET = 0;

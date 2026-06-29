@@ -41,9 +41,9 @@ namespace T = Config::Timing;
 // kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle
 //  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f,
+Axis_value Roll(0.03f, 0.0f, 0.0000005f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f,
                 0.0f),
-    Pitch(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
+    Pitch(0.01f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
     Yaw(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
 
 float BANK_ANGLE = 25.0f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
@@ -55,12 +55,12 @@ BarometerSensor barometer(1013.25, 0.1, &Wire1);
 // EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA);
 // // 停止中 (搭載無し)
 
-Sbus sbus(&Serial5);
+Sbus sbus(&Serial6);
 FlightTelemetry telemetry(&Serial3);
 
 Flight_mode Mode;
 
-motor motor1,motor2,motor3,motor4;  // Teensy4.X Pin 20
+motor motor1, motor2, motor3, motor4;  // Teensy4.X Pin 20
 // ============================================================
 //  プロトタイプ宣言
 // ============================================================
@@ -102,10 +102,10 @@ void setup() {
   if (USE_SERVO) {
     Serial.println("Init Actuators...");
 
-    motor1.set_pin(20).set_minPWM(600).set_maxPWM(2000).begin();
-    motor2.set_pin(21).set_minPWM(600).set_maxPWM(2000).begin();
-    motor3.set_pin(22).set_minPWM(600).set_maxPWM(2000).begin();
-    motor4.set_pin(23).set_minPWM(600).set_maxPWM(2000).begin();
+    motor1.set_pin(9).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor2.set_pin(28).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor3.set_pin(10).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor4.set_pin(11).set_minPWM(1000).set_maxPWM(2000).begin();
   }
 
   if (USE_IM920) {
@@ -166,10 +166,10 @@ void loop() {
     // 4) スロットル出力 (ONの場合のみ)
     if (USE_SERVO) {
       if (sbus.isSafe()) {
-        motor1.write(sbus.des[Ch::THR] + Pitch.cmd + Yaw.cmd);
-        motor2.write(sbus.des[Ch::THR] + Roll.cmd  - Yaw.cmd);
-        motor3.write(sbus.des[Ch::THR] - Pitch.cmd + Yaw.cmd);
-        motor4.write(sbus.des[Ch::THR] - Roll.cmd  - Yaw.cmd);
+        motor1.write(sbus.des[Ch::THR] - Pitch.cmd + Yaw.cmd);
+        motor2.write(sbus.des[Ch::THR] - Roll.cmd - Yaw.cmd);
+        motor3.write(sbus.des[Ch::THR] + Roll.cmd + Yaw.cmd);
+        motor4.write(sbus.des[Ch::THR] + Pitch.cmd - Yaw.cmd);
       } else {
         motor1.write(0);
         motor2.write(0);
@@ -215,11 +215,11 @@ void loop() {
 void updateSensorsAndComms() {
   mpu.update();
   sbus.update();
-  Mode.update(sbus.Ch_state(Ch::Aux2), sbus.Ch_state(Ch::Aux3));
+  Mode.update(cen, cen);
 
-  Roll.update_value(sbus.des[Ch::ROLL], mpu.getRoll(), mpu.getAccY(),
+  Roll.update_value(sbus.des[Ch::ROLL], mpu.getPitch(), mpu.getAccY(),
                     mpu.getGyroY());
-  Pitch.update_value(sbus.des[Ch::PITCH], mpu.getPitch(), mpu.getAccX(),
+  Pitch.update_value(sbus.des[Ch::PITCH], mpu.getRoll(), mpu.getAccX(),
                      mpu.getGyroX());
   Yaw.update_value(sbus.des[Ch::YAW], mpu.getYaw(), mpu.getAccZ(),
                    mpu.getGyroZ());
@@ -230,6 +230,10 @@ void updateSensorsAndComms() {
       break;
     case 'P':
       handlePIDTuning(Roll, Pitch, Yaw);
+      motor1.write(0);
+      motor2.write(0);
+      motor3.write(0);
+      motor4.write(0);
       break;
     default:
       break;

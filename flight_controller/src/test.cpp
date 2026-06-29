@@ -2,7 +2,7 @@
 #include <Servo.h>
 
 // === PWM出力ピン定義 ===
-const int MOTOR_PINS[4] = {9, 24, 10, 11};
+const int MOTOR_PINS[4] = {9, 28, 10, 11};
 
 // Servoオブジェクトの配列を作成
 Servo motors[4];
@@ -14,7 +14,7 @@ const int PWM_MAX_US = 2000;
 // DShot スロットル値(0〜2047) → PWMパルス幅(μs) に変換
 int throttleToPulseUs(int throttle) {
   throttle = constrain(throttle, 0, 2047);
-  return map(throttle, 0, 2047, PWM_MIN_US, PWM_MAX_US);
+  return map(throttle, 0, 2000, PWM_MIN_US, PWM_MAX_US);
 }
 
 void sendAll(int throttle);
@@ -91,7 +91,7 @@ void loop() {
     } else if (cmd == '3') {
       sendAll(600);
     } else if (cmd == '4') {
-      sendAll(1000);
+      sendAll(2000);
     } else if (cmd == 's') {
       Serial.println("停止: 1000μs");
       sendAll(0);

@@ -101,7 +101,7 @@ void setup() {
 
   Flp2.set_pin(9).set_endpoints(-1.0, 1.0).begin();
 
-  Thr.set_pin(3).set_minPWM(600).set_maxPWM(2000).begin();
+  Thr.set_pin(3).set_minPWM(1000).set_maxPWM(2000).begin();
 
   Serial.begin(115200);
   uint32_t start_ms = millis();
