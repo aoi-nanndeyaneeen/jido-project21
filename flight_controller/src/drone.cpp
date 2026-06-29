@@ -51,7 +51,7 @@ unsigned long TURN_MS = 4000UL;  // 8 of 8 or a single trip time [ms]
 float RUDDER_COORD = 0.66;       // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
 
 IMU mpu(&Wire);
-BarometerSensor barometer(1013.25, 0.1, &Wire1);
+BarometerSensor barometer(1013.25, 0.1, &Wire);
 // EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA);
 // // 停止中 (搭載無し)
 
@@ -104,8 +104,8 @@ void setup() {
 
     motor1.set_pin(9).set_minPWM(1000).set_maxPWM(2000).begin();
     motor2.set_pin(28).set_minPWM(1000).set_maxPWM(2000).begin();
-    motor3.set_pin(10).set_minPWM(1000).set_maxPWM(2000).begin();
-    motor4.set_pin(11).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor3.set_pin(11).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor4.set_pin(10).set_minPWM(1000).set_maxPWM(2000).begin();
   }
 
   if (USE_IM920) {
