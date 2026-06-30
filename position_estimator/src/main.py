@@ -5,6 +5,7 @@ import datetime
 import time
 import msvcrt
 import socket
+import json
 
 from utils.config import (CAMERA_1_URL, 
                           RPI_HOST, RPI_PORT, 
@@ -202,7 +203,8 @@ def main():
         print("  [WARN] Camera1 映像取得失敗。ダミーモードで続行します。")
 
     # Camera2: 疎通確認のみ（STREAM 接続はキャリブ後に行う）
-    cam2_ok_rpi = False
+    cam2_ok_rpi = True
+    print("  [INFO] Camera2 (RPi): キャリブレーション時に接続確認します")
     try:
         test_sock = socket.socket()
         test_sock.settimeout(3.0)
@@ -288,26 +290,94 @@ def main():
         else:
             K1, R1, tvec1 = dummy_calib("Camera1", [-8, -8, 2])
 
-        # Camera2（RPi側でクリック → 座標を受け取る）
+        # ── Camera2（test_cam2.py と同じフローを main.py に統合） ──
         if cam2_ok_rpi:
-            print("\n  ─── Camera2 キャリブレーション（ラズパイ画面でクリック）───")
-            print("       順序: 左下→右下→右上→左上→左上の2m上")
-            pts, cw, ch = RemoteCamera.request_calibration(RPI_HOST, RPI_PORT)
-            K2 = np.array([[cw,0,cw/2],[0,cw,ch/2],[0,0,1]], dtype=np.float32)
-            pts2d = np.array(pts, dtype=np.float32)
-            ret_pnp, rvec2, tvec2 = cv2.solvePnP(
-                FIELD_POINTS, pts2d, K2, None, flags=cv2.SOLVEPNP_EPNP)
-            if not ret_pnp:
-                raise RuntimeError("Camera2 solvePnP 失敗")
-            R2, _ = cv2.Rodrigues(rvec2)
-            cp = -R2.T.dot(tvec2)
-            print(f"  [Camera2] キャリブ完了 "
-                  f"X={cp[0,0]:.2f} Y={cp[1,0]:.2f} Z={cp[2,0]:.2f}m")
+            import socket as _s
 
-            # キャリブ完了後に STREAM 接続
-            real_cam2 = RemoteCamera(RPI_HOST, RPI_PORT, label="Camera2")
-            real_cam2.connect(mode="STREAM")
-            cam2 = real_cam2
+            def _rline(sock, buf=""):
+                """文字列バッファで改行まで受信"""
+                while "\n" not in buf:
+                    buf += sock.recv(4096).decode()
+                line, rest = buf.split("\n", 1)
+                return line, rest
+
+            # ── A: CALIB ────────────────────────────────────────
+            print("\n  ─── Camera2 キャリブレーション ───")
+            print("       ラズパイ画面で5点クリック")
+            print("       順序: 左下→右下→右上→左上→左上+2m")
+
+            _pts = None
+            _w2, _h2 = 1280, 720
+            _sk = _s.socket()
+            _sk.settimeout(120.0)
+            try:
+                _sk.connect((RPI_HOST, RPI_PORT))
+                _line, _buf = _rline(_sk)
+                _info = json.loads(_line)
+                _w2, _h2 = _info["width"], _info["height"]
+                print(f"  [A] 解像度: {_w2}x{_h2}")
+
+                _sk.sendall(b"CALIB\n")
+                print("  [A] CALIB送信 - クリック待ち...")
+
+                _line, _ = _rline(_sk, _buf)
+                _pts = json.loads(_line)["calib_pts"]
+                print(f"  [A] {len(_pts)}点受信: {_pts}")
+            except Exception as e:
+                print(f"  [FAIL] CALIB失敗: {e}")
+            finally:
+                _sk.close()
+
+            # ── B: solvePnP ─────────────────────────────────────
+            _cam2_ready = False
+            if _pts and len(_pts) == 5:
+                K2    = np.array([[_w2, 0, _w2/2],
+                                  [0, _w2, _h2/2],
+                                  [0,   0,     1]], dtype=np.float32)
+                _p2d  = np.array(_pts, dtype=np.float32)
+                _ok, _rv, _tv = cv2.solvePnP(
+                    FIELD_POINTS, _p2d, K2, None, flags=cv2.SOLVEPNP_EPNP)
+                if _ok:
+                    R2, _  = cv2.Rodrigues(_rv)
+                    tvec2  = _tv
+                    _cp    = -R2.T.dot(tvec2)
+                    print(f"  [B] solvePnP: "
+                          f"X={_cp[0,0]:.2f} Y={_cp[1,0]:.2f} Z={_cp[2,0]:.2f}m")
+                    _cam2_ready = True
+                else:
+                    print("  [FAIL] solvePnP失敗 → ダミー")
+                    K2, R2, tvec2 = dummy_calib("Camera2", [8, -8, 2])
+            else:
+                print("  [FAIL] 点データ不正 → ダミー")
+                K2, R2, tvec2 = dummy_calib("Camera2", [8, -8, 2])
+
+            # ── C: STREAM接続 → cam2 を本物に差し替え ────────────
+            if _cam2_ready:
+                time.sleep(0.3)
+                print("  [C] STREAM接続中...")
+                _sk2 = _s.socket()
+                _sk2.settimeout(5.0)
+                try:
+                    _sk2.connect((RPI_HOST, RPI_PORT))
+                    _line2, _buf2 = _rline(_sk2)
+                    print(f"  [C] サーバー応答: {json.loads(_line2)}")
+                    _sk2.sendall(b"STREAM\n")
+                    _sk2.settimeout(1.0)
+
+                    # RemoteCamera にソケットを直接セット
+                    real_cam2        = RemoteCamera(RPI_HOST, RPI_PORT, label="Camera2")
+                    real_cam2.sock   = _sk2
+                    real_cam2.buf    = _buf2          # 文字列バッファ
+                    real_cam2.width  = _w2
+                    real_cam2.height = _h2
+                    cam2 = real_cam2                  # ★ スタブを本物に差し替え
+                    print("  [C] Camera2 ストリーム開始!")
+
+                except Exception as e:
+                    print(f"  [FAIL] STREAM接続失敗: {e}")
+                    _sk2.close()
+                    K2, R2, tvec2 = dummy_calib("Camera2", [8, -8, 2])
+
         else:
             K2, R2, tvec2 = dummy_calib("Camera2", [8, -8, 2])
 

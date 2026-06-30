@@ -19,15 +19,16 @@ class RemoteCamera:
         """
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
-        self.sock.settimeout(1.0)
+        self.sock.settimeout(2.0)
 
         # 解像度情報を受信
         info = self._readline()
         d = json.loads(info)
         self.width, self.height = d["width"], d["height"]
 
-        # モードをサーバーに通知
+        # ★ モードをサーバーに送信（必須）
         self.sock.sendall(f"{mode}\n".encode())
+        self.sock.settimeout(1.0)   # 通常通信用に戻す
         print(f"[{self.label}] 接続完了: {self.width}x{self.height} (mode={mode})")
 
     # ── キャリブレーション専用クラスメソッド ────────────────────
