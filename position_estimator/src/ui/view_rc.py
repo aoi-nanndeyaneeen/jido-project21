@@ -45,30 +45,29 @@ class ViewRC:
                  (self.W // 2, 50), (self.W // 2, self.H - 10),
                  self._DIVIDER, 1)
 
-        # 左スティック: Yaw(X) × Throttle(Y)
-        # Throttle 0~1 を -1~1 に変換して表示
+        # 左スティック: Yaw(X) × Pitch(Y)
         self._stick(img,
                     cx=self._LX, cy=self._CY, r=self._R,
                     sx=cmd.yaw,
-                    sy=cmd.throttle * 2.0 - 1.0,
+                    sy=cmd.pitch,
                     title="LEFT  STICK",
                     x_name="YAW",
                     x_val=cmd.yaw,
-                    y_name="THROTTLE",
-                    y_val=cmd.throttle,
-                    y_str=f"{cmd.throttle * 100:.0f} %")
-
-        # 右スティック: Roll(X) × Pitch(Y)
-        self._stick(img,
-                    cx=self._RX, cy=self._CY, r=self._R,
-                    sx=cmd.roll,
-                    sy=cmd.pitch,
-                    title="RIGHT STICK",
-                    x_name="ROLL",
-                    x_val=cmd.roll,
                     y_name="PITCH",
                     y_val=cmd.pitch,
                     y_str=f"{cmd.pitch:+.3f}")
+
+        # 右スティック: Roll(X) × Throttle(Y)
+        self._stick(img,
+                    cx=self._RX, cy=self._CY, r=self._R,
+                    sx=cmd.roll,
+                    sy=cmd.throttle * 2.0 - 1.0,
+                    title="RIGHT STICK",
+                    x_name="ROLL",
+                    x_val=cmd.roll,
+                    y_name="THROTTLE",
+                    y_val=cmd.throttle,
+                    y_str=f"{cmd.throttle * 100:.0f} %")
 
         return img
 

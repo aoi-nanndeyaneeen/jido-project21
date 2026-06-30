@@ -1,3 +1,9 @@
+import ctypes
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    pass
+
 import cv2
 import numpy as np
 import threading
@@ -24,6 +30,7 @@ from core.geometry import accel_to_angles
 from collections import deque
 from core.autopilot import SquarePatrol, RCCommand
 from ui.view_rc     import ViewRC     
+from utils.calib_store import save_calibration, load_calibration, ask_use_saved
 
 # ── オプション: シリアル通信 ─────────────────────────────
 if SERIAL_ENABLED:
@@ -284,14 +291,56 @@ def main():
 
     try:
         # Camera1
-        if cam1_ok:
+        if cam1_ok and ask_use_saved("Camera1"):
+            saved = load_calibration("Camera1")
+            K1, R1, tvec1 = saved["K"], saved["R"], saved["tvec"]
+            print("  [Camera1] 保存済みデータを使用")
+        elif cam1_ok:
             print("\n  ─── Camera1 キャリブレーション ───")
             K1, R1, tvec1 = run_calibration_single(cam1, "Camera1")
+            save_calibration("Camera1", K1, R1, tvec1)
         else:
             K1, R1, tvec1 = dummy_calib("Camera1", [-8, -8, 2])
 
         # ── Camera2（test_cam2.py と同じフローを main.py に統合） ──
-        if cam2_ok_rpi:
+        if cam2_ok_rpi and ask_use_saved("Camera2"):
+            saved = load_calibration("Camera2")
+            K2, R2, tvec2 = saved["K"], saved["R"], saved["tvec"]
+            _w2 = saved["width"] or 1280
+            _h2 = saved["height"] or 720
+            print("  [Camera2] 保存済みデータを使用 → STREAM接続のみ実施")
+
+            _cam2_ready = False
+            for _attempt in range(5):
+                try:
+                    _sk2 = socket.socket()
+                    _sk2.settimeout(5.0)
+                    _sk2.connect((RPI_HOST, RPI_PORT))
+                    def _rline2(sock, buf=""):
+                        while "\n" not in buf:
+                            buf += sock.recv(4096).decode()
+                        line, rest = buf.split("\n", 1)
+                        return line, rest
+                    _line2, _buf2 = _rline2(_sk2)
+                    _info2 = json.loads(_line2)
+                    _sk2.sendall(b"STREAM\n")
+                    _sk2.settimeout(1.0)
+                    real_cam2 = RemoteCamera(RPI_HOST, RPI_PORT, label="Camera2")
+                    real_cam2.sock, real_cam2.buf = _sk2, _buf2
+                    real_cam2.width  = _info2["width"]
+                    real_cam2.height = _info2["height"]
+                    cam2 = real_cam2
+                    _cam2_ready = True
+                    print("  [Camera2] STREAM接続成功")
+                    break
+                except Exception as e:
+                    print(f"  [Camera2] 接続試行{_attempt+1}/5失敗: {e}")
+                    time.sleep(1.0)
+            if not _cam2_ready:
+                print("  [WARN] Camera2 接続失敗 → ダミーで続行")
+                K2, R2, tvec2 = dummy_calib("Camera2", [8, -8, 2])
+
+        elif cam2_ok_rpi:
             import socket as _s
 
             def _rline(sock, buf=""):
@@ -340,6 +389,7 @@ def main():
                 if _ok:
                     R2, _  = cv2.Rodrigues(_rv)
                     tvec2  = _tv
+                    save_calibration("Camera2", K2, R2, tvec2, _pts, _w2, _h2)   
                     _cp    = -R2.T.dot(tvec2)
                     print(f"  [B] solvePnP: "
                           f"X={_cp[0,0]:.2f} Y={_cp[1,0]:.2f} Z={_cp[2,0]:.2f}m")
