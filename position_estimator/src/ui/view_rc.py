@@ -87,7 +87,7 @@ class ViewRC:
 
         # ── スティック位置（円外クランプ） ──────────────────
         raw_dx = sx * r
-        raw_dy = -sy * r   # 画面Y軸反転
+        raw_dy = sy * r   # 画面Y軸反転
         length = np.hypot(raw_dx, raw_dy)
         if length > r:
             raw_dx = raw_dx / length * r

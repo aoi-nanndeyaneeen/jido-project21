@@ -6,6 +6,7 @@ SEND_PREVIEW   = True
 PREVIEW_SCALE  = 0.5
 TARGET_WIDTH   = 1280
 TARGET_HEIGHT  = 720
+TARGET_FPS     = 60   # config.py の CAMERA_FPS と合わせること
 
 # --- 差分パラメータ（config.py の値と合わせること） ---
 DIFF_THRESHOLD = 15
@@ -209,13 +210,16 @@ def main():
     cap = cv2.VideoCapture(CAMERA_ID)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  TARGET_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, TARGET_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS,          TARGET_FPS)
 
     ret, frame = cap.read()
     if not ret:
         print("[RPi] カメラ起動失敗")
         return
     h, w = frame.shape[:2]
-    print(f"[RPi Camera] {w}x{h}  ポート {PORT} で待機中...")
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"[RPi Camera] {w}x{h}@{actual_fps:.1f}fps (要求{TARGET_FPS}fps)  "
+          f"ポート {PORT} で待機中...")
 
     use_display = init_local_display(cap)
     if use_display:
