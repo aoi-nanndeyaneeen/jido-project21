@@ -197,7 +197,13 @@ def camera_thread_func(cam1, cam2,
                 # ── ログ記録（ダミーモード中は記録しない） ────────
                 if not in_dummy_mode:
                     current_z = float(P_vec[2]) if P_vec is not None else 0.0
-                    log.write(P_vec, current_z, 0.0, 0.0, 0.0, 0.0)
+                    log.write(
+                        P_vec, current_z,
+                        residual if residual is not None else -1.0,
+                        uv1_raw is not None,
+                        uv2_raw is not None,
+                        jump_rejected
+                    )
                 else:
                     current_z = float(P_vec[2]) if P_vec is not None else 0.0
 
