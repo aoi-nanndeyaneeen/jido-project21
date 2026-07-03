@@ -96,8 +96,8 @@ class ViewVelocity:
                     arrowprops=dict(arrowstyle='->', color='#E24B4A', lw=2.5),
                     zorder=6)
 
-        ax.set_xlim(-12, 12)
-        ax.set_ylim(-12, 12)
+        ax.set_xlim(-15, 15)
+        ax.set_ylim(-15, 15)
         ax.set_aspect('equal')
         ax.set_title('Top view (XY)', fontsize=10)
         ax.set_xlabel('X [m]', fontsize=8)

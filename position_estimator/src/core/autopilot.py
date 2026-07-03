@@ -8,12 +8,21 @@ autopilot.py
 
 RCCommand の throttle/pitch/roll/yaw は -1.0〜1.0（throttleは0〜1）に
 正規化し、呼び出し元で PWM 変換する。
+
+ログ:
+    update() を呼ぶたびに、目標値・現在位置・実際に送信したRCコマンドを
+    自動でCSVに記録する（autopilot_YYYYMMDD_HHMMSS.csv）。
+    tracker.py 側のログとは別ファイルになるが、Time列で後から突き合わせ可能。
+    dummyモード中は呼び出し側で is_dummy=True を渡すことでログを止められる。
 """
 
+import csv
 import math
 import time
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
+from datetime import datetime
 
 
 # ── データ型 ───────────────────────────────────────────────────
@@ -29,6 +38,62 @@ class RCCommand:
                 f"pit={self.pitch:.2f} "
                 f"rol={self.roll:.2f} "
                 f"yaw={self.yaw:.2f}")
+
+
+# ── ログ記録 ───────────────────────────────────────────────────
+class AutopilotLogger:
+    """
+    autopilot の入出力を CSV に記録する。
+
+    列構成:
+        Time, WP_idx, Heading(deg),
+        Pos_X(m), Pos_Y(m), Pos_Z(m),
+        Vel_X(m/s), Vel_Y(m/s),
+        Target_X(m), Target_Y(m), Target_Z(m),
+        Cmd_Throttle, Cmd_Pitch, Cmd_Roll, Cmd_Yaw
+    """
+
+    HEADER = [
+        "Time", "WP_idx", "Heading(deg)",
+        "Pos_X(m)", "Pos_Y(m)", "Pos_Z(m)",
+        "Vel_X(m/s)", "Vel_Y(m/s)",
+        "Target_X(m)", "Target_Y(m)", "Target_Z(m)",
+        "Cmd_Throttle", "Cmd_Pitch", "Cmd_Roll", "Cmd_Yaw",
+    ]
+
+    def __init__(self, log_dir: str = "logs", prefix: str = "autopilot"):
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = Path(log_dir) / f"{prefix}_{ts}.csv"
+
+        self._file = open(self.path, "w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(self.HEADER)
+
+        print(f"[AutopilotLogger] 記録開始: {self.path}")
+
+    def write(self,
+              wp_idx: int,
+              heading_rad: float,
+              pos: np.ndarray,
+              vel: np.ndarray,
+              target: tuple,
+              cmd: RCCommand):
+        row = [
+            datetime.now().isoformat(timespec="milliseconds"),
+            wp_idx,
+            f"{math.degrees(heading_rad):.2f}",
+            f"{float(pos[0]):.4f}", f"{float(pos[1]):.4f}", f"{float(pos[2]):.4f}",
+            f"{float(vel[0]):.4f}", f"{float(vel[1]):.4f}",
+            f"{target[0]:.4f}", f"{target[1]:.4f}", f"{target[2]:.4f}",
+            f"{cmd.throttle:.4f}", f"{cmd.pitch:.4f}",
+            f"{cmd.roll:.4f}", f"{cmd.yaw:.4f}",
+        ]
+        self._writer.writerow(row)
+
+    def close(self):
+        self._file.close()
+        print(f"[AutopilotLogger] 記録終了: {self.path}")
 
 
 # ── PID コントローラ ───────────────────────────────────────────
@@ -78,7 +143,11 @@ class SquarePatrol:
     KP_H, KI_H, KD_H = 0.40, 0.01, 0.10   # 水平（前後/左右共通）
     KP_Z, KI_Z, KD_Z = 0.80, 0.05, 0.20   # 高度
 
-    def __init__(self, start_x: float = 0.0, start_y: float = 0.0):
+    def __init__(self,
+                 start_x: float = 0.0,
+                 start_y: float = 0.0,
+                 enable_logging: bool = True,
+                 log_dir: str = "logs"):
         L = self.SIDE_LEN
         x0, y0, z = start_x, start_y, self.ALTITUDE
         self.waypoints = [
@@ -94,6 +163,8 @@ class SquarePatrol:
         self.pid_right = PID(self.KP_H, self.KI_H, self.KD_H, limit=0.6)
         self.pid_z     = PID(self.KP_Z, self.KI_Z, self.KD_Z, limit=0.5)
 
+        self.logger = AutopilotLogger(log_dir=log_dir) if enable_logging else None
+
         print(f"[SquarePatrol] ウェイポイント:")
         for i, wp in enumerate(self.waypoints):
             print(f"  WP{i}: ({wp[0]:.1f}, {wp[1]:.1f}, {wp[2]:.1f})")
@@ -103,13 +174,16 @@ class SquarePatrol:
                pos: np.ndarray,
                vel: np.ndarray,
                dt: float,
-               heading_rad: float | None = None) -> RCCommand:
+               heading_rad: float | None = None,
+               is_dummy: bool = False) -> RCCommand:
         """
         Args:
             pos         : 現在位置 [x, y, z] (m)
             vel         : 現在速度 [vx, vy, vz] (m/s)
             dt          : 前回呼び出しからの経過時間 (s)
             heading_rad : 機首方向 (rad)。None なら速度ベクトルから推定。
+            is_dummy    : True の場合、このフレームはログに記録しない
+                          （tracker.py が dummy フォールバック中のとき呼び出し側から渡す）
         Returns:
             RCCommand
         """
@@ -154,12 +228,28 @@ class SquarePatrol:
         cmd.throttle = self.HOVER_THROTTLE + self.pid_z.update(dz, dt)
         cmd.throttle = max(0.0, min(1.0, cmd.throttle))
 
+        # ── ログ記録 ──────────────────────────────────────────
+        if self.logger is not None and not is_dummy:
+            self.logger.write(
+                wp_idx=self.wp_idx,
+                heading_rad=self.heading,
+                pos=pos,
+                vel=vel,
+                target=(tx, ty, tz),
+                cmd=cmd,
+            )
+
         return cmd
 
     # ── 現在の目標ウェイポイント ──────────────────────────────
     @property
     def target(self) -> tuple:
         return self.waypoints[self.wp_idx]
+
+    def close(self):
+        """終了時に呼ぶ（ログファイルをきちんと閉じる）"""
+        if self.logger is not None:
+            self.logger.close()
 
     def _reset_pids(self):
         for pid in [self.pid_fwd, self.pid_right, self.pid_z]:

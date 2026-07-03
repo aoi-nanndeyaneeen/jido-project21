@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from utils.config import DIFF_THRESHOLD, MIN_AREA_PX, BLUR_KERNEL, MORPH_KERNEL
+from utils.config import DIFF_THRESHOLD, MIN_AREA_PX, BLUR_KERNEL, MORPH_KERNEL, CAMERA_FPS
 
 
 class CameraTracker:
@@ -13,6 +13,7 @@ class CameraTracker:
             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            self.cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         else:
             self.cap = cv2.VideoCapture(camera_url)
@@ -20,7 +21,9 @@ class CameraTracker:
 
         actual_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
         actual_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        print(f"[{label}] 初期化完了: 要求 {width}x{height} -> 実際 {int(actual_w)} x {int(actual_h)}")
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        print(f"[{label}] 初期化完了: 要求 {width}x{height}@{CAMERA_FPS}fps "
+              f"-> 実際 {int(actual_w)}x{int(actual_h)}@{actual_fps:.1f}fps")
 
         self.width  = int(actual_w) if actual_w > 0 else width
         self.height = int(actual_h) if actual_h > 0 else height
@@ -53,15 +56,12 @@ class CameraTracker:
         center_uv = None
 
         if self.prev_gray is None:
-            # 初回フレーム：背景として保存
             self.prev_gray = gray_blurred
         else:
-            # ── フレーム差分（camera_server.py と同じ方式） ────
             diff = cv2.absdiff(self.prev_gray, gray_blurred)
             _, thresh = cv2.threshold(
                 diff, self.diff_threshold, 255, cv2.THRESH_BINARY
             )
-            # MORPH_OPEN = 収縮→膨張（小ノイズ除去、大ブロブ保持）
             thresh = cv2.morphologyEx(
                 thresh, cv2.MORPH_OPEN, self._morph_kernel
             )
@@ -83,7 +83,6 @@ class CameraTracker:
                         cv2.putText(frame, f"({cx},{cy})", (cx+10, cy-10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            # 前フレームを更新（単純入れ替え。加重平均なし）
             self.prev_gray = gray_blurred
 
         cv2.putText(frame, self.label, (10, 30),
