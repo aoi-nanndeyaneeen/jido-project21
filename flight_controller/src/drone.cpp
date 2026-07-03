@@ -41,7 +41,7 @@ namespace T = Config::Timing;
 // kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle
 //  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(0.03f, 0.0f, 0.0000005f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f,
+Axis_value Roll(0.0095, 0.0f, 0.000000f, 0.0f, 0.0f, 0.0f, 1.0f, 0.7f, 0.0f, 0.0f,
                 0.0f),
     Pitch(0.01f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
     Yaw(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
@@ -51,12 +51,12 @@ unsigned long TURN_MS = 4000UL;  // 8 of 8 or a single trip time [ms]
 float RUDDER_COORD = 0.66;       // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
 
 IMU mpu(&Wire);
-BarometerSensor barometer(1013.25, 0.1, &Wire);
+BarometerSensor barometer(1013.25, 0.1, &Wire);  // 海面気圧1013.25hPa, α=0.1
 // EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA);
 // // 停止中 (搭載無し)
 
-Sbus sbus(&Serial6);
-FlightTelemetry telemetry(&Serial3);
+Sbus sbus(&Serial2);
+FlightTelemetry telemetry(&Serial5);
 
 Flight_mode Mode;
 
@@ -102,10 +102,10 @@ void setup() {
   if (USE_SERVO) {
     Serial.println("Init Actuators...");
 
-    motor1.set_pin(9).set_minPWM(1000).set_maxPWM(2000).begin();
-    motor2.set_pin(28).set_minPWM(1000).set_maxPWM(2000).begin();
-    motor3.set_pin(11).set_minPWM(1000).set_maxPWM(2000).begin();
-    motor4.set_pin(10).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor1.set_pin(0).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor2.set_pin(1).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor3.set_pin(2).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor4.set_pin(3).set_minPWM(1000).set_maxPWM(2000).begin();
   }
 
   if (USE_IM920) {
@@ -166,10 +166,10 @@ void loop() {
     // 4) スロットル出力 (ONの場合のみ)
     if (USE_SERVO) {
       if (sbus.isSafe()) {
-        motor1.write(sbus.des[Ch::THR] - Pitch.cmd + Yaw.cmd);
+        motor1.write(sbus.des[Ch::THR] + Pitch.cmd + Yaw.cmd);
         motor2.write(sbus.des[Ch::THR] - Roll.cmd - Yaw.cmd);
         motor3.write(sbus.des[Ch::THR] + Roll.cmd + Yaw.cmd);
-        motor4.write(sbus.des[Ch::THR] + Pitch.cmd - Yaw.cmd);
+        motor4.write(sbus.des[Ch::THR] - Pitch.cmd - Yaw.cmd);
       } else {
         motor1.write(0);
         motor2.write(0);
