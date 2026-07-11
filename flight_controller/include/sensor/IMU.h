@@ -24,7 +24,10 @@ public:
         // --- スケール強制設定 MPU6050 (±2g / ±250dps) ---
         wire->beginTransmission(0x68); wire->write(0x1C); wire->write(0x00); wire->endTransmission(); // Accel ±2g
         wire->beginTransmission(0x68); wire->write(0x1B); wire->write(0x00); wire->endTransmission(); // Gyro ±250dps
-
+        
+        // ★ここを追加：DLPF (Digital Low Pass Filter) を42Hzに設定
+        wire->beginTransmission(0x68); wire->write(0x1A); wire->write(0x03); wire->endTransmission();
+        
         filter.begin(Config::Timing::MAIN_Hz);
     }
 

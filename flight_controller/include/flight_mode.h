@@ -1,46 +1,33 @@
-// 制御、演算系
 #pragma once
-#include "Config.h" // dt などを使うために必要
+#include "Config.h"
 #include <Arduino.h>
 
 class Flight_mode {
 private:
-    FlightMode currentMode = MODE_MANUAL; // 初期モードをMANUALに変更
-    FlightMode prevMode = MODE_MANUAL;    // モード変化検出用
+    FlightMode currentMode = MODE_MANUAL;
+    FlightMode prevMode = MODE_MANUAL;
 public:
-
     unsigned long modeStartMs = 0;
-    
-    // main.cpp から Mode.update(Aux2, Aux3) として呼ばれる
-    void update(Sw switch_Turn, Sw switch_Fig8) {
-        // ============================================================
-        //  モード判定 (独立スイッチ版)
-        // ============================================================
-        // 優先度: 水平飛行 > 水平旋回 > マニュアル(基本モード)
-        if (switch_Fig8 == up) {
-            currentMode = MODE_LEVEL_FLIGHT; // Aux3 が上なら水平飛行
-        }
-        else if (switch_Turn == up) {
-            currentMode = MODE_LEVEL_TURN;   // Aux2 が上なら水平旋回
-        }
-        else if(switch_Fig8 == cen && switch_Turn == cen){
-            currentMode = MODE_SEMI_MANUAL; // どちらもセンターならセミマニュアル
-        }
-        else {
-            currentMode = MODE_MANUAL;     // どちらもオフならマニュアル
+
+    // 優先度: 水平飛行 > 水平旋回 > ホバリング(セミマニュアル) > マニュアル
+    void update(Sw sw_turn, Sw sw_level, Sw sw_hover) {
+        if (sw_level == up) {
+            currentMode = MODE_LEVEL_FLIGHT;
+        } else if (sw_turn == up) {
+            currentMode = MODE_LEVEL_TURN;
+        } else if (sw_hover == up) {
+            currentMode = MODE_SEMI_MANUAL;
+        } else {
+            currentMode = MODE_MANUAL;
         }
     }
 
-    bool change(){
+    bool change() {
         if (currentMode == prevMode) return false;
-        else{
-            prevMode = currentMode;
-            return true;
-        }
+        prevMode = currentMode;
+        return true;
     }
 
-    void set_mode(FlightMode mode){
-        currentMode = mode;
-    }
-    FlightMode get_mode() {return currentMode;}
+    void set_mode(FlightMode mode) { currentMode = mode; }
+    FlightMode get_mode() { return currentMode; }
 };

@@ -103,7 +103,7 @@ public:
     // ★修正：引数なし版からも static と重複カウントを削除
     void update_RateAnglePID(){
         loop_counter++;
-        if(loop_counter >= 10){// 1000Hz / 10 = 100Hz
+        if(loop_counter >= 5){// 1000Hz / 5 = 200Hz
             pid_ang_out = c_ang.pidStep(ang, tar, Sen);
             loop_counter = 0;
         }  

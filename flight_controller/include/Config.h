@@ -38,14 +38,19 @@ constexpr int GROUND_DATA_NUM = 6;
 enum Sw { up, cen, down };
 
 enum Ch {
-    ROLL, PITCH, THR, YAW, Aux1, Aux2, THR_CUT, Aux3, Aux4, Aux5
+    ROLL, PITCH, THR, YAW,   // ch1-4
+    SW_TURN,                 // ch5  左旋回スイッチ
+    SW_LEVEL,                // ch6  水平飛行スイッチ
+    THR_CUT,                 // ch7  スロットルカット
+    SW_HOVER,                // ch8  ホバリング(セミマニュアル)スイッチ
+    SPARE1, SPARE2           // ch9,10 未使用
 };
 
 enum FlightMode : uint8_t {
-    MODE_MANUAL      = 0,  // プロポ直接操作
-    MODE_LEVEL_TURN  = 1,  // 自動水平旋回
-    MODE_LEVEL_FLIGHT= 2,  // 水平飛行
-    MODE_SEMI_MANUAL = 3,  //4にするな範囲外アクセスになる
+    MODE_MANUAL      = 0,  // 電波途絶時の自動フェイルセーフ：プロペラ停止（最も安全）
+    MODE_LEVEL_TURN  = 1,  // 固定バンク角(BANK_ANGLE)で左旋回
+    MODE_LEVEL_FLIGHT = 2, // スティック入力に応じた角度で水平直進
+    MODE_SEMI_MANUAL = 3,  // スティック入力=目標角度としてPID直結（デフォルト状態）
 };
 
 

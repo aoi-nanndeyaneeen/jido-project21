@@ -37,6 +37,29 @@ void Flap_Servo::write(Sw input){
     );
 }
 
-void motor::write(float input){
-    if(is_ready()) _servo.writeMicroseconds(input*(_maxPWM - _minPWM) + _minPWM);
+// ============================================================
+// motorクラス - Teensyハードウェアタイマーを使った400Hz Fast PWM
+// ============================================================
+void motor::begin() {
+    if(_pin == -1) return;
+    pinMode(_pin, OUTPUT);
+    
+    // TeensyのハードウェアPWM設定
+    analogWriteResolution(12);       // 12-bit分解能 (0-4095)
+    analogWriteFrequency(_pin, 400); // PWM周波数を400Hzに設定
+    
+    write(0.0f); // 初期化 (スロットル0のパルスを出力)
+    _built = true;
+}
+
+void motor::write(float input) {
+    if(!is_ready()) return;
+    
+    // inputは 0.0(スロットル0) ~ 1.0(フルスロットル) を想定
+    input = constrain(input, 0.0f, 1.0f);
+    
+    // 1000us ~ 2000us の幅を 12-bit (0-4095) の 1638 ~ 3277 にマッピング
+    int pwm_val = 1638 + (int)(input * (3277 - 1638));
+    
+    analogWrite(_pin, pwm_val);
 }

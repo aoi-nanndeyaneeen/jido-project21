@@ -41,22 +41,26 @@ namespace T = Config::Timing;
 // kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle
 //  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(0.0095, 0.0f, 0.000000f, 0.0f, 0.0f, 0.0f, 1.0f, 0.7f, 0.0f, 0.0f,
-                0.0f),
-    Pitch(0.01f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
-    Yaw(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
+Axis_value Roll(0.003f, 0.00f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.7f, 0.0f, 0.5f,
+                0.0f),//angleをなくすときは291行目からの場所の、RateAnglePIDをRatePIDに変える
+                // 0.3f, 0.0f, 0.01f, 0.00f, 0.0f, 0.0f, 1.0f, 0.7f, 0.0f, 0.0f, 0.0f),(pを感じた)
+                //0.6f, 0.00f, 0.003f, 10.0f, 0.0f, 0.2f, 1.0f, 0.7f, 0.0f, 0.5f,0.0f,(水平に戻ろうとする、うれしい)
+    Pitch(0.0f, 0.0f, 0.01f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
+    Yaw(0.001f, 0.0f, 0.01f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
 
 float BANK_ANGLE = 25.0f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
 unsigned long TURN_MS = 4000UL;  // 8 of 8 or a single trip time [ms]
 float RUDDER_COORD = 0.66;       // 協調ラダー量 [0.0~1.0]  1.0=全開, 0.0=なし
+float LEVEL_PITCH_ANGLE = 10.0f; // LEVEL_FLIGHTで前傾する固定角度 [deg] ← 要調整、控えめから
+float MAX_ANGLE_CMD = 30.0f;     // SEMI_MANUAL(ホバリング)でスティック全開時の目標角度 [deg]
 
 IMU mpu(&Wire);
 BarometerSensor barometer(1013.25, 0.1, &Wire);  // 海面気圧1013.25hPa, α=0.1
 // EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA);
 // // 停止中 (搭載無し)
 
-Sbus sbus(&Serial2);
-FlightTelemetry telemetry(&Serial5);
+Sbus sbus(&Serial5);
+FlightTelemetry telemetry(&Serial2);
 
 Flight_mode Mode;
 
@@ -102,10 +106,10 @@ void setup() {
   if (USE_SERVO) {
     Serial.println("Init Actuators...");
 
-    motor1.set_pin(0).set_minPWM(1000).set_maxPWM(2000).begin();
-    motor2.set_pin(1).set_minPWM(1000).set_maxPWM(2000).begin();
-    motor3.set_pin(2).set_minPWM(1000).set_maxPWM(2000).begin();
-    motor4.set_pin(3).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor1.set_pin(17).set_minPWM(1000).set_maxPWM(2000).begin();//1175,125
+    motor2.set_pin(16).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor3.set_pin(15).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor4.set_pin(14).set_minPWM(1000).set_maxPWM(2000).begin();
   }
 
   if (USE_IM920) {
@@ -165,11 +169,11 @@ void loop() {
 
     // 4) スロットル出力 (ONの場合のみ)
     if (USE_SERVO) {
-      if (sbus.isSafe()) {
-        motor1.write(sbus.des[Ch::THR] + Pitch.cmd + Yaw.cmd);
-        motor2.write(sbus.des[Ch::THR] - Roll.cmd - Yaw.cmd);
-        motor3.write(sbus.des[Ch::THR] + Roll.cmd + Yaw.cmd);
-        motor4.write(sbus.des[Ch::THR] - Pitch.cmd - Yaw.cmd);
+      if (sbus.isSafe()&&sbus.Ch_state(THR_CUT)==down) {  // スロットルカットがOFFの時のみ出力
+        motor1.write(sbus.des[Ch::THR] + (sbus.des[Ch::THR]>0.1f ? constrain(-Pitch.cmd + Yaw.cmd, -0.1f, 0.1f) : 0));
+        motor2.write(sbus.des[Ch::THR] - (sbus.des[Ch::THR]>0.1f ? constrain(-Roll.cmd + Yaw.cmd, -0.1f, 0.1f) : 0));
+        motor3.write(sbus.des[Ch::THR] + (sbus.des[Ch::THR]>0.1f ? constrain(-Roll.cmd + Yaw.cmd, -0.1f, 0.1f) : 0));
+        motor4.write(sbus.des[Ch::THR] - (sbus.des[Ch::THR]>0.1f ? constrain(-Pitch.cmd + Yaw.cmd, -0.1f, 0.1f) : 0));
       } else {
         motor1.write(0);
         motor2.write(0);
@@ -201,10 +205,13 @@ void loop() {
         print_MPU(Roll.ang, Pitch.ang, Yaw.ang, Roll.gyr, Pitch.gyr, Yaw.gyr);
       if (USE_SBUS)
         print_sbus(sbus.des[Ch::ROLL], sbus.des[Ch::PITCH], sbus.des[Ch::THR],
-                   sbus.des[Ch::YAW], sbus.des[Ch::Aux1], sbus.des[Ch::Aux2],
-                   sbus.des[Ch::Aux3]);
+             sbus.des[Ch::YAW], sbus.des[Ch::SW_TURN], sbus.des[Ch::SW_LEVEL],
+             sbus.des[Ch::SW_HOVER]);
       if (USE_BARO) Serial.printf("Alt: %+7.2f m\n", fused_alt);
       print_timing(T::Main_dt);
+
+      // デバッグ用に一時的に追加
+      Serial.printf("\n cmd=%+.4f\n", Roll.cmd);
     }
   }
 }
@@ -215,7 +222,7 @@ void loop() {
 void updateSensorsAndComms() {
   mpu.update();
   sbus.update();
-  Mode.update(cen, cen);
+  Mode.update(sbus.Ch_state(SW_TURN), sbus.Ch_state(SW_LEVEL), sbus.Ch_state(SW_HOVER));
 
   Roll.update_value(sbus.des[Ch::ROLL], mpu.getPitch(), mpu.getAccY(),
                     mpu.getGyroY());
@@ -267,61 +274,58 @@ void autonomousControl() {
 
   // --- 🟢 電波がある場合（ここから下は元のコードそのまま） ---
   switch (Mode.get_mode()) {
-    case MODE_LEVEL_TURN:
-      // ★ 左旋回にしたい場合は -BANK_ANGLE にする
-      Roll.tar = +BANK_ANGLE;
+    case MODE_LEVEL_TURN: {
+      // 左旋回: 固定バンク角。ラダー協調は下の共通ブロックで自動適用される
+      Roll.tar = -BANK_ANGLE;  // マイナスで左旋回
       break;
+    }
 
     case MODE_LEVEL_FLIGHT: {
+      // 固定角度で前傾しながら直進。スティックは無視する
       Roll.tar = 0.0f;
+      Pitch.tar = LEVEL_PITCH_ANGLE;
       break;
     }
 
     case MODE_SEMI_MANUAL: {
-      // ============================================================
-      //  マニュアル制御: スティック → レートPID → サーボ
-      // ============================================================
-      Roll.tar = Roll.sbus;
-      Pitch.tar = Pitch.sbus;
-      Yaw.tar = Yaw.sbus;
+      // ホバリング: スティック入力を目標角度としてPID制御
+      // Yawはここではスティック直接(角度PIDを介さない)なので早期return
+      Roll.tar  = Roll.sbus  * MAX_ANGLE_CMD;
+      Pitch.tar = Pitch.sbus * MAX_ANGLE_CMD;
       Roll.update_RatePID();
       Pitch.update_RatePID();
-      Yaw.update_RatePID();
-      return;  // ここで戻る
+      Yaw.cmd = Yaw.sbus;   // ヨーはスティックで直接レート操作
+      return;
     }
 
     case MODE_MANUAL: {
-      // SBUSが安全(通信中)ならプロポの値を、途絶しているなら0.0(ニュートラル)にする
+      // PIDなし。スティックの倒し量をそのまま出力し続ける(通常ラジコン挙動)
       if (sbus.isSafe()) {
-        Roll.cmd = Roll.sbus;
+        Roll.cmd  = Roll.sbus;
         Pitch.cmd = Pitch.sbus;
-        Yaw.cmd = Yaw.sbus;
+        Yaw.cmd   = Yaw.sbus;
       } else {
         Roll.cmd = 0.0f;
         Pitch.cmd = 0.0f;
-        Yaw.cmd = Yaw.sbus;  // トリム維持
+        Yaw.cmd = 0.0f;
       }
-      return;  // これもここで戻す
+      return;
     }
+
     default:
       break;
   }
 
-  // --- 角度外ループ + レート内ループ (Control.hのupdate_RateAnglePID使用) ---
-  //   角度PID: 100Hzで目標レートを算出 (counter%10)
-  //   レートPID: 1000Hzでサーボ指令を算出
-  //   内部.cmdの数値を勝手に、目標値からいじる
+  // --- LEVEL_TURN / LEVEL_FLIGHT 共通: 角度外ループ+レート内ループ ---
   Roll.update_RateAnglePID();
   Pitch.update_RateAnglePID();
 
-  // --- 協調ラダー: バンク方向にRUDDER_COORD量のラダーを打つ ---
-  // Config.h の RUDDER_COORD で量を調整 (1.0=全開, 0.5=半分, 0=なし)
   if (Roll.tar > 0.1f)
     Yaw.cmd = Yaw.sbus + RUDDER_COORD;
   else if (Roll.tar < -0.1f)
     Yaw.cmd = Yaw.sbus - RUDDER_COORD;
   else
-    Yaw.cmd = Yaw.sbus;  // 0固定ではなく、プロポのトリム値をベースにする
+    Yaw.cmd = Yaw.sbus;
 }
 void reset_all() {
   mpu.recalibrate();

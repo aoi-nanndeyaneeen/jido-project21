@@ -20,14 +20,15 @@ void print_MPU(float r, float p, float y, float gr, float gp, float gy) {
                   r, p, y, gr, gp, gy);
 }
 
-void print_sbus(float Roll_des, float Pitch_des, float Thr_des, float Yaw_des, float Aux1_des, float Aux2_des, float Aux3_des) {
-    Serial.printf("|ch1(ail)=%+6.2f |ch2(ele)=%+6.2f |ch3(thr)=%+6.2f |ch4(rud)=%+6.2f |Aux1(flp)=%+6.2f |Aux2(trn)=%+6.2f |Aux3(fig)=%+6.2f\n",
-                  Roll_des, Pitch_des, Thr_des, Yaw_des, Aux1_des, Aux2_des, Aux3_des);
-}
-
 void print_flightmode(int currentMode, float bankAngle, unsigned long turnMs) {
     const char* modeStr[] = {"MANUAL    ", "LEVEL_TURN ", "LEVEL_FLIGHT", "SEMI_MANUAL"};
     Serial.printf("Mode: %s  BankAngle: %+6.1f deg  TurnMs: %5lu ms\n", modeStr[currentMode], bankAngle, turnMs);
+}
+
+void print_sbus(float Roll_des, float Pitch_des, float Thr_des, float Yaw_des,
+                float SwTurn, float SwLevel, float SwHover) {
+    Serial.printf("|ch1(ail)=%+6.2f |ch2(ele)=%+6.2f |ch3(thr)=%+6.2f |ch4(rud)=%+6.2f |ch5(turn)=%+6.2f |ch6(lvl)=%+6.2f |ch8(hov)=%+6.2f\n",
+                  Roll_des, Pitch_des, Thr_des, Yaw_des, SwTurn, SwLevel, SwHover);
 }
 
 void print_ACC(float ax, float ay, float az) {

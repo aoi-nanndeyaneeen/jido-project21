@@ -52,6 +52,7 @@ public:
 class motor : public Actuator<motor> {
 private:
 public:
+    void begin();             // 親クラスのServo用begin()を上書きするために追加
     void write(float input) ;
 };
 
