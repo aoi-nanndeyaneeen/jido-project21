@@ -1,46 +1,53 @@
 import serial
 import numpy as np
 import cv2
+import time
 
-# COM番号を変更してください
-ser = serial.Serial("COM8", 115200)
+PORT = "COM8"
+BAUD = 200000000
+
+last=time.time()
+count=0
+
+ser = serial.Serial(PORT, BAUD, timeout=1)
+
+print("Connected!")
+
+SCALE = 20
 
 while True:
 
-    line = ser.readline().decode().strip()
-
-    if line != "FRAME":
-        continue
-
-    img = []
-
+    # AA55を探す
     while True:
+        b = ser.read(1)
 
-        line = ser.readline().decode().strip()
+        if not b:
+            continue
 
-        if line == "END":
-            break
+        if b[0] == 0xAA:
+            b2 = ser.read(1)
+            if b2 and b2[0] == 0x55:
+                break
 
-        img.append(int(line))
+    frame = ser.read(35*35)
 
-    if len(img) != 35*35:
+    count += 1
+
+    if time.time() - last >= 1:
+        print("FPS =", count)
+        count = 0
+        last = time.time()
+
+    if len(frame) != 35*35:
         continue
 
-    img = np.array(img, dtype=np.uint8)
-    img = img.reshape((35,35))
+    img = np.frombuffer(frame, dtype=np.uint8).reshape((35,35))
 
-    # コントラスト自動補正
-    img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+    img = cv2.normalize(img,None,0,255,cv2.NORM_MINMAX)
 
-    # 20倍拡大
-    big = cv2.resize(img,
-                     (700,700),
-                     interpolation=cv2.INTER_NEAREST)
+    img = cv2.resize(img,(700,700),interpolation=cv2.INTER_NEAREST)
 
-    cv2.imshow("PMW3901", big)
+    cv2.imshow("PMW3901",img)
 
-    if cv2.waitKey(1) == 27:
+    if cv2.waitKey(1)==27:
         break
-
-ser.close()
-cv2.destroyAllWindows()

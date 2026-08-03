@@ -1,6 +1,6 @@
 #pragma once
 #include <Arduino.h>
-#include <cmath>
+//#include <cmath>
 #include "Config.h"
 
 // フライトコントローラー(Teensy)と同等のフォーマットで出力するためのヘッダー

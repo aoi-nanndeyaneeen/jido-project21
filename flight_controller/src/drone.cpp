@@ -41,12 +41,11 @@ namespace T = Config::Timing;
 // kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle
 //  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(0.003f, 0.00f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.7f, 0.0f, 0.5f,
-                0.0f),//angleをなくすときは291行目からの場所の、RateAnglePIDをRatePIDに変える
+Axis_value Roll(5.0f, 0.0f, 0.05f, 5.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),//angleをなくすときは291行目からの場所の、RateAnglePIDをRatePIDに変える
                 // 0.3f, 0.0f, 0.01f, 0.00f, 0.0f, 0.0f, 1.0f, 0.7f, 0.0f, 0.0f, 0.0f),(pを感じた)
                 //0.6f, 0.00f, 0.003f, 10.0f, 0.0f, 0.2f, 1.0f, 0.7f, 0.0f, 0.5f,0.0f,(水平に戻ろうとする、うれしい)
-    Pitch(0.0f, 0.0f, 0.01f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f),
-    Yaw(0.001f, 0.0f, 0.01f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
+    Pitch(5.0f, 0.0f, 0.05f, 5.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),
+    Yaw(1.0f, 0.0f, 0.00f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
 
 float BANK_ANGLE = 25.0f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
 unsigned long TURN_MS = 4000UL;  // 8 of 8 or a single trip time [ms]
@@ -59,8 +58,8 @@ BarometerSensor barometer(1013.25, 0.1, &Wire);  // 海面気圧1013.25hPa, α=0
 // EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA);
 // // 停止中 (搭載無し)
 
-Sbus sbus(&Serial5);
-FlightTelemetry telemetry(&Serial2);
+Sbus sbus(&Serial2);
+FlightTelemetry telemetry(&Serial3);
 
 Flight_mode Mode;
 
@@ -106,10 +105,10 @@ void setup() {
   if (USE_SERVO) {
     Serial.println("Init Actuators...");
 
-    motor1.set_pin(17).set_minPWM(1000).set_maxPWM(2000).begin();//1175,125
-    motor2.set_pin(16).set_minPWM(1000).set_maxPWM(2000).begin();
-    motor3.set_pin(15).set_minPWM(1000).set_maxPWM(2000).begin();
-    motor4.set_pin(14).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor1.set_pin(0).set_minPWM(1000).set_maxPWM(2000).begin();//1175,125
+    motor2.set_pin(1).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor3.set_pin(2).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor4.set_pin(3).set_minPWM(1000).set_maxPWM(2000).begin();
   }
 
   if (USE_IM920) {
@@ -170,10 +169,41 @@ void loop() {
     // 4) スロットル出力 (ONの場合のみ)
     if (USE_SERVO) {
       if (sbus.isSafe()&&sbus.Ch_state(THR_CUT)==down) {  // スロットルカットがOFFの時のみ出力
-        motor1.write(sbus.des[Ch::THR] + (sbus.des[Ch::THR]>0.1f ? constrain(-Pitch.cmd + Yaw.cmd, -0.1f, 0.1f) : 0));
-        motor2.write(sbus.des[Ch::THR] - (sbus.des[Ch::THR]>0.1f ? constrain(-Roll.cmd + Yaw.cmd, -0.1f, 0.1f) : 0));
-        motor3.write(sbus.des[Ch::THR] + (sbus.des[Ch::THR]>0.1f ? constrain(-Roll.cmd + Yaw.cmd, -0.1f, 0.1f) : 0));
-        motor4.write(sbus.des[Ch::THR] - (sbus.des[Ch::THR]>0.1f ? constrain(-Pitch.cmd + Yaw.cmd, -0.1f, 0.1f) : 0));
+        const float thr_val = sbus.des[Ch::THR];
+
+        // ★ 修正: 従来は "thr>0.1f ? 補正 : 0" で、スロットルが0.1を
+        //   またいだ瞬間に補正が 0 → ±0.5 へ段差でジャンプしていた。
+        //   スティックを0付近へ戻したときに残るわずかな補正(ノイズ/D項)だけで
+        //   モーターが小刻みに動いたり止まったりする(ピクつく)原因になっていたので、
+        //   0.05〜0.15 の間でなめらかに 0%→100% へ立ち上げるようにする。
+        //   ゲインやクランプ幅(±0.5)、Roll/Pitchの組み合わせは変更していない。
+        constexpr float THR_MIX_MIN  = 0.05f;
+        constexpr float THR_MIX_FULL = 0.15f;
+        const float mix_auth = constrain(
+            (thr_val - THR_MIX_MIN) / (THR_MIX_FULL - THR_MIX_MIN), 0.0f, 1.0f);
+
+        // ★ 追加修正: 補正を常に ±0.5 固定でクランプしていたため、
+        //   thr < 0.5 のときに補正が -0.5 付近まで振れると、
+        //   motor::write() 内部の 0〜1 クランプでモーターが完全停止(0)に
+        //   強制的に叩き落とされていた。PIDが飽和/振動して補正が±0.5近くまで
+        //   振れるたびにこれが起き、モーターの停止→再始動の繰り返し
+        //   (ピクつき、再始動時の突入電流による発熱)の直接の原因になっていた。
+        //   マニュアルモードで症状が出ないのは、そこでは姿勢誤差を追いかける
+        //   フィードバックが無く、補正がこのように振動しないため。
+        //
+        //   固定 ±0.5 ではなく、「thr ± 補正 が絶対に 0 にも 1.0 にも
+        //   張り付かない」範囲まで、thr の位置に応じて補正の上限を絞る。
+        const float corr_limit = min(0.5f, min(thr_val, 1.0f - thr_val));
+
+        const float c1 = constrain(-Pitch.cmd + Roll.cmd-Yaw.cmd, -corr_limit, corr_limit) * mix_auth;
+        const float c2 = constrain( Pitch.cmd - Roll.cmd-Yaw.cmd, -corr_limit, corr_limit) * mix_auth;
+        const float c3 = constrain( Pitch.cmd + Roll.cmd+Yaw.cmd, -corr_limit, corr_limit) * mix_auth;
+        const float c4 = constrain(-Pitch.cmd - Roll.cmd+Yaw.cmd, -corr_limit, corr_limit) * mix_auth;
+
+        motor1.write(thr_val + c1);
+        motor2.write(thr_val + c2);
+        motor3.write(thr_val + c3);
+        motor4.write(thr_val + c4);
       } else {
         motor1.write(0);
         motor2.write(0);
@@ -292,9 +322,10 @@ void autonomousControl() {
       // Yawはここではスティック直接(角度PIDを介さない)なので早期return
       Roll.tar  = Roll.sbus  * MAX_ANGLE_CMD;
       Pitch.tar = Pitch.sbus * MAX_ANGLE_CMD;
-      Roll.update_RatePID();
-      Pitch.update_RatePID();
-      Yaw.cmd = Yaw.sbus;   // ヨーはスティックで直接レート操作
+      Yaw.tar   = Yaw.sbus * MAX_ANGLE_CMD;  // Yawはスティックで直接レート操作するので角度目標は0固定
+      Roll.update_RateAnglePID();
+      Pitch.update_RateAnglePID();
+      Yaw.update_RatePID();   // ヨーはスティックで直接レート操作
       return;
     }
 

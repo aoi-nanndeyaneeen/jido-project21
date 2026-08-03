@@ -8,7 +8,10 @@ class Sbus {
 private:
 
     bfs::SbusRx *_sbus;
-    bfs::SbusData _data;
+    // ★ {} を追加: SbusData は初期化子を持たない POD なので、
+    //   これが無いと最初の Read() が成功するまで failsafe / ch[] が不定値でした。
+    //   起動直後に isSafe() が不定値を読んでしまうのを防ぎます。
+    bfs::SbusData _data{};
     int i;
 
     int connection_fail;

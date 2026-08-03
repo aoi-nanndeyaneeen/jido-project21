@@ -1,39 +1,61 @@
-#include "Bitcraze_PMW3901.h"
+import serial
+import numpy as np
+import cv2
 
-Bitcraze_PMW3901 flow(10);
+PORT = "COM8"      # ←自分のCOM番号
+BAUD = 115200
 
-char frame[35 * 35];
+ser = serial.Serial(PORT, BAUD, timeout=1)
 
-void setup() {
-  Serial.begin(115200);
+print("Waiting for READY...")
 
-  while (!Serial);
+# READYが来るまで待つ
+while True:
+    line = ser.readline().decode(errors="ignore")
+    if "READY" in line:
+        break
 
-  if (!flow.begin()) {
-    Serial.println("Init Failed");
-    while (1);
-  }
+print("Connected!")
 
-  flow.enableFrameBuffer();
+SCALE = 20
 
-  Serial.println("READY");
-}
+while True:
 
-void loop() {
+    # フレーム開始マーカー(0xAA 0x55)を探す
+    while True:
+        b = ser.read(1)
+        if not b:
+            continue
 
-  flow.readFrameBuffer(frame);
+        if b[0] == 0xAA:
+            b2 = ser.read(1)
+            if b2 and b2[0] == 0x55:
+                break
 
-  // フレーム開始
-  Serial.println("FRAME");
+    # 35×35 = 1225Byte読み込む
+    frame = ser.read(35 * 35)
 
-  for (int i = 0; i < 35 * 35; i++) {
+    if len(frame) != 35 * 35:
+        continue
 
-    Serial.println((uint8_t)frame[i]);
+    img = np.frombuffer(frame, dtype=np.uint8)
+    img = img.reshape((35, 35))
 
-  }
+    # コントラスト自動調整
+    img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
 
-  // フレーム終了
-  Serial.println("END");
+    # 拡大表示
+    img = cv2.resize(
+        img,
+        (35 * SCALE, 35 * SCALE),
+        interpolation=cv2.INTER_NEAREST
+    )
 
-  delay(50);      // 約20FPS
-}
+    cv2.imshow("PMW3901", img)
+
+    key = cv2.waitKey(1)
+    if key == 27:      # ESCで終了
+        break
+
+ser.close()
+cv2.destroyAllWindows()
