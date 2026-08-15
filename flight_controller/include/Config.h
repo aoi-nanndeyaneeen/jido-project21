@@ -23,12 +23,18 @@ struct __attribute__((__packed__)) GroundData {
     float roll, pitch, yaw;    // BANK_ANGLE / TURN_MS 調整用
     uint8_t reset_cmd;         // 1: リセット
     uint8_t param_sel;         // 0=なし 1=RollRate 2=PitchRate 3=YawRate 4=RollAngle 5=PitchAngle
-    // 合計 26 bytes
+    // 地上局(position_estimator)のオートパイロットが計算したRC相当コマンド。
+    // SW_AUTOスイッチONかつ受信が新鮮なときだけ MODE_AUTONOMOUS で使用される。
+    float ap_roll, ap_pitch, ap_yaw; // -1.0〜1.0 (スティック相当)
+    float ap_throttle;                // 0.0〜1.0 ※現状は未使用(下記drone.cpp参照)
+    // 合計 42 bytes (IM920SL実効ペイロード上限60byte以内)
 
     void print() const {
         Serial.println("=== Ground Data ===");
         Serial.printf("PID: P=%.4f I=%.4f D=%.4f  sel=%d\n", p_adj, i_adj, d_adj, param_sel);
         Serial.printf("Att: Roll=%.1f Pitch=%.1f Yaw=%.1f\n", roll, pitch, yaw);
+        Serial.printf("AP : Roll=%.3f Pitch=%.3f Yaw=%.3f Thr=%.3f\n",
+                      ap_roll, ap_pitch, ap_yaw, ap_throttle);
     }
 };
 constexpr int GROUND_DATA_NUM = 6;
@@ -43,7 +49,8 @@ enum Ch {
     SW_LEVEL,                // ch6  水平飛行スイッチ
     THR_CUT,                 // ch7  スロットルカット
     SW_HOVER,                // ch8  ホバリング(セミマニュアル)スイッチ
-    SPARE1, SPARE2           // ch9,10 未使用
+    SW_AUTO,                 // ch9  地上局(自律制御)コマンド有効化スイッチ (旧SPARE1)
+    SPARE2                   // ch10 未使用
 };
 
 enum FlightMode : uint8_t {
@@ -51,6 +58,7 @@ enum FlightMode : uint8_t {
     MODE_LEVEL_TURN  = 1,  // 固定バンク角(BANK_ANGLE)で左旋回
     MODE_LEVEL_FLIGHT = 2, // スティック入力に応じた角度で水平直進
     MODE_SEMI_MANUAL = 3,  // スティック入力=目標角度としてPID直結（デフォルト状態）
+    MODE_AUTONOMOUS  = 4,  // 地上局からのRC相当コマンドで姿勢を制御（SW_AUTO ON + 受信新鮮な間のみ）
 };
 
 

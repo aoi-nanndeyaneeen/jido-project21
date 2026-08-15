@@ -21,7 +21,11 @@ void print_MPU(float r, float p, float y, float gr, float gp, float gy) {
 }
 
 void print_flightmode(int currentMode, float bankAngle, unsigned long turnMs) {
-    const char* modeStr[] = {"MANUAL    ", "LEVEL_TURN ", "LEVEL_FLIGHT", "SEMI_MANUAL"};
+    const char* modeStr[] = {"MANUAL    ", "LEVEL_TURN ", "LEVEL_FLIGHT", "SEMI_MANUAL", "AUTONOMOUS "};
+    if (currentMode < 0 || currentMode >= (int)(sizeof(modeStr) / sizeof(modeStr[0]))) {
+        Serial.printf("Mode: UNKNOWN(%d)  BankAngle: %+6.1f deg  TurnMs: %5lu ms\n", currentMode, bankAngle, turnMs);
+        return;
+    }
     Serial.printf("Mode: %s  BankAngle: %+6.1f deg  TurnMs: %5lu ms\n", modeStr[currentMode], bankAngle, turnMs);
 }
 

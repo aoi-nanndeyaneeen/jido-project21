@@ -251,3 +251,110 @@ class SquarePatrol:
     def _reset_pids(self):
         for pid in [self.pid_fwd, self.pid_right, self.pid_z]:
             pid.reset()
+
+
+# ── ホバリング（その場保持） ───────────────────────────────────
+class HoverHold:
+    """
+    生成された時点の位置（またはpos省略時は原点）でその場ホバリングを維持する。
+
+    SquarePatrol と同じ PID／ヘディング推定／ロギングの作り方を流用し、
+    update()/close() のインターフェースを揃えることで、main_loop.py 側は
+    どのモードが有効かを意識せずに autopilot オブジェクトを差し替えられる。
+    """
+
+    ALTITUDE               = SquarePatrol.ALTITUDE
+    MIN_SPEED_FOR_HEADING  = SquarePatrol.MIN_SPEED_FOR_HEADING
+    HOVER_THROTTLE         = SquarePatrol.HOVER_THROTTLE
+    KP_H, KI_H, KD_H = SquarePatrol.KP_H, SquarePatrol.KI_H, SquarePatrol.KD_H
+    KP_Z, KI_Z, KD_Z = SquarePatrol.KP_Z, SquarePatrol.KI_Z, SquarePatrol.KD_Z
+
+    def __init__(self,
+                 pos=None,
+                 enable_logging: bool = True,
+                 log_dir: str = "logs"):
+        if pos is None:
+            self.target = (0.0, 0.0, self.ALTITUDE)
+        else:
+            self.target = (float(pos[0]), float(pos[1]), float(pos[2]))
+        self.heading = 0.0
+
+        self.pid_fwd   = PID(self.KP_H, self.KI_H, self.KD_H, limit=0.6)
+        self.pid_right = PID(self.KP_H, self.KI_H, self.KD_H, limit=0.6)
+        self.pid_z     = PID(self.KP_Z, self.KI_Z, self.KD_Z, limit=0.5)
+
+        self.logger = AutopilotLogger(log_dir=log_dir) if enable_logging else None
+
+        print(f"[HoverHold] 保持位置: "
+              f"({self.target[0]:.1f}, {self.target[1]:.1f}, {self.target[2]:.1f})")
+
+    def update(self,
+               pos: np.ndarray,
+               vel: np.ndarray,
+               dt: float,
+               heading_rad: float | None = None,
+               is_dummy: bool = False) -> RCCommand:
+        px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
+        vx, vy     = float(vel[0]), float(vel[1])
+
+        if heading_rad is not None:
+            self.heading = heading_rad
+        else:
+            horiz_speed = math.sqrt(vx**2 + vy**2)
+            if horiz_speed > self.MIN_SPEED_FOR_HEADING:
+                self.heading = math.atan2(vy, vx)
+
+        tx, ty, tz = self.target
+        dx, dy, dz = tx - px, ty - py, tz - pz
+
+        ch, sh    = math.cos(self.heading), math.sin(self.heading)
+        fwd_err   =  dx * ch + dy * sh
+        right_err = -dx * sh + dy * ch
+
+        cmd = RCCommand()
+        cmd.pitch    = self.pid_fwd.update(fwd_err, dt)
+        cmd.roll     = self.pid_right.update(right_err, dt)
+        cmd.throttle = self.HOVER_THROTTLE + self.pid_z.update(dz, dt)
+        cmd.throttle = max(0.0, min(1.0, cmd.throttle))
+
+        if self.logger is not None and not is_dummy:
+            self.logger.write(
+                wp_idx=0,
+                heading_rad=self.heading,
+                pos=pos,
+                vel=vel,
+                target=self.target,
+                cmd=cmd,
+            )
+
+        return cmd
+
+    @property
+    def target_point(self) -> tuple:
+        return self.target
+
+    def close(self):
+        if self.logger is not None:
+            self.logger.close()
+
+
+# ── ウェイポイント飛行（今後実装予定） ──────────────────────────
+class WaypointMission(HoverHold):
+    """
+    ウェイポイント飛行モード（未実装）。
+
+    ルート追従ロジックが実装されるまでは、安全側としてその場ホバリング
+    （HoverHold）にフォールバックする。update()/close() は HoverHold から
+    そのまま継承しているため、main_loop.py からは他モードと同じ扱いで良い。
+    """
+
+    _warned = False
+
+    def __init__(self,
+                 pos=None,
+                 enable_logging: bool = True,
+                 log_dir: str = "logs"):
+        if not WaypointMission._warned:
+            print("[WaypointMission] 未実装のため、現在位置でホバリングします。")
+            WaypointMission._warned = True
+        super().__init__(pos=pos, enable_logging=enable_logging, log_dir=log_dir)

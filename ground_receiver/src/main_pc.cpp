@@ -10,6 +10,41 @@ PlaneData  Plane_Data;
 GroundData Ground_Data;
 IM920SL_Generic<GroundData, PlaneData> im920(&Serial1);
 
+// ── position_estimator(PC) からの自律制御コマンド中継 ──────────
+// PCは "AP,<roll>,<pitch>,<yaw>,<throttle>\n" をカメラフレームレートで
+// 送ってくるが、IM920は半二重・低帯域(19200bps)なので、最新値をmailboxに
+// 保持しつつ AP_SEND_INTERVAL_MS おきにだけ実際に無線送信する。
+// 既存のPlaneData姿勢テレメトリ(drone.cpp側)も10Hzで動いているので、それに
+// 合わせて同じ10Hzにし、リンクの片方向だけを過負荷にしないようにする。
+constexpr unsigned long AP_SEND_INTERVAL_MS = 100; // 10Hz
+unsigned long last_ap_send_ms = 0;
+
+// 'R'/'P' の単発コマンドと衝突しないよう、行の先頭1文字を見てから分岐する。
+void handleAutopilotLine() {
+    long old_to = Serial.getTimeout();
+    Serial.setTimeout(50); // PCは1回のwrite()で全行を送るので短時間で十分
+    String line = Serial.readStringUntil('\n');
+    Serial.setTimeout(old_to);
+    line.trim();
+    if (!line.startsWith("AP,")) return;
+
+    float vals[4];
+    int idx = 0;
+    int start = 3; // "AP," の直後から
+    for (int i = start; i <= (int)line.length() && idx < 4; i++) {
+        if (i == (int)line.length() || line[i] == ',') {
+            vals[idx++] = line.substring(start, i).toFloat();
+            start = i + 1;
+        }
+    }
+    if (idx < 4) return; // パース不完全な行は捨てる
+
+    Ground_Data.ap_roll     = vals[0];
+    Ground_Data.ap_pitch    = vals[1];
+    Ground_Data.ap_yaw      = vals[2];
+    Ground_Data.ap_throttle = vals[3];
+}
+
 // auto_flight.cpp の値と合わせておく（Config変更時はここも更新）
 float g_rp  =  0.15f,  g_ri = 0.0f,   g_rd = 0.0f;   // Roll  Rate
 float g_pp  =  0.10f,  g_pi = 0.001f, g_pd = 0.0f;   // Pitch Rate
@@ -96,18 +131,38 @@ void loop() {
     if (!frec()) return;
 
     if (Serial.available()) {
-        char c = toupper(Serial.read());
-        while (Serial.available() &&
-               (Serial.peek()=='\n' || Serial.peek()=='\r')) Serial.read();
-        if (c == 'R') {
-            Ground_Data.reset_cmd = 1;
-            Ground_Data.param_sel = 0;
-            im920.write(Ground_Data);
-            Ground_Data.reset_cmd = 0;
-            Serial.println(">>> INFO: Reset sent.");
-        } else if (c == 'P') {
-            handleGroundPIDTuning();
+        // ★ 先に1文字 peek して分岐する。'R'/'P' はこれまで通り人間の単発キー
+        //   コマンドとして扱い、それ以外は position_estimator が送ってくる
+        //   "AP,...\n" 行として扱う。1バイトずつ読み進めて 'R'/'P' 以外を
+        //   捨てる旧実装だと、"AP,...\n" の2文字目がたまたま 'P' になった時に
+        //   30秒ブロッキングのPIDチューニングメニューを誤発火させてしまうため。
+        char peek_c = toupper(Serial.peek());
+        if (peek_c == 'R' || peek_c == 'P') {
+            char c = toupper(Serial.read());
+            while (Serial.available() &&
+                   (Serial.peek()=='\n' || Serial.peek()=='\r')) Serial.read();
+            if (c == 'R') {
+                Ground_Data.reset_cmd = 1;
+                Ground_Data.param_sel = 0;
+                im920.write(Ground_Data);
+                Ground_Data.reset_cmd = 0;
+                Serial.println(">>> INFO: Reset sent.");
+            } else if (c == 'P') {
+                handleGroundPIDTuning();
+            }
+        } else {
+            handleAutopilotLine();
         }
+    }
+
+    // 自律制御コマンドのmailbox(Ground_Data.ap_*)を10Hzで定期的にIM920送信。
+    // PCはカメラフレームレートで送ってくるが、半二重・低帯域のIM920側は
+    // 間引いて飽和を防ぐ。継続送信すること自体が機体側の groundLinkFresh()
+    // 判定(生存確認)を兼ねる。
+    unsigned long now_ms = millis();
+    if (now_ms - last_ap_send_ms >= AP_SEND_INTERVAL_MS) {
+        last_ap_send_ms = now_ms;
+        im920.write(Ground_Data);
     }
 
     // 受信したときだけ表示用バッファを更新（受信なし時は前回値を保持）

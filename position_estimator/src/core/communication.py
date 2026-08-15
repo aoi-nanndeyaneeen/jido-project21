@@ -25,18 +25,20 @@ class SerialReceiver:
         self.thread = threading.Thread(target=self._receive_loop, daemon=True)
         self.thread.start()
 
-    def send_target_altitude(self, target_alt):
-        """目標高度をPCからRP2040へ送信する（今回はpitchフィールドを使用）"""
+    def send_autopilot_command(self, cmd):
+        """
+        オートパイロットが計算したRCCommand（roll/pitch/yaw/throttle）を
+        ground_receiver(main_pc.cpp)へ送信する。
+        ground_receiver側は "AP," で始まる行だけをコマンドとして解釈し、
+        受信した最新値をmailboxに保持して一定間隔でIM920経由ドローンへ転送する。
+        """
         if not self.is_running or not self.ser.is_open:
             return
 
-        # p_adj, i_adj, d_adj, roll, pitch(ここに目標高度), yaw
-        # 形式: "0.0,0.0,0.0,0.0,25.5,0.0\n"
-        send_str = f"0.0,0.0,0.0,0.0,{target_alt:.2f},0.0\n"
+        send_str = f"AP,{cmd.roll:.4f},{cmd.pitch:.4f},{cmd.yaw:.4f},{cmd.throttle:.4f}\n"
 
         try:
             self.ser.write(send_str.encode('utf-8'))
-            print(f"[Serial] 目標高度 {target_alt} m を送信しました。")
         except Exception as e:
             print(f"[Serial] 送信エラー: {e}")
 

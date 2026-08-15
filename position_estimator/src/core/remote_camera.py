@@ -1,6 +1,9 @@
-import socket, json, base64, cv2
+import socket, json, base64, cv2, time
 import numpy as np
 from core.geometry import approx_camera_matrix
+
+RECONNECT_INTERVAL_S = 1.0   # 切断後、何秒おきに再接続を試みるか
+CONNECT_TIMEOUT_S    = 1.0   # 接続試行1回あたりの上限（呼び出し元スレッドを長時間止めないため）
 
 
 class RemoteCamera:
@@ -12,13 +15,18 @@ class RemoteCamera:
         self.buf   = ""
         self.width  = None
         self.height = None
+        self._mode  = "STREAM"          # 再接続時に同じモードで繋ぎ直すため保持
+        self._next_reconnect_t = 0.0
 
     def connect(self, mode: str = "STREAM"):
         """
         サーバーに接続してモードを通知する。
         mode: "STREAM"（通常）または "CALIB"（キャリブレーション）
         """
+        self._mode = mode
+        self.buf = ""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(CONNECT_TIMEOUT_S)
         self.sock.connect((self.host, self.port))
         self.sock.settimeout(2.0)
 
@@ -31,6 +39,26 @@ class RemoteCamera:
         self.sock.sendall(f"{mode}\n".encode())
         self.sock.settimeout(1.0)   # 通常通信用に戻す
         print(f"[{self.label}] 接続完了: {self.width}x{self.height} (mode={mode})")
+
+    def _try_reconnect(self):
+        """
+        切断中に呼ばれる。RECONNECT_INTERVAL_S おきにのみ実際の接続を試み、
+        それ以外は即座に戻ることで read_and_track() ループを詰まらせない。
+        """
+        now = time.time()
+        if now < self._next_reconnect_t:
+            return
+        self._next_reconnect_t = now + RECONNECT_INTERVAL_S
+        try:
+            self.connect(self._mode)
+            print(f"[{self.label}] 再接続に成功しました。")
+        except Exception:
+            if self.sock is not None:
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+            self.sock = None
 
     # ── キャリブレーション専用クラスメソッド ────────────────────
     @classmethod
@@ -86,6 +114,12 @@ class RemoteCamera:
         return line
 
     def read_and_track(self):
+        if self.sock is None:
+            # 切断中：一定間隔でだけ再接続を試み、それ以外は即座に「未検出」として戻る
+            self._try_reconnect()
+            if self.sock is None:
+                return None, None
+
         try:
             line = self._readline()
             d = json.loads(line)
@@ -112,6 +146,17 @@ class RemoteCamera:
             return frame, center_uv
 
         except (socket.timeout, json.JSONDecodeError):
+            return None, None
+
+        except (ConnectionError, OSError) as e:
+            # 相手（ラズパイ）の再起動・切断など。ソケットを畳んで次回から再接続を試みる。
+            print(f"[{self.label}] 切断を検知しました ({e})。再接続を試みます...")
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+            self.buf = ""
             return None, None
 
     def get_approx_camera_matrix(self):

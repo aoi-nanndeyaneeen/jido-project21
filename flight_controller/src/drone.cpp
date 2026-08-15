@@ -441,7 +441,8 @@ void loop() {
 void updateSensorsAndComms() {
   mpu.update();
   sbus.update();
-  Mode.update(sbus.Ch_state(SW_TURN), sbus.Ch_state(SW_LEVEL), sbus.Ch_state(SW_HOVER));
+  Mode.update(sbus.Ch_state(SW_TURN), sbus.Ch_state(SW_LEVEL), sbus.Ch_state(SW_HOVER),
+              sbus.Ch_state(SW_AUTO), telemetry.groundLinkFresh());
 
   Roll.update_value(sbus.des[Ch::ROLL], mpu.getPitch(), mpu.getAccY(),
                     mpu.getGyroY());
@@ -543,6 +544,24 @@ void autonomousControl() {
       Roll.update_RateAnglePID();
       Pitch.update_RateAnglePID();
       Yaw.update_RatePID();   // ヨーはスティックで直接レート操作
+      return;
+    }
+
+    case MODE_AUTONOMOUS: {
+      // 地上局(position_estimator)が計算したRC相当コマンドを、
+      // MODE_SEMI_MANUALと全く同じ経路でスティック値の代わりに使う。
+      // Flight_mode::update() 側で SW_AUTO ON かつ受信新鮮な間しかこのモードに
+      // ならないので、ここでは無条件に採用してよい。
+      const GroundData &g = telemetry.lastGroundData();
+      Roll.tar  = g.ap_roll  * MAX_ANGLE_CMD;
+      Pitch.tar = g.ap_pitch * MAX_ANGLE_CMD;
+      Yaw.tar   = g.ap_yaw   * MAX_ANGLE_CMD;
+      Roll.update_RateAnglePID();
+      Pitch.update_RateAnglePID();
+      Yaw.update_RatePID();
+      // ★ g.ap_throttle はあえて使わない: このコード全体の安全上の不変条件として、
+      //   スロットル(高度)は全モード共通で常に物理プロポ(sbus.des[Ch::THR])から
+      //   取っている(loop()内、モード分岐の外)。自律モードでもこれを崩さない。
       return;
     }
 

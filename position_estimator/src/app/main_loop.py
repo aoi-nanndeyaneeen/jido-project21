@@ -15,7 +15,7 @@ from utils.config import DISP_W, DISP_H, VELOCITY_W, VELOCITY_H
 from core.tracker import camera_thread_func
 from core.controller import AltitudeController
 from core.geometry import accel_to_angles
-from core.autopilot import SquarePatrol, RCCommand
+from core.autopilot import SquarePatrol, HoverHold, WaypointMission, RCCommand
 from ui.dashboard import Dashboard
 from ui.view_velocity import ViewVelocity
 from ui.view_rc import ViewRC
@@ -43,10 +43,13 @@ def run_main_loop(cam1, cam2,
     print("=" * 56)
     print()
     print("  [B]     背景リセット (両カメラ)")
+    print("  [H]     ホバリングモード")
+    print("  [W]     waypoint飛行モード (今後実装予定 → 現状はホバリングにフォールバック)")
+    print("  [C]     本番(競技)モード")
     print("  [Q]     終了")
     print()
 
-    shared = {"do_bg_reset": False, "quit": False}
+    shared = {"do_bg_reset": False, "quit": False, "mode_request": None}
 
     # ── ウィンドウ作成 ──────────────────────────────────────
     cv2.namedWindow("Camera 1", cv2.WINDOW_NORMAL)
@@ -68,6 +71,15 @@ def run_main_loop(cam1, cam2,
                 elif key == b'b':
                     print("[KEY] B → 背景リセット")
                     shared["do_bg_reset"] = True
+                elif key == b'h':
+                    print("[KEY] H → ホバリングモード要求")
+                    shared["mode_request"] = "hover"
+                elif key == b'w':
+                    print("[KEY] W → waypoint飛行モード要求")
+                    shared["mode_request"] = "waypoint"
+                elif key == b'c':
+                    print("[KEY] C → 本番(競技)モード要求")
+                    shared["mode_request"] = "competition"
             time.sleep(0.05)
 
     threading.Thread(target=keyboard_thread, daemon=True).start()
@@ -84,7 +96,8 @@ def run_main_loop(cam1, cam2,
     dashboard      = Dashboard(field_points)
     controller     = AltitudeController(p_gain=5.0)
     velocity_view  = ViewVelocity(field_points)
-    patrol         = SquarePatrol(start_x=0.0, start_y=0.0)
+    autopilot_mode = "hover"                    # 起動直後は最も安全なホバリングから開始
+    patrol         = HoverHold()
     view_rc        = ViewRC()
 
     cv2.namedWindow("RC Command", cv2.WINDOW_NORMAL)
@@ -140,8 +153,28 @@ def run_main_loop(cam1, cam2,
                 if dt_v > 1e-4:
                     vel_ap = (p1 - p0) / dt_v
 
+            # ── モード切替要求の反映（H/W/C キー） ──────────────
+            mode_req = shared.get("mode_request")
+            if mode_req is not None:
+                shared["mode_request"] = None
+                if mode_req != autopilot_mode:
+                    patrol.close()
+                    if mode_req == "hover":
+                        patrol = HoverHold(pos=P)
+                    elif mode_req == "waypoint":
+                        patrol = WaypointMission(pos=P)
+                    elif mode_req == "competition":
+                        # 本番のウェイポイントはフィールド固定座標なので原点基準で生成する
+                        patrol = SquarePatrol(start_x=0.0, start_y=0.0)
+                    autopilot_mode = mode_req
+                    print(f"[Mode] → {autopilot_mode}")
+
             if P is not None and dt_ap > 0:
                 _last_cmd = patrol.update(pos=P, vel=vel_ap, dt=dt_ap)
+
+            # ── 自律制御コマンドをground_receiver経由でドローンへ送信 ──
+            if alt_sensor is not None:
+                alt_sensor.send_autopilot_command(_last_cmd)
 
             rc_img = view_rc.get_image(_last_cmd)
             cv2.imshow("RC Command", rc_img)
@@ -162,9 +195,6 @@ def run_main_loop(cam1, cam2,
                 if O1 is not None:
                     target_alt = controller.get_target()
                     dashboard.render_and_show(P, current_z, target_alt)
-                    if imu_available and P is not None:
-                        pitch_cmd = controller.calc_pitch_command(current_z)
-                        alt_sensor.send_target_altitude(pitch_cmd)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -182,6 +212,7 @@ def run_main_loop(cam1, cam2,
             threading.Thread(target=ask_target, daemon=True).start()
 
     # ── 終了処理 ──────────────────────────────────────────
+    patrol.close()
     if alt_sensor is not None:
         alt_sensor.stop()
     dashboard.close()

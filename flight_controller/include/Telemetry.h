@@ -84,6 +84,7 @@ private:
     IM920SL_Generic<PlaneData, GroundData> _im920;
     PlaneData  _plane_data;
     GroundData _ground_data;
+    uint32_t   _last_ground_rx_ms = 0; // 最後にGroundDataを正常受信した時刻
 
 public:
     FlightTelemetry(HardwareSerial* serial) : _im920(serial) {}
@@ -105,6 +106,7 @@ public:
                            IMU &mpu, BarometerSensor &barometer,
                            float &bank_angle, unsigned long &turn_ms) {
         if (!_im920.read(_ground_data)) return false;
+        _last_ground_rx_ms = millis();
 
         // リモートリセット
         if (_ground_data.reset_cmd == 1) {
@@ -143,4 +145,11 @@ public:
 
     // デバッグ用: 最後に受信した GroundData を返す
     const GroundData& lastGroundData() const { return _ground_data; }
+
+    // 地上局からのリンクが max_age_ms 以内に新規受信されているか
+    // (MODE_AUTONOMOUS への安全なフォールバック判定に使う)
+    bool groundLinkFresh(uint32_t max_age_ms = 500) const {
+        return _last_ground_rx_ms != 0 &&
+               (millis() - _last_ground_rx_ms) < max_age_ms;
+    }
 };
