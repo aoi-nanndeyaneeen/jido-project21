@@ -161,7 +161,7 @@ def run_main_loop(cam1, cam2,
 
                 if O1 is not None:
                     target_alt = controller.get_target()
-                    dashboard.render_and_show(P, O1, 0.0, 0.0, current_z, target_alt)
+                    dashboard.render_and_show(P, current_z, target_alt)
                     if imu_available and P is not None:
                         pitch_cmd = controller.calc_pitch_command(current_z)
                         alt_sensor.send_target_altitude(pitch_cmd)

@@ -34,10 +34,22 @@
 ```text
 position_estimator/
 ├── camera_server.py         # [RPi上で実行] カメラサーバー（CALIB/STREAMモード対応）
+├── standalone_logger.py     # Tkinter製の単独シリアルロガーGUI（main.pyとは独立して使用可）
+├── graph.py                 # 保存済みCSVから飛行軌跡を可視化するスクリプト
 ├── calib/                   # 保存済みキャリブレーションデータ（JSON）
 ├── logs/                    # フライトログ（CSV）
+├── used/                    # 過去の可視化コードなど、現行フローでは未使用のレガシー置き場（例: view_3d.py）
+├── tools/                   # 単体診断・補助スクリプト群
+│   ├── test_cam2.py          # Camera2接続の単独診断スクリプト
+│   ├── test_remote.py        # RPiのCALIB→STREAMフロー単独テスト
+│   ├── find_camera.py        # 接続中のUSBカメラID探索
+│   ├── dummy_source.py       # カメラ/センサ代替の合成データ生成モジュール
+│   ├── receiver.py           # UDP受信の単独テスト
+│   ├── sensor_receiver.py    # 高度センサ受信の単独テスト
+│   └── test.py                # シリアル/カメラの雑多な動作確認スクリプト
 └── src/
     ├── main.py               # エントリーポイント（初期化～メインループ）
+    ├── test_view_rc.py       # RCスティック表示（ui/view_rc.py）の単体テスト
     ├── core/
     │   ├── camera.py          # ローカルUSBカメラ制御・フレーム差分検知
     │   ├── remote_camera.py   # RPiカメラとのソケット通信クライアント
@@ -52,12 +64,10 @@ position_estimator/
     │   ├── view_graph.py      # matplotlibグラフ描画
     │   ├── view_velocity.py   # トップビュー・速度・姿勢指示器（ADI）
     │   └── view_rc.py         # RCスティックプレビュー（純OpenCV描画）
-    ├── utils/
-    │   ├── config.py          # 全パラメータ設定
-    │   ├── calib_store.py     # キャリブレーション結果のJSON保存・復元
-    │   └── logger.py          # CSVフライトログ
-    └── tools/
-        └── test_cam2.py       # Camera2接続の単独診断スクリプト
+    └── utils/
+        ├── config.py          # 全パラメータ設定
+        ├── calib_store.py     # キャリブレーション結果のJSON保存・復元
+        └── logger.py          # CSVフライトログ
 ```
 
 ## 🛠️ セットアップ
@@ -147,6 +157,11 @@ python graph.py
 ```
 
 保存されたCSVから飛行軌跡の3Dグラフと時間変化グラフを生成します。
+
+## 🧰 単独ツール
+
+- `standalone_logger.py` : `main.py`とは独立に、シリアルポートからのテレメトリ（Roll/Pitch/Yaw/Ax/Ay/Az/Alt）をTkinter GUIで記録するロガー。`logs/`にCSV出力。
+- `tools/` : カメラ探索・ダミーデータ生成・RPi通信の単独テストなど、開発時の動作確認用スクリプト群（`main.py`からはimportされない）。
 
 ## ⚙️ 主要config.pyパラメータ
 

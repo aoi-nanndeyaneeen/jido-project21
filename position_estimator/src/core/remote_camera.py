@@ -1,5 +1,6 @@
 import socket, json, base64, cv2
 import numpy as np
+from core.geometry import approx_camera_matrix
 
 
 class RemoteCamera:
@@ -114,10 +115,7 @@ class RemoteCamera:
             return None, None
 
     def get_approx_camera_matrix(self):
-        focal = self.width
-        return np.array([[focal, 0,     self.width  / 2],
-                         [0,     focal, self.height / 2],
-                         [0,     0,     1             ]], dtype=np.float32)
+        return approx_camera_matrix(self.width, self.height)
 
     def reset_background(self):
         pass

@@ -1,5 +1,5 @@
 import cv2
-import numpy as np
+from core.geometry import approx_camera_matrix
 from utils.config import DIFF_THRESHOLD, MIN_AREA_PX, BLUR_KERNEL, MORPH_KERNEL, CAMERA_FPS
 
 
@@ -38,12 +38,7 @@ class CameraTracker:
         )
 
     def get_approx_camera_matrix(self):
-        focal_length = self.width
-        cx = self.width  / 2.0
-        cy = self.height / 2.0
-        return np.array([[focal_length, 0,            cx],
-                         [0,            focal_length, cy],
-                         [0,            0,             1]], dtype=np.float32)
+        return approx_camera_matrix(self.width, self.height)
 
     def read_and_track(self):
         ret, frame = self.cap.read()

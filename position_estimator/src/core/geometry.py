@@ -71,7 +71,9 @@ def accel_to_angles(accel):
     return roll, pitch
 
 
-def calc_tilt(accel, ref_roll, ref_pitch):
-    """加速度からキャリブ基準を引いた相対 roll/pitch を返す"""
-    roll, pitch = accel_to_angles(accel)
-    return roll - ref_roll, pitch - ref_pitch
+def approx_camera_matrix(width, height):
+    """焦点距離を幅で近似したカメラ内部行列（画角情報が無い場合の概算用）"""
+    focal = width
+    return np.array([[focal, 0,     width  / 2],
+                     [0,     focal, height / 2],
+                     [0,     0,     1         ]], dtype=np.float32)

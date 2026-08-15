@@ -14,7 +14,7 @@ class Dashboard:
         # 初回imshowで即座に応答可能にする
         cv2.imshow("Graph", np.zeros((600, 600, 3), dtype=np.uint8))
 
-    def render_and_show(self, P, O, roll, pitch, current_z, target_alt):
+    def render_and_show(self, P, current_z, target_alt):
         img = self.view_graph.get_image(P, current_z, target_alt)
         cv2.imshow("Graph", img)
 

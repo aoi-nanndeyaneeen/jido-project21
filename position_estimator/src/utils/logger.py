@@ -5,33 +5,38 @@ import datetime
 from pathlib import Path
 
 
-class FlightLogger:
-    HEADER = ["Time", "Detected",
-              "Target_X(m)", "Target_Y(m)", "Target_Z(m)",
-              "Roll(deg)", "Pitch(deg)",
-              "Alt_raw(m)", "Alt_offset(m)"]
+class CsvLogger:
+    """ディレクトリ作成・ファイルオープン・ヘッダー書き込みをまとめた共通CSVロガー基底クラス"""
 
-    def __init__(self, log_path: Path):
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        write_header = not log_path.exists()
-        self._fh = open(log_path, mode='a', newline='', encoding='utf-8')
+    def __init__(self, path: Path, header: list, mode: str = "w"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        write_header = mode == "w" or not path.exists()
+        self._fh = open(path, mode=mode, newline="", encoding="utf-8")
         self._writer = csv.writer(self._fh)
         if write_header:
-            self._writer.writerow(self.HEADER)
+            self._writer.writerow(header)
 
-    def write(self, P_vec, current_z, roll, pitch, raw_alt, alt_offset):
+    def close(self):
+        self._fh.close()
+
+
+class FlightLogger(CsvLogger):
+    HEADER = ["Time", "Detected",
+              "Pos_X(m)", "Pos_Y(m)", "Pos_Z(m)",
+              "Residual(m)", "Cam1_Detected", "Cam2_Detected", "Jump_Rejected"]
+
+    def __init__(self, log_path: Path):
+        super().__init__(log_path, self.HEADER, mode="a")
+
+    def write(self, P_vec, current_z, residual, cam1_detected, cam2_detected, jump_rejected):
         """毎フレーム呼び出す。P_vec=None なら未検知として記録"""
         t = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
         if P_vec is not None:
             self._writer.writerow([t, 1,
                 round(P_vec[0], 3), round(P_vec[1], 3), round(current_z, 3),
-                round(roll, 2), round(pitch, 2),
-                round(raw_alt, 3), round(alt_offset, 3)])
+                round(residual, 3), int(cam1_detected), int(cam2_detected), int(jump_rejected)])
         else:
             self._writer.writerow([t, 0, "", "", round(current_z, 3),
-                round(roll, 2), round(pitch, 2),
-                round(raw_alt, 3), round(alt_offset, 3)])
+                round(residual, 3), int(cam1_detected), int(cam2_detected), int(jump_rejected)])
         self._fh.flush()
-
-    def close(self):
-        self._fh.close()

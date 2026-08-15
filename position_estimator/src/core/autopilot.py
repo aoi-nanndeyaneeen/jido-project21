@@ -16,13 +16,14 @@ RCCommand の throttle/pitch/roll/yaw は -1.0〜1.0（throttleは0〜1）に
     dummyモード中は呼び出し側で is_dummy=True を渡すことでログを止められる。
 """
 
-import csv
 import math
 import time
 import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
+
+from utils.logger import CsvLogger
 
 
 # ── データ型 ───────────────────────────────────────────────────
@@ -41,7 +42,7 @@ class RCCommand:
 
 
 # ── ログ記録 ───────────────────────────────────────────────────
-class AutopilotLogger:
+class AutopilotLogger(CsvLogger):
     """
     autopilot の入出力を CSV に記録する。
 
@@ -62,13 +63,9 @@ class AutopilotLogger:
     ]
 
     def __init__(self, log_dir: str = "logs", prefix: str = "autopilot"):
-        Path(log_dir).mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.path = Path(log_dir) / f"{prefix}_{ts}.csv"
-
-        self._file = open(self.path, "w", newline="", encoding="utf-8")
-        self._writer = csv.writer(self._file)
-        self._writer.writerow(self.HEADER)
+        path = Path(log_dir) / f"{prefix}_{ts}.csv"
+        super().__init__(path, self.HEADER, mode="w")
 
         print(f"[AutopilotLogger] 記録開始: {self.path}")
 
@@ -92,7 +89,7 @@ class AutopilotLogger:
         self._writer.writerow(row)
 
     def close(self):
-        self._file.close()
+        super().close()
         print(f"[AutopilotLogger] 記録終了: {self.path}")
 
 

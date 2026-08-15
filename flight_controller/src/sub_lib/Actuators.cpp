@@ -43,13 +43,32 @@ void Flap_Servo::write(Sw input){
 void motor::begin() {
     if(_pin == -1) return;
     pinMode(_pin, OUTPUT);
-    
+
     // TeensyのハードウェアPWM設定
     analogWriteResolution(12);       // 12-bit分解能 (0-4095)
     analogWriteFrequency(_pin, 400); // PWM周波数を400Hzに設定
-    
-    write(0.0f); // 初期化 (スロットル0のパルスを出力)
+
+    // ★ 修正: 以前は write(0.0f) を _built = true の前で呼んでいたため、
+    //   write() 冒頭の if(!is_ready()) return; に弾かれて
+    //   「スロットル0のパルス」が実際には一切出ていなかった。
+    //   ESCから見ると信号が来ないまま放置されるので、アーミングに失敗して
+    //   ビープを鳴らし続ける個体が出る (ESCを4in1から分割すると顕在化しやすい)。
+    //   先に _built を立ててから、実際に 1000us を出す。
     _built = true;
+    write(0.0f);
+}
+
+// ------------------------------------------------------------
+//  ESCキャリブレーション
+//    max_us を一定時間出してから min_us に落とす、標準的な手順。
+//    ★必ずプロペラを外して実行すること。
+// ------------------------------------------------------------
+void motor::calibrate(uint32_t high_ms, uint32_t low_ms) {
+    if(!is_ready()) return;
+    write(1.0f);          // フルスロットル
+    delay(high_ms);
+    write(0.0f);          // スロットル0
+    delay(low_ms);
 }
 
 void motor::write(float input) {

@@ -6,8 +6,8 @@ Camera2の本接続はキャリブレーション完了後に calibration_flow.p
 """
 
 import socket
-import numpy as np
 from core.camera import CameraTracker
+from core.geometry import approx_camera_matrix
 from utils.config import CAMERA_1_URL, CAMERA_W, CAMERA_H, RPI_HOST, RPI_PORT
 
 
@@ -25,10 +25,7 @@ class _DummyCam2:
         pass
 
     def get_approx_camera_matrix(self):
-        f = self.width
-        return np.array([[f, 0, self.width / 2],
-                         [0, f, self.height / 2],
-                         [0, 0, 1]], dtype=np.float32)
+        return approx_camera_matrix(self.width, self.height)
 
 
 def init_cameras():

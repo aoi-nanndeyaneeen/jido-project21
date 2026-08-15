@@ -54,5 +54,7 @@ private:
 public:
     void begin();             // 親クラスのServo用begin()を上書きするために追加
     void write(float input) ;
+    // ESCキャリブレーション (フルスロットル→スロットル0)。プロペラを外して実行すること
+    void calibrate(uint32_t high_ms = 4000, uint32_t low_ms = 4000);
 };
 

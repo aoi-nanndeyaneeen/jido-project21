@@ -41,10 +41,10 @@ namespace T = Config::Timing;
 // kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle
 //  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(5.0f, 0.0f, 0.05f, 5.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),//angleをなくすときは291行目からの場所の、RateAnglePIDをRatePIDに変える
+Axis_value Roll(2.0f, 0.0f, 0.03f, 5.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),//angleをなくすときは291行目からの場所の、RateAnglePIDをRatePIDに変える
                 // 0.3f, 0.0f, 0.01f, 0.00f, 0.0f, 0.0f, 1.0f, 0.7f, 0.0f, 0.0f, 0.0f),(pを感じた)
                 //0.6f, 0.00f, 0.003f, 10.0f, 0.0f, 0.2f, 1.0f, 0.7f, 0.0f, 0.5f,0.0f,(水平に戻ろうとする、うれしい)
-    Pitch(5.0f, 0.0f, 0.05f, 5.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),
+    Pitch(2.0f, 0.0f, 0.03f, 5.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),
     Yaw(1.0f, 0.0f, 0.00f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
 
 float BANK_ANGLE = 25.0f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
@@ -82,6 +82,162 @@ bool USE_BARO = false;  // 気圧センサー (BMP280)
 bool USE_SBUS = true;   // 受信機 (SBUS)
 bool USE_IM920 = true;  // 無線モジュール (IM920)
 bool USE_SERVO = true;  // サーボ・アンプ出力 (Servo/ESC)
+
+// ============================================================
+//  § ログ出力 (USBシリアル → scripts/logger.py)
+// ============================================================
+//  logger.py が期待するプロトコルに合わせてある:
+//    HEADER,<列名>   ... 起動時と LOG_START 前に1回
+//    LOG_START       ... 記録開始
+//    DATA,<値,...>   ... 1サンプル
+//    LOG_STOP        ... 記録終了
+//  シリアルで 'L' を送るたびに 開始/停止 が切り替わる。
+//
+//  10Hzの画面表示では数十Hzの振動は絶対に見えないので、
+//  制御ループと同じ土俵(500Hz)で全信号を落とす。
+namespace Log {
+
+constexpr int  LOG_HZ  = 500;                 // 記録レート [Hz]
+constexpr int  DIV     = T::MAIN_Hz / LOG_HZ; // メインループ何回に1回
+constexpr char HEADER[] =
+    "t_ms,dt_us,mode,armed,thr,"
+    "roll_sbus,pitch_sbus,yaw_sbus,"
+    "roll_ang,pitch_ang,yaw_ang,"
+    "roll_gyr,pitch_gyr,yaw_gyr,"
+    "roll_cmd,pitch_cmd,yaw_cmd,"
+    "m1,m2,m3,m4,corr_limit,sat";
+
+bool     active   = false;
+uint32_t dropped  = 0;   // USBが詰まって捨てたサンプル数
+uint32_t written  = 0;
+int      div_cnt  = 0;
+
+// このループのモーター出力とクランプ状況 (loop本体から書き込む)
+float m_out[4]     = {0, 0, 0, 0};
+float m_corr_limit = 0.0f;
+uint8_t m_sat      = 0;   // bit0..3 = 各モーターが 0 or 1 に張り付いた
+
+inline void start() {
+    Serial.println();
+    Serial.print("HEADER,"); Serial.println(HEADER);
+    Serial.println("LOG_START");
+    active  = true;
+    dropped = 0;
+    written = 0;
+    div_cnt = 0;
+}
+
+inline void stop() {
+    active = false;
+    Serial.println("LOG_STOP");
+    Serial.printf("INFO: %lu行記録 / %lu行ドロップ(USB詰まり)\n",
+                  (unsigned long)written, (unsigned long)dropped);
+}
+
+inline void toggle() { active ? stop() : start(); }
+
+// 1サンプル出力。★USBが詰まっていたら書かずに捨てる。
+//   ここでブロックすると制御ループが止まって、それ自体が振動源になる。
+inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
+    if (!active) return;
+    if (++div_cnt < DIV) return;
+    div_cnt = 0;
+
+    // 1行ぶん(約160バイト)の空きが無ければ捨てる
+    if (Serial.availableForWrite() < 200) { dropped++; return; }
+
+    Serial.printf(
+        "DATA,%lu,%lu,%d,%d,%.3f,"
+        "%.3f,%.3f,%.3f,"
+        "%.2f,%.2f,%.2f,"
+        "%.2f,%.2f,%.2f,"
+        "%.4f,%.4f,%.4f,"
+        "%.3f,%.3f,%.3f,%.3f,%.3f,%u\n",
+        (unsigned long)millis(), (unsigned long)dt_us, mode, armed ? 1 : 0, thr,
+        Roll.sbus, Pitch.sbus, Yaw.sbus,
+        Roll.ang,  Pitch.ang,  Yaw.ang,
+        Roll.gyr,  Pitch.gyr,  Yaw.gyr,
+        Roll.cmd,  Pitch.cmd,  Yaw.cmd,
+        m_out[0], m_out[1], m_out[2], m_out[3],
+        m_corr_limit, (unsigned)m_sat);
+    written++;
+}
+
+} // namespace Log
+
+
+// ============================================================
+//  § ESCキャリブレーション / モーター単体テスト
+// ============================================================
+//  ★ 必ずプロペラを外して実行すること。
+//
+//  ESCがキャリブレーションモードに入るのは「ESCの電源が入った瞬間に
+//  フルスロットル信号が来ている」ときだけ。Teensyは起動に数秒かかるので、
+//  普通に電源を入れる手順では絶対にキャリブレーションに入らない。
+//  そこで「先にTeensyだけ動かして2000usを出し続け、その状態で
+//  バッテリーを挿す」という順番を踏めるようにする。
+
+static void waitForKey() {
+  while (Serial.available()) Serial.read();
+  while (!Serial.available()) { /* 待つ */ }
+  while (Serial.available()) Serial.read();
+}
+
+static void escCalibration() {
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println(" ESC キャリブレーション");
+  Serial.println("========================================");
+  Serial.println(" !! プロペラを外してください !!");
+  Serial.println();
+  Serial.println(" 手順:");
+  Serial.println("  1) いま バッテリーを抜いた 状態にする");
+  Serial.println("     (TeensyはUSBから給電されたままにする)");
+  Serial.println("  2) Enterを押すと 2000us(フル) を出し続けます");
+  Serial.println("  3) その状態で バッテリーを挿す");
+  Serial.println("     → ESCが「ピピッ」と鳴って上限を記録します");
+  Serial.println("  4) 鳴ったら もう一度Enter → 1000us(ゼロ) に落とします");
+  Serial.println("     → ESCが鳴って下限を記録し、キャリブレーション完了");
+  Serial.println();
+  Serial.print(" 準備ができたらEnter > ");
+  waitForKey();
+
+  Serial.println("\n 2000us 出力中... バッテリーを挿してください。");
+  Serial.println(" ESCが鳴ったらEnter > ");
+  motor1.write(1.0f);
+  motor2.write(1.0f);
+  motor3.write(1.0f);
+  motor4.write(1.0f);
+  waitForKey();
+
+  Serial.println("\n 1000us に落としました。ESCの確認音を待ってください。");
+  motor1.write(0.0f);
+  motor2.write(0.0f);
+  motor3.write(0.0f);
+  motor4.write(0.0f);
+  delay(3000);
+
+  Serial.println(" 完了。バッテリーを一度抜いて、挿し直してください。");
+  Serial.println("========================================\n");
+}
+
+// 1本だけ回す。どのESC/モーターが不調かを切り分ける。
+static void motorTest(int index) {
+  constexpr float TEST_THR = 0.12f;
+  constexpr uint32_t TEST_MS = 2000;
+
+  motor* m[4] = { &motor1, &motor2, &motor3, &motor4 };
+  if (index < 0 || index > 3) return;
+
+  Serial.printf("\nTEST: M%d のみ %.2f で %lu ms 回します "
+                "(プロペラを外すこと)\n",
+                index + 1, (double)TEST_THR, (unsigned long)TEST_MS);
+
+  for (int i = 0; i < 4; ++i) m[i]->write(i == index ? TEST_THR : 0.0f);
+  delay(TEST_MS);
+  for (int i = 0; i < 4; ++i) m[i]->write(0.0f);
+  Serial.println("TEST: 終了");
+}
 
 void setup() {
   // サーボの宣言
@@ -126,7 +282,11 @@ void setup() {
   ez2.begin();
   */
 
+  Serial.print("HEADER,"); Serial.println(Log::HEADER);
   Serial.println("--- Setup Complete. Loop start ---");
+  Serial.println("INFO: 'L'=ログ開始/停止  'P'=PID調整  'R'=リセット");
+  Serial.println("INFO: 'C'=ESCキャリブレーション  '1'-'4'=モーター単体テスト");
+  Serial.println("INFO: (C と 1-4 は必ずプロペラを外して実行すること)");
 }
 
 // ============================================================
@@ -134,8 +294,9 @@ void setup() {
 // ============================================================
 void loop() {
   // --- 究極の最小ループ (ボード本体生存確認) ---
+  //     ログ中はCSVを汚すので出さない
   static uint32_t last_alive_ms = 0;
-  if (millis() - last_alive_ms > 1000) {
+  if (!Log::active && millis() - last_alive_ms > 1000) {
     last_alive_ms = millis();
     Serial.printf("### Teensy Alive - MPU:%s BARO:%s SBUS:%s ###\n",
                   USE_MPU ? "ON" : "OFF", USE_BARO ? "ON" : "OFF",
@@ -195,26 +356,54 @@ void loop() {
         //   張り付かない」範囲まで、thr の位置に応じて補正の上限を絞る。
         const float corr_limit = min(0.5f, min(thr_val, 1.0f - thr_val));
 
-        const float c1 = constrain(-Pitch.cmd + Roll.cmd-Yaw.cmd, -corr_limit, corr_limit) * mix_auth;
-        const float c2 = constrain( Pitch.cmd - Roll.cmd-Yaw.cmd, -corr_limit, corr_limit) * mix_auth;
-        const float c3 = constrain( Pitch.cmd + Roll.cmd+Yaw.cmd, -corr_limit, corr_limit) * mix_auth;
-        const float c4 = constrain(-Pitch.cmd - Roll.cmd+Yaw.cmd, -corr_limit, corr_limit) * mix_auth;
+        const float raw1 = -Pitch.cmd + Roll.cmd;
+        const float raw2 =  Pitch.cmd - Roll.cmd;
+        const float raw3 =  Pitch.cmd + Roll.cmd;
+        const float raw4 = -Pitch.cmd - Roll.cmd;
 
-        motor1.write(thr_val + c1);
-        motor2.write(thr_val + c2);
-        motor3.write(thr_val + c3);
-        motor4.write(thr_val + c4);
+        const float c1 = constrain(raw1, -corr_limit, corr_limit) * mix_auth;
+        const float c2 = constrain(raw2, -corr_limit, corr_limit) * mix_auth;
+        const float c3 = constrain(raw3, -corr_limit, corr_limit) * mix_auth;
+        const float c4 = constrain(raw4, -corr_limit, corr_limit) * mix_auth;
+
+        // ログ用: 補正がクランプに当たったモーターを記録する。
+        // sat が立ちっぱなしなら「ゲインが高すぎて常に飽和している」証拠になる。
+        Log::m_corr_limit = corr_limit;
+        Log::m_sat = 0;
+        if (fabsf(raw1) > corr_limit) Log::m_sat |= 1 << 0;
+        if (fabsf(raw2) > corr_limit) Log::m_sat |= 1 << 1;
+        if (fabsf(raw3) > corr_limit) Log::m_sat |= 1 << 2;
+        if (fabsf(raw4) > corr_limit) Log::m_sat |= 1 << 3;
+
+        Log::m_out[0] = thr_val + c1;
+        Log::m_out[1] = thr_val + c2;
+        Log::m_out[2] = thr_val + c3;
+        Log::m_out[3] = thr_val + c4;
+
+        motor1.write(Log::m_out[0]);
+        motor2.write(Log::m_out[1]);
+        motor3.write(Log::m_out[2]);
+        motor4.write(Log::m_out[3]);
       } else {
         motor1.write(0);
         motor2.write(0);
         motor3.write(0);
         motor4.write(0);
+        Log::m_out[0] = Log::m_out[1] = Log::m_out[2] = Log::m_out[3] = 0.0f;
+        Log::m_corr_limit = 0.0f;
+        Log::m_sat = 0;
       }
     }
 
+    // 5) ログ (500Hz)
+    Log::sample(T::Main_dt, (int)Mode.get_mode(),
+                sbus.isSafe() && sbus.Ch_state(THR_CUT) == down,
+                sbus.des[Ch::THR]);
+
     // 6) テレメトリ・デバッグ (10Hz)
+    //    ★ ログ中は画面クリアや人間向け表示がCSVを壊すので出さない
     static int dbg_cnt = 0;
-    if (++dbg_cnt >= 100) {
+    if (!Log::active && ++dbg_cnt >= 100) {
       dbg_cnt = 0;
       if (USE_BARO) barometer.update();
       float fused_alt = (USE_BARO) ? barometer.get_smoothed_altitude() : 0.0f;
@@ -261,16 +450,44 @@ void updateSensorsAndComms() {
   Yaw.update_value(sbus.des[Ch::YAW], mpu.getYaw(), mpu.getAccZ(),
                    mpu.getGyroZ());
 
+  // ★ 'L' (ログ開始/停止) を先に横取りする。
+  //   serial_com.h の Update_SerialCommand() は他の機体も使う共有コードなので
+  //   触らず、ここで処理してしまう。
+  if (Serial.available()) {
+    const char pk = toupper(Serial.peek());
+    if (pk == 'L') {
+      Serial.read();
+      Log::toggle();
+    } else if (pk == 'C') {
+      Serial.read();
+      escCalibration();
+    } else if (pk >= '1' && pk <= '4') {
+      Serial.read();
+      motorTest(pk - '1');
+    }
+  }
+
   switch (Update_SerialCommand()) {
     case 'R':
       reset_all();
       break;
     case 'P':
+      // ★ メニューは最大30秒ブロックする。入る前にモーターを止める。
+      //   (従来は menu から戻ってから止めていたので、その間ずっと
+      //    直前のPWMを出し続けていた)
+      motor1.write(0);
+      motor2.write(0);
+      motor3.write(0);
+      motor4.write(0);
+      if (Log::active) Log::stop();
       handlePIDTuning(Roll, Pitch, Yaw);
       motor1.write(0);
       motor2.write(0);
       motor3.write(0);
       motor4.write(0);
+      Roll.pid_reset();
+      Pitch.pid_reset();
+      Yaw.pid_reset();
       break;
     default:
       break;
