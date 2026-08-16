@@ -100,6 +100,26 @@ public:
         _im920.write(_plane_data);
     }
 
+    // ------------------------------------------------------------
+    //  受信のみ (GroundData を取り込んで鮮度を更新するだけ)
+    //
+    //  receiveAndProcess() は Axis_value / BarometerSensor を引数に取るため、
+    //  それらを持たないコード (drone_s4.cpp のクアッド系は quad/QuadPID.h の
+    //  Quad::Pid を使い、気圧計も積んでいない) からは呼べません。
+    //  自律制御コマンド (ap_*) の受信だけが目的ならこちらを使います。
+    //  PIDゲインのリモート調整やリモートリセットは行いません。
+    // ------------------------------------------------------------
+    bool receive() {
+        if (!_im920.read(_ground_data)) return false;
+        _last_ground_rx_ms = millis();
+        return true;
+    }
+
+    // 姿勢データを送信 (roll/pitch/yaw のみ。加速度と高度は 0 埋め)
+    void sendAttitudeOnly(float roll, float pitch, float yaw) {
+        sendAttitude(0.0f, 0.0f, 0.0f, roll, pitch, yaw, 0.0f);
+    }
+
     // 地上局からの受信・処理
     // 戻り値: 受信して何らかの処理をした場合 true
     bool receiveAndProcess(Axis_value &Roll, Axis_value &Pitch, Axis_value &Yaw,

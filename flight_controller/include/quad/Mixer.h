@@ -15,6 +15,22 @@
 namespace Quad {
 
 // ------------------------------------------------------------
+//  MixInfo : ミキサーが実際に何をしたかの報告 (ログ用)
+//
+//  drone.cpp のロガーが出していた corr_limit / sat と同じ役割です。
+//  ・span_limit : 姿勢補正に使える振れ幅
+//  ・scale      : 補正が入りきらず縮小したときの倍率 (1.0 なら無縮小)
+//  ・sat        : bit0..3 = そのモーターが 0 または 1 に張り付いた
+//
+//  sat が立ちっぱなしなら「ゲインが高すぎて常に飽和している」証拠です。
+// ------------------------------------------------------------
+struct MixInfo {
+    float   span_limit = 0.0f;
+    float   scale      = 1.0f;
+    uint8_t sat        = 0;
+};
+
+// ------------------------------------------------------------
 //  mix() : 姿勢指令とスロットルを 4 モーターの出力 [0.0, 1.0] に変換する
 //
 //    thr    : スロットル [0.0, 1.0]
@@ -30,7 +46,9 @@ namespace Quad {
 //    こうすると、フルスロットル付近でも姿勢が保てる。
 // ------------------------------------------------------------
 inline void mix(float thr, float roll, float pitch, float yaw,
-                float out[MOTOR_COUNT]) {
+                float out[MOTOR_COUNT], MixInfo* info = nullptr) {
+
+    if (info) *info = MixInfo{};
 
     // --- スロットルが低いときは全停止 (地上でプロペラが暴れるのを防ぐ) ---
     if (thr <= THR_MIN_MIX) {
@@ -61,11 +79,13 @@ inline void mix(float thr, float roll, float pitch, float yaw,
     //     出せる幅は 1.0 からアイドル分を引いた値。
     const float span_limit = 1.0f - THR_IDLE;
     const float span = hi - lo;
+    if (info) info->span_limit = span_limit;
     if (span > span_limit) {
         const float k = span_limit / span;
         for (int i = 0; i < MOTOR_COUNT; ++i) out[i] *= k;
         lo *= k;
         hi *= k;
+        if (info) info->scale = k;
     }
 
     // --- 3) スロットルの許容範囲 ---
@@ -84,7 +104,9 @@ inline void mix(float thr, float roll, float pitch, float yaw,
 
     // --- 4) 合成 ---
     for (int i = 0; i < MOTOR_COUNT; ++i) {
-        out[i] = constrain(out[i] + thr, 0.0f, 1.0f);
+        const float raw = out[i] + thr;
+        out[i] = constrain(raw, 0.0f, 1.0f);
+        if (info && (raw <= 0.0f || raw >= 1.0f)) info->sat |= (uint8_t)(1 << i);
     }
 }
 

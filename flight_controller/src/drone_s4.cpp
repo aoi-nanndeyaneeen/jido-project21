@@ -13,7 +13,9 @@
 //    RATE モード:
 //      スティック → 目標角速度[deg/s] → レートPID(1000Hz) → ...
 //
-//    ヨーは常にレートのみです (角度で押さえると機首が固定されて扱いにくい)。
+//    ヨーはスティックを触っている間だけレート指令です。
+//    中立に戻すと「ヘディングホールド」に切り替わり、そのときの機首方位を
+//    保持します (§ 7-2 を参照)。
 //
 //  【モード】
 //    SW_HOVER が UP  → ANGLE (手を離すと水平に戻る)
@@ -32,6 +34,10 @@
 //    ・モード遷移時に目標値もクリアするようにした
 //      (旧: pid_reset() は呼ぶが tar は残るので、
 //       LEVEL_FLIGHT の前傾10度が次のモードに持ち越されていた)
+//    ・ヨーのレートPIDに I項を入れ、ヘディングホールドを追加した (§ 7-2)
+//      (旧: ヨーは kp のみ。P制御は定常偏差を消せないので、モーター取付角の
+//       わずかな傾きやプロペラの個体差が作る一定のヨートルクに負けて、
+//       機首がじわじわ回り続けていた)
 // ============================================================
 
 #include <Arduino.h>
@@ -41,6 +47,7 @@
 #include "Actuators.h"
 #include "Receiver.h"
 #include "sensor/IMU.h"   // 気圧・超音波は使わないので Sensors.h ごとは読まない
+#include "Telemetry.h"    // IM920SL (地上局との送受信)
 
 #include "quad/QuadConfig.h"
 #include "quad/QuadPID.h"
@@ -58,10 +65,40 @@ namespace Gain {
 //                        kp      ki      kd
 constexpr float RATE_ROLL [3] = { 0.0010f, 0.0f, 0.00002f };
 constexpr float RATE_PITCH[3] = { 0.0010f, 0.0f, 0.00002f };
-constexpr float RATE_YAW  [3] = { 0.0020f, 0.0f, 0.0f     };
+
+// ★ ヨーの I項。P制御だけでは定常偏差が残る。
+//   機体には必ず一定のヨートルクが残っている:
+//     ・モーター取付角のわずかな傾き (推力ベクトルが真上を向いていない)
+//     ・CW/CCW プロペラの特性差、モーターのKV差、ESCの個体差
+//   これらは P では釣り合った角速度で回り続けるだけで、消えない。
+//   ki = kp は積分時定数 1秒に相当する。まずこの値で試し、
+//   戻りが遅ければ 0.005 まで上げてよい (上げすぎると 1Hz 前後で揺れる)。
+constexpr float RATE_YAW  [3] = { 0.0020f, 0.0020f, 0.0f     };
 
 constexpr float RATE_D_ALPHA = 0.80f;
 constexpr float RATE_I_LIMIT = 0.15f;
+
+// ---- ヘディングホールド (ヨー) ----
+//  ジャイロZを積分した「相対」方位を保持する。絶対方位 (磁気センサ/GPS) は
+//  使わない。市販のフライトコントローラのヨーもこれと同じ仕組み。
+//
+//  ・ドリフトは無関係: 積分値がどれだけずれても「今向いている方向」を
+//    保ち続けることに変わりはない
+//  ・±180度の折り返し処理も不要: 相対値なので連続量のまま扱える
+//
+//  Madgwick の getYaw() は使わない。あれは updateIMU() (6軸) なので
+//  ヨーに補正項が一切入らず、結局ジャイロの純積分でしかない上に、
+//  制御に使うジャイロ値と位相がずれる。
+
+// 方位誤差 1度あたり何 deg/s で戻すか [(deg/s)/deg]
+constexpr float YAW_HOLD_KP       = 3.0f;
+// ヘディングホールドが出してよい角速度の上限 [deg/s]
+constexpr float YAW_HOLD_RATE_LIM = 60.0f;
+// これ以上の方位誤差は追わない [deg]
+//  大きく振られたときに全力で振り戻すと危ないので、ここで頭打ちにする。
+constexpr float YAW_HOLD_ERR_LIM  = 20.0f;
+// ラダースティックの不感帯。これを超えたら「操作中」と判定する
+constexpr float YAW_STICK_DEAD    = 0.03f;
 
 // ---- 角度 (外側ループ) ----
 //  出力の単位は [deg/s] です。kp = 4.0 なら「10度傾いていたら 40deg/s で戻す」。
@@ -84,8 +121,18 @@ namespace S4 {
 constexpr bool USE_MPU   = true;
 constexpr bool USE_SBUS  = true;
 constexpr bool USE_MOTOR = true;
+constexpr bool USE_IM920 = true;   // 地上局(position_estimator)との無線
 
 constexpr float I_ENABLE_THR = 0.15f;
+
+// 姿勢テレメトリの送信レート [Hz] (IM920SL の帯域を食い過ぎない範囲で)
+constexpr int TELEM_TX_HZ = 10;
+
+// 受信のポーリングレート [Hz]
+//  IM920SL は 19200 baud なので 200Hz でも 1回あたり最大12バイト程度。
+//  Teensy の受信バッファ(64B)を溢れさせずに、1000Hz の制御ループから
+//  String 操作を追い出せる。地上局からの更新は10Hz程度なので十分。
+constexpr int TELEM_RX_HZ = 200;
 
 // 角度ループが出せる角速度の上限 [deg/s]
 // (大きく傾いたときに、レートループが追えない目標を出さないための蓋)
@@ -94,7 +141,10 @@ constexpr float ANGLE_OUT_LIMIT = 250.0f;
 constexpr int MAIN_HZ  = Q::RATE_LOOP_HZ;
 constexpr int DEBUG_HZ = Q::DEBUG_HZ;
 
-enum Mode : uint8_t { MODE_RATE = 0, MODE_ANGLE = 1 };
+//  ★ MODE_AUTO を追加 (drone.cpp の MODE_AUTONOMOUS 相当)
+//    SW_AUTO が UP かつ IM920 の受信が新鮮なときだけ入る。
+//    スイッチOFF、またはリンク途絶の瞬間に ANGLE へ自動フォールバックする。
+enum Mode : uint8_t { MODE_RATE = 0, MODE_ANGLE = 1, MODE_AUTO = 2 };
 
 } // namespace S4
 
@@ -104,6 +154,10 @@ enum Mode : uint8_t { MODE_RATE = 0, MODE_ANGLE = 1 };
 IMU   mpu(&Wire);
 Sbus  sbus(&Serial5);
 motor motors[Q::MOTOR_COUNT];
+
+// IM920SL。drone.cpp と同じ Serial3 に合わせてある。
+// 配線が違う場合はここを変えること。
+FlightTelemetry telemetry(&Serial3);
 
 Q::Axis roll_axis, pitch_axis, yaw_axis;
 
@@ -123,7 +177,100 @@ bool     g_prev_armed = false;
 int      g_angle_div_count = 0;
 uint32_t g_angle_prev_us   = 0;
 
+// ---- ヘディングホールド ----
+float g_yaw_est   = 0.0f;   // ジャイロZを積分した相対方位 [deg]
+float g_yaw_hold  = 0.0f;   // 保持したい相対方位 [deg]
+bool  g_yaw_holding = false; // 表示用: いま保持中か
+
+// シリアルから調整できるようにゲインだけ変数で持つ
+float g_yaw_hold_kp = Gain::YAW_HOLD_KP;
+
+// ---- ミキサーの報告 (ログ用) ----
+Q::MixInfo g_mix;
+
 } // anonymous namespace
+
+// ============================================================
+//  § 4-2  ログ出力 (USBシリアル → scripts/logger.py)
+// ============================================================
+//  drone.cpp から移植。logger.py / analyze_log.py が期待するプロトコル:
+//    HEADER,<列名>   ... LOG_START の直前に1回
+//    LOG_START       ... 記録開始
+//    DATA,<値,...>   ... 1サンプル
+//    LOG_STOP        ... 記録終了
+//  シリアルで 'l' を送るたびに 開始/停止 が切り替わる。
+//
+//  ★列名は drone.cpp と完全に同じにしてある。
+//    scripts/analyze_log.py を一切変更せずにそのまま使える。
+//
+//  10Hzの画面表示では数十Hzの振動は絶対に見えないので、
+//  制御ループと同じ土俵(500Hz)で全信号を落とす。
+namespace Log {
+
+constexpr int  LOG_HZ = 500;                    // 記録レート [Hz]
+constexpr int  DIV    = S4::MAIN_HZ / LOG_HZ;   // メインループ何回に1回
+constexpr char HEADER[] =
+    "t_ms,dt_us,mode,armed,thr,"
+    "roll_sbus,pitch_sbus,yaw_sbus,"
+    "roll_ang,pitch_ang,yaw_ang,"
+    "roll_gyr,pitch_gyr,yaw_gyr,"
+    "roll_cmd,pitch_cmd,yaw_cmd,"
+    "m1,m2,m3,m4,corr_limit,sat";
+
+bool     active  = false;
+uint32_t dropped = 0;   // USBが詰まって捨てたサンプル数
+uint32_t written = 0;
+int      div_cnt = 0;
+
+inline void start() {
+    Serial.println();
+    Serial.print("HEADER,"); Serial.println(HEADER);
+    Serial.println("LOG_START");
+    active  = true;
+    dropped = 0;
+    written = 0;
+    div_cnt = 0;
+}
+
+inline void stop() {
+    active = false;
+    Serial.println("LOG_STOP");
+    Serial.printf("INFO: %lu行記録 / %lu行ドロップ(USB詰まり)\n",
+                  (unsigned long)written, (unsigned long)dropped);
+}
+
+inline void toggle() { active ? stop() : start(); }
+
+// 1サンプル出力。★USBが詰まっていたら書かずに捨てる。
+//   ここでブロックすると制御ループが止まって、それ自体が振動源になる。
+inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
+    if (!active) return;
+    if (++div_cnt < DIV) return;
+    div_cnt = 0;
+
+    // 1行ぶん(約160バイト)の空きが無ければ捨てる
+    if (Serial.availableForWrite() < 200) { dropped++; return; }
+
+    // yaw_ang にはヘディングホールドの積分値を入れる。
+    // (Madgwick の6軸ヨーは意味を持たないので記録しても仕方がない)
+    Serial.printf(
+        "DATA,%lu,%lu,%d,%d,%.3f,"
+        "%.3f,%.3f,%.3f,"
+        "%.2f,%.2f,%.2f,"
+        "%.2f,%.2f,%.2f,"
+        "%.4f,%.4f,%.4f,"
+        "%.3f,%.3f,%.3f,%.3f,%.3f,%u\n",
+        (unsigned long)millis(), (unsigned long)dt_us, mode, armed ? 1 : 0, thr,
+        roll_axis.stick,     pitch_axis.stick,     yaw_axis.stick,
+        roll_axis.ang_meas,  pitch_axis.ang_meas,  g_yaw_est,
+        roll_axis.rate_meas, pitch_axis.rate_meas, yaw_axis.rate_meas,
+        roll_axis.cmd,       pitch_axis.cmd,       yaw_axis.cmd,
+        g_out[0], g_out[1], g_out[2], g_out[3],
+        g_mix.span_limit, (unsigned)g_mix.sat);
+    written++;
+}
+
+} // namespace Log
 
 // ============================================================
 //  § 5  周期実行のヘルパ
@@ -144,6 +291,8 @@ struct Ticker {
 
 static Ticker main_tick (S4::MAIN_HZ);
 static Ticker debug_tick(S4::DEBUG_HZ);
+static Ticker telem_tick(S4::TELEM_TX_HZ);
+static Ticker telem_rx_tick(S4::TELEM_RX_HZ);
 
 // ============================================================
 //  § 6  出力
@@ -155,6 +304,7 @@ static void writeMotors() {
 
 static void stopAllMotors() {
     for (int i = 0; i < Q::MOTOR_COUNT; ++i) g_out[i] = 0.0f;
+    g_mix = Q::MixInfo{};
     writeMotors();
 }
 
@@ -173,10 +323,41 @@ static void resetControllers() {
     yaw_axis.reset();
     g_angle_div_count = 0;
     g_angle_prev_us   = micros();
+
+    // ヘディングホールドも「今の向き」を基準に取り直す。
+    // 相対値なので 0 に戻すだけでよい。
+    g_yaw_est     = 0.0f;
+    g_yaw_hold    = 0.0f;
+    g_yaw_holding = false;
 }
 
 static const char* modeName(S4::Mode m) {
-    return (m == S4::MODE_ANGLE) ? "ANGLE (水平維持)" : "RATE  (アクロ)";
+    switch (m) {
+        case S4::MODE_AUTO:  return "AUTO  (地上局)";
+        case S4::MODE_ANGLE: return "ANGLE (水平維持)";
+        default:             return "RATE  (アクロ)";
+    }
+}
+
+// ------------------------------------------------------------
+//  モード判定
+//    優先度: AUTO (SW_AUTO UP かつ受信新鮮) > ANGLE (SW_HOVER UP) > RATE
+//
+//  ★ SW_AUTO が最優先なのは、パイロットが物理スイッチで明示的に権限委譲した
+//    場合のみ有効になるため。スイッチOFF、または IM920 リンクが途絶えた瞬間に
+//    下の優先順位へ自動的にフォールバックする (安全側)。
+//    drone.cpp の Flight_mode::update() と同じ考え方。
+// ------------------------------------------------------------
+static S4::Mode selectMode() {
+    if (!S4::USE_SBUS) return S4::MODE_RATE;
+
+    if (S4::USE_IM920 &&
+        sbus.Ch_state(Ch::SW_AUTO) == up &&
+        telemetry.groundLinkFresh()) {
+        return S4::MODE_AUTO;
+    }
+    if (sbus.Ch_state(Ch::SW_HOVER) == up) return S4::MODE_ANGLE;
+    return S4::MODE_RATE;
 }
 
 // ============================================================
@@ -184,8 +365,7 @@ static const char* modeName(S4::Mode m) {
 // ============================================================
 static void updateControl(float dt_s) {
     // --- モード判定 ---
-    g_mode = (S4::USE_SBUS && sbus.Ch_state(Ch::SW_HOVER) == up)
-             ? S4::MODE_ANGLE : S4::MODE_RATE;
+    g_mode = selectMode();
 
     const bool armed = isArmed();
 
@@ -213,17 +393,35 @@ static void updateControl(float dt_s) {
 
     roll_axis.ang_meas  = g_att.roll;
     pitch_axis.ang_meas = g_att.pitch;
-    yaw_axis.ang_meas   = g_att.yaw;
-
-    // --- スティック ---
-    roll_axis.stick  = Q::STICK_SIGN_ROLL  * sbus.des[Ch::ROLL];
-    pitch_axis.stick = Q::STICK_SIGN_PITCH * sbus.des[Ch::PITCH];
-    yaw_axis.stick   = Q::STICK_SIGN_YAW   * sbus.des[Ch::YAW];
+    // yaw_axis.ang_meas は § 7-2 でヘディングホールドの積分値を入れる。
+    // g_att.yaw (Madgwick の6軸ヨー) は絶対方位として意味を持たないので使わない。
 
     // ------------------------------------------------------------
-    //  外側ループ: 角度 → 目標角速度   (ANGLE モードのみ, 200Hz)
+    //  スティック入力
+    //
+    //  AUTO モードでは、地上局(position_estimator)が計算した RC相当コマンドを
+    //  スティック値の「代わりに」使う。以降の制御経路は ANGLE モードと完全に
+    //  同じなので、自律制御専用のPID経路は存在しない。
+    //
+    //  ★ スロットルだけは全モード共通で常に物理プロポから取る (下の thr)。
+    //    このコード全体の安全上の不変条件として崩さない。
+    //    g.ap_throttle はあえて使わない。
     // ------------------------------------------------------------
-    if (g_mode == S4::MODE_ANGLE) {
+    if (g_mode == S4::MODE_AUTO) {
+        const GroundData& g = telemetry.lastGroundData();
+        roll_axis.stick  = constrain(g.ap_roll,  -1.0f, 1.0f);
+        pitch_axis.stick = constrain(g.ap_pitch, -1.0f, 1.0f);
+        yaw_axis.stick   = constrain(g.ap_yaw,   -1.0f, 1.0f);
+    } else {
+        roll_axis.stick  = Q::STICK_SIGN_ROLL  * sbus.des[Ch::ROLL];
+        pitch_axis.stick = Q::STICK_SIGN_PITCH * sbus.des[Ch::PITCH];
+        yaw_axis.stick   = Q::STICK_SIGN_YAW   * sbus.des[Ch::YAW];
+    }
+
+    // ------------------------------------------------------------
+    //  外側ループ: 角度 → 目標角速度   (ANGLE / AUTO モード, 200Hz)
+    // ------------------------------------------------------------
+    if (g_mode == S4::MODE_ANGLE || g_mode == S4::MODE_AUTO) {
         roll_axis.ang_tar  = roll_axis.stick  * Q::MAX_ANGLE_ROLL;
         pitch_axis.ang_tar = pitch_axis.stick * Q::MAX_ANGLE_PITCH;
 
@@ -256,8 +454,43 @@ static void updateControl(float dt_s) {
         pitch_axis.rate_tar = pitch_axis.stick * Q::MAX_RATE_PITCH;
     }
 
-    // ヨーは常にレート指令
-    yaw_axis.rate_tar = yaw_axis.stick * Q::MAX_RATE_YAW;
+    // ------------------------------------------------------------
+    //  § 7-2  ヨー: ヘディングホールド
+    //
+    //  ・スティックを触っている間 → 素直にレート指令 (従来どおり)
+    //  ・中立に戻した瞬間          → そのときの方位を目標として保持
+    //
+    //  レートPIDの I項 (§1) は「回転速度を0にする」ところまでしか
+    //  保証しない。突風で30度振られたら、その30度は戻ってこない。
+    //  振られた分まで戻したいので、相対方位の外側ループを足す。
+    // ------------------------------------------------------------
+    //  積分は「制御に使っているジャイロ値」をそのまま使う。
+    //  こうするとレートループと位相が完全に揃う。
+    g_yaw_est += yaw_axis.rate_meas * dt_s;
+
+    const bool yaw_stick_active = (fabsf(yaw_axis.stick) > Gain::YAW_STICK_DEAD);
+
+    if (yaw_stick_active || !integrate) {
+        // 操作中、または低スロットル(地上)。
+        // 目標方位を現在値に追従させておくことで、スティックを離した
+        // 瞬間から「今の向き」の保持が始まる。
+        yaw_axis.rate_tar = yaw_axis.stick * Q::MAX_RATE_YAW;
+        g_yaw_hold        = g_yaw_est;
+        g_yaw_holding     = false;
+    } else {
+        // 中立: 保持方位との差を消しにいく
+        const float err = constrain(g_yaw_hold - g_yaw_est,
+                                    -Gain::YAW_HOLD_ERR_LIM,
+                                    +Gain::YAW_HOLD_ERR_LIM);
+        yaw_axis.rate_tar = constrain(g_yaw_hold_kp * err,
+                                      -Gain::YAW_HOLD_RATE_LIM,
+                                      +Gain::YAW_HOLD_RATE_LIM);
+        g_yaw_holding     = true;
+    }
+
+    // 表示用 (ヨーには角度PIDを通していないが、保持誤差をここに入れておく)
+    yaw_axis.ang_tar  = g_yaw_hold;
+    yaw_axis.ang_meas = g_yaw_est;
 
     // ------------------------------------------------------------
     //  内側ループ: 角速度 → トルク指令   (1000Hz)
@@ -267,7 +500,7 @@ static void updateControl(float dt_s) {
     yaw_axis.cmd   = yaw_axis.rate  .update(yaw_axis.rate_tar,   yaw_axis.rate_meas,   dt_s, integrate);
 
     // --- ミキサー ---
-    Q::mix(thr, roll_axis.cmd, pitch_axis.cmd, yaw_axis.cmd, g_out);
+    Q::mix(thr, roll_axis.cmd, pitch_axis.cmd, yaw_axis.cmd, g_out, &g_mix);
     writeMotors();
 }
 
@@ -296,6 +529,9 @@ static void tuningMenu() {
                   roll_axis.angle.kp(), roll_axis.angle.ki(), roll_axis.angle.kd());
     Serial.printf(" [d] Pitch P %9.4f  [e] Pitch I %9.4f  [f] Pitch D %9.4f\n",
                   pitch_axis.angle.kp(), pitch_axis.angle.ki(), pitch_axis.angle.kd());
+    Serial.println("-- ヘディングホールド (ヨー) --");
+    Serial.printf(" [h] Hold  P %9.4f   (0 にすると保持を切って従来のレートのみになる)\n",
+                  g_yaw_hold_kp);
     Serial.println(" [q] 抜ける");
     Serial.print("選択 > ");
 
@@ -313,6 +549,16 @@ static void tuningMenu() {
     Serial.print("新しい値 > ");
     const float v = Serial.parseFloat();
     Serial.println(v, 5);
+
+    // ヘディングホールドは Pid クラスではないので先に処理する
+    if (sel[0] == 'h') {
+        g_yaw_hold_kp = constrain(v, 0.0f, 20.0f);
+        Serial.printf("更新: ヘディングホールド kp=%.4f\n", g_yaw_hold_kp);
+        resetControllers();
+        Serial.setTimeout(old_timeout);
+        Serial.println("再開します。");
+        return;
+    }
 
     Q::Pid* pid = nullptr;
     int which = -1;   // 0=P 1=I 2=D
@@ -368,6 +614,10 @@ static void handleSerial() {
             resetControllers();
             Serial.println("PID reset");
             break;
+        case 'l':
+            // 500Hz ログの開始/停止。scripts/logger.py と対で使う。
+            Log::toggle();
+            break;
         default:
             break;
     }
@@ -383,9 +633,17 @@ static void printStatus(uint32_t dt_us) {
                   (unsigned long)dt_us, 1000000.0f / (float)dt_us,
                   isArmed() ? "ARMED" : "DISARMED",
                   sbus.isSafe() ? "OK" : "LOST");
-    Serial.printf("MODE = %s        (SW_HOVER が UP で ANGLE)\n", modeName(g_mode));
+    Serial.printf("MODE = %s   (SW_AUTO UP+受信新鮮 で AUTO / SW_HOVER UP で ANGLE)\n",
+                  modeName(g_mode));
 
-    if (g_mode == S4::MODE_ANGLE) {
+    if (S4::USE_IM920) {
+        const GroundData& g = telemetry.lastGroundData();
+        Serial.printf("IM920 link=%s   AP: roll=%+.3f pitch=%+.3f yaw=%+.3f (thr=%+.3f 未使用)\n",
+                      telemetry.groundLinkFresh() ? "FRESH" : "STALE",
+                      g.ap_roll, g.ap_pitch, g.ap_yaw, g.ap_throttle);
+    }
+
+    if (g_mode == S4::MODE_ANGLE || g_mode == S4::MODE_AUTO) {
         Serial.println("\n[角度ループ]  目標[deg]  実測[deg]  → 角速度目標[deg/s]");
         Serial.printf("  roll  %10.1f %10.1f %18.1f\n",
                       roll_axis.ang_tar, roll_axis.ang_meas, roll_axis.rate_tar);
@@ -404,8 +662,16 @@ static void printStatus(uint32_t dt_us) {
                   yaw_axis.rate_tar, yaw_axis.rate_meas,
                   yaw_axis.cmd, yaw_axis.rate.i_term());
 
-    Serial.printf("\n  attitude roll=%+7.2f pitch=%+7.2f yaw=%+7.2f [deg]  thr=%.2f\n",
-                  g_att.roll, g_att.pitch, g_att.yaw, sbus.des[Ch::THR]);
+    // --- ヘディングホールド ---
+    //  err がじわじわ片側に増え続けるなら、機体が回っているのではなく
+    //  ジャイロZのバイアスが残っている (= [k] で再キャリブレーションが必要)。
+    Serial.printf("\n[ヨー保持] %s  kp=%.2f  目標%+8.2f  推定%+8.2f  誤差%+7.2f [deg]\n",
+                  g_yaw_holding ? "HOLD  " : "STICK ",
+                  g_yaw_hold_kp, g_yaw_hold, g_yaw_est,
+                  g_yaw_hold - g_yaw_est);
+
+    Serial.printf("\n  attitude roll=%+7.2f pitch=%+7.2f [deg]  thr=%.2f\n",
+                  g_att.roll, g_att.pitch, sbus.des[Ch::THR]);
 
     Serial.println("\n[モーター]  M1=左前 M2=右前 M3=右後 M4=左後");
     for (int i = 0; i < Q::MOTOR_COUNT; ++i) {
@@ -415,7 +681,12 @@ static void printStatus(uint32_t dt_us) {
         Serial.println();
     }
 
-    Serial.println("\n[p] ゲイン調整  [k] IMUキャリブレーション  [r] PIDリセット");
+    Serial.printf("\n[ミキサー] span_limit=%.3f  scale=%.3f  sat=0b%c%c%c%c (M4..M1)\n",
+                  g_mix.span_limit, g_mix.scale,
+                  (g_mix.sat & 8) ? '1' : '0', (g_mix.sat & 4) ? '1' : '0',
+                  (g_mix.sat & 2) ? '1' : '0', (g_mix.sat & 1) ? '1' : '0');
+
+    Serial.println("\n[p] ゲイン調整  [k] IMUキャリブレーション  [r] PIDリセット  [l] ログ開始/停止");
 }
 
 // ============================================================
@@ -452,8 +723,9 @@ void setup() {
         stopAllMotors();
     }
 
-    if (S4::USE_SBUS) { Serial.println("Init SBUS..."); sbus.begin(); }
-    if (S4::USE_MPU)  { Serial.println("Init IMU...");  mpu.begin();  }
+    if (S4::USE_SBUS)  { Serial.println("Init SBUS...");  sbus.begin(); }
+    if (S4::USE_MPU)   { Serial.println("Init IMU...");   mpu.begin();  }
+    if (S4::USE_IM920) { Serial.println("Init IM920..."); telemetry.begin(); }
 
     resetControllers();
     Serial.println("--- Setup complete ---");
@@ -470,8 +742,26 @@ void loop() {
     }
     if (S4::USE_SBUS) sbus.update();
 
+    // 地上局からの受信。groundLinkFresh() の判定に使うので制御より前に読む。
+    // (PIDゲインのリモート調整やリモートリセットは行わない。receive() は
+    //  GroundData を取り込んで鮮度を更新するだけ)
+    if (S4::USE_IM920 && telem_rx_tick.ready()) telemetry.receive();
+
     updateControl(dt_s);
     handleSerial();
 
-    if (debug_tick.ready()) printStatus(main_tick.dt_us);
+    // 500Hz ログ (制御の直後。この周期の指令と出力が揃った状態で落とす)
+    Log::sample(main_tick.dt_us, (int)g_mode, isArmed(),
+                S4::USE_SBUS ? sbus.des[Ch::THR] : 0.0f);
+
+    // 姿勢テレメトリの送信 (10Hz)
+    //  yaw はヘディングホールドの積分値を送る。Madgwick の6軸ヨーは
+    //  絶対方位として意味を持たないため。
+    if (S4::USE_IM920 && telem_tick.ready()) {
+        telemetry.sendAttitudeOnly(g_att.roll, g_att.pitch, g_yaw_est);
+    }
+
+    // ログ中は画面表示を止める。同じUSBシリアルを奪い合うと
+    // ログが落ちるうえ、logger.py 側のパースも乱れる。
+    if (!Log::active && debug_tick.ready()) printStatus(main_tick.dt_us);
 }
