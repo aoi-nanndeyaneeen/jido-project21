@@ -22,8 +22,7 @@ from ui.view_rc import ViewRC
 
 
 def run_main_loop(cam1, cam2,
-                  K1, R1, tvec1,
-                  K2, R2, tvec2,
+                  calib1, calib2,
                   log_path,
                   alt_sensor,
                   field_points):
@@ -87,7 +86,7 @@ def run_main_loop(cam1, cam2,
     # ── カメラスレッド起動 ──────────────────────────────────
     cam_thread = threading.Thread(
         target=camera_thread_func,
-        args=(cam1, cam2, K1, R1, tvec1, K2, R2, tvec2,
+        args=(cam1, cam2, calib1, calib2,
               log_path, shared, plot_lock, plot_data),
         daemon=True)
     cam_thread.start()

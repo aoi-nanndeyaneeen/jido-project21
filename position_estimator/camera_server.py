@@ -1,4 +1,21 @@
-import cv2, socket, json, base64, numpy as np, time
+"""
+camera_server.py  [RPi上で単独実行]
+
+カメラサーバー。CALIB（フィールド基準点クリック）と STREAM（動体検知の配信）の
+2モードを持つ。position_estimator 本体からは import されない独立プロセス。
+
+検知パラメータは detection_params.json から読む（PC側 src/utils/config.py と
+同じファイル）。以前は両者に別々の数値がハードコードされていてずれていた。
+このファイルを RPi にも配置すること。
+"""
+
+import base64
+import json
+import socket
+import time
+from pathlib import Path
+
+import cv2
 
 HOST, PORT     = "0.0.0.0", 5555
 CAMERA_ID      = 0
@@ -8,10 +25,46 @@ TARGET_WIDTH   = 1280
 TARGET_HEIGHT  = 720
 TARGET_FPS     = 60   # config.py の CAMERA_FPS と合わせること
 
-# --- 差分パラメータ（config.py の値と合わせること） ---
-DIFF_THRESHOLD = 15
-MIN_AREA       = 40
-MORPH_KERNEL   = 5
+# オートフォーカスは必ず切る。フォーカスが動くと焦点距離が変わり、
+# 事前にチェッカーボードで測った内部パラメータ K が無効になる。
+DISABLE_AUTOFOCUS = True
+FOCUS_VALUE       = 0        # 0 = 無限遠
+LOCK_EXPOSURE_ON_STREAM = True
+
+DSHOW_EXPOSURE_MANUAL = 0.25
+
+# ── 検知パラメータ（PC側と共有）────────────────────────────────
+_DEFAULT_PARAMS = {
+    "diff_threshold": 12,
+    "min_area_px": 40,
+    "max_area_px": 20000,
+    "blur_kernel": 5,
+    "morph_kernel": 5,
+    "max_candidates": 8,
+    "use_background_subtractor": True,
+    "bg_history": 500,
+    "bg_var_threshold": 24.0,
+    "bg_learning_rate": 0.0005,
+    "vibration_reject_ratio": 0.06,
+}
+
+
+def load_params():
+    path = Path(__file__).resolve().parent / "detection_params.json"
+    params = dict(_DEFAULT_PARAMS)
+    try:
+        with open(path, encoding="utf-8") as f:
+            loaded = json.load(f)
+        params.update({k: v for k, v in loaded.items() if not k.startswith("_")})
+        print(f"[RPi] 検知パラメータを読み込み: {path.name}")
+    except FileNotFoundError:
+        print("[RPi] detection_params.json が無いため既定値を使用します")
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[RPi] detection_params.json 読込失敗（既定値を使用）: {e}")
+    return params
+
+
+P = load_params()
 
 # ── 共有状態（モジュールレベル） ─────────────────────────────
 calib_pts    = []
@@ -19,21 +72,119 @@ shared_state = {"quit": False}
 
 
 # ── 動体検知 ──────────────────────────────────────────────────
-def detect_plane(prev_gray, curr_gray):
-    diff = cv2.absdiff(prev_gray, curr_gray)
-    _, thresh = cv2.threshold(diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (MORPH_KERNEL, MORPH_KERNEL))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, k)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < MIN_AREA:
-        return None
-    M = cv2.moments(largest)
-    if M["m00"] == 0:
-        return None
-    return (M["m10"] / M["m00"], M["m01"] / M["m00"])
+class Detector:
+    """
+    動体候補を「複数」返す検知器。
+
+    候補を1個に絞らないのは、42m先だと機体も人も20px程度で
+    大きさも形も区別がつかないため。どれが機体かはPC側が
+    2カメラの幾何整合（三角測量の残差とフィールド内判定）で決める。
+    """
+
+    def __init__(self):
+        self.blur = (P["blur_kernel"], P["blur_kernel"])
+        self.kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (P["morph_kernel"], P["morph_kernel"]))
+        self.prev_gray = None
+        self.bg = None
+        self.vibration_rejected = False
+        if P["use_background_subtractor"]:
+            self.bg = self._make_bg()
+
+    def _make_bg(self):
+        return cv2.createBackgroundSubtractorMOG2(
+            history=P["bg_history"],
+            varThreshold=P["bg_var_threshold"],
+            detectShadows=False,
+        )
+
+    def reset(self):
+        self.prev_gray = None
+        if self.bg is not None:
+            self.bg = self._make_bg()
+
+    def _mask(self, gray_blurred):
+        if self.bg is not None:
+            m = self.bg.apply(gray_blurred, learningRate=P["bg_learning_rate"])
+            _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
+            return m
+
+        if self.prev_gray is None:
+            self.prev_gray = gray_blurred
+            return None
+        diff = cv2.absdiff(self.prev_gray, gray_blurred)
+        _, m = cv2.threshold(diff, P["diff_threshold"], 255, cv2.THRESH_BINARY)
+        self.prev_gray = gray_blurred
+        return m
+
+    def detect(self, frame):
+        """[(u, v, area, x, y, w, h), ...] を面積の大きい順に返す。"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, self.blur, 0)
+
+        mask = self._mask(gray)
+        self.vibration_rejected = False
+        if mask is None:
+            return []
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
+
+        # 三脚の揺れ・照明の急変で画面全体が前景になったフレームは丸ごと捨てる
+        if cv2.countNonZero(mask) / float(mask.size) > P["vibration_reject_ratio"]:
+            self.vibration_rejected = True
+            return []
+
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        out = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < P["min_area_px"] or area > P["max_area_px"]:
+                continue
+            M = cv2.moments(c)
+            if M["m00"] == 0:
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            out.append([M["m10"] / M["m00"], M["m01"] / M["m00"],
+                        float(area), int(x), int(y), int(w), int(h)])
+
+        out.sort(key=lambda c: -c[2])
+        return out[:P["max_candidates"]]
+
+
+# ── カメラ設定 ────────────────────────────────────────────────
+def apply_focus_settings(cap):
+    if not DISABLE_AUTOFOCUS:
+        return
+    try:
+        cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+        cap.set(cv2.CAP_PROP_FOCUS, FOCUS_VALUE)
+        print("[RPi] オートフォーカス無効・無限遠固定")
+    except Exception as e:
+        print(f"[RPi] [WARN] フォーカス設定に失敗: {e}")
+
+
+def lock_exposure(cap):
+    """
+    現在の自動露出の結果を読み取り、その値で固定する。
+
+    STREAM開始時（＝競技開始時）に呼ぶ。それまでは自動のままなので
+    会場の明るさに勝手に合い、当日の手作業は不要。
+    """
+    if not LOCK_EXPOSURE_ON_STREAM:
+        return
+    try:
+        exposure = cap.get(cv2.CAP_PROP_EXPOSURE)
+        wb = cap.get(cv2.CAP_PROP_WB_TEMPERATURE)
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, DSHOW_EXPOSURE_MANUAL)
+        cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
+        cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+        if wb and wb > 0:
+            cap.set(cv2.CAP_PROP_WB_TEMPERATURE, wb)
+        print(f"[RPi] 露出を固定 (exposure={exposure:.1f}, wb={wb:.0f})")
+    except Exception as e:
+        print(f"[RPi] [WARN] 露出固定に失敗（自動のまま続行）: {e}")
 
 
 # ── マウスコールバック（接続前から有効） ─────────────────────
@@ -159,42 +310,59 @@ def handle_calib(conn, cap, use_display):
 
 # ── ストリーミングモード ──────────────────────────────────────
 def handle_stream(conn, cap, use_display):
-    ret, frame = cap.read()
-    if not ret:
-        return
-    prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    detector = Detector()
+    lock_exposure(cap)
 
     while not shared_state["quit"]:
         ret, frame = cap.read()
+        ts = time.time()
         if not ret:
             break
-        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        pt = detect_plane(prev_gray, curr_gray)
-        prev_gray = curr_gray
+
+        cands = detector.detect(frame)
+        best = cands[0] if cands else None
 
         if use_display:
             disp = draw_overlay(frame)
-            if pt:
-                cx, cy = int(pt[0]), int(pt[1])
-                cv2.circle(disp, (cx, cy), 12, (0, 255, 0), 2)
-                cv2.circle(disp, (cx, cy),  3, (0, 255, 0), -1)
-                cv2.putText(disp, f"({cx},{cy})", (cx + 16, cy - 16),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            else:
-                cv2.putText(disp, "NO TARGET", (20, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (80, 80, 80), 2)
-            cv2.putText(disp, "STREAMING", (20, TARGET_HEIGHT - 20),
+            for i, c in enumerate(cands):
+                cu, cvv = int(c[0]), int(c[1])
+                is_best = (i == 0)
+                color = (0, 255, 0) if is_best else (110, 110, 110)
+                cv2.rectangle(disp, (c[3], c[4]), (c[3] + c[5], c[4] + c[6]),
+                              color, 2 if is_best else 1)
+                if is_best:
+                    cv2.circle(disp, (cu, cvv), 3, (0, 255, 0), -1)
+                    cv2.putText(disp, f"({cu},{cvv})", (cu + 16, cvv - 16),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            if not cands:
+                label = ("FRAME REJECTED" if detector.vibration_rejected
+                         else "NO TARGET")
+                color = ((0, 140, 255) if detector.vibration_rejected
+                         else (80, 80, 80))
+                cv2.putText(disp, label, (20, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 2)
+            cv2.putText(disp, f"STREAMING  cands={len(cands)}",
+                        (20, TARGET_HEIGHT - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
             cv2.imshow("RPi Camera", disp)
             cv2.waitKey(1)
 
-        payload = {"pt": pt}
+        payload = {
+            # 候補リスト [u, v, area, x, y, w, h]（PC側が幾何整合で選ぶ）
+            "pts": cands,
+            # 後方互換: 従来の単一点フィールド
+            "pt": [best[0], best[1]] if best else None,
+            # 2カメラの時刻ずれ補正用（Phase C のカルマン予測で使用）
+            "t": ts,
+            "rejected": detector.vibration_rejected,
+        }
         if SEND_PREVIEW:
             small = cv2.resize(frame, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE)
-            if pt:
+            for i, c in enumerate(cands):
                 cv2.circle(small,
-                           (int(pt[0] * PREVIEW_SCALE), int(pt[1] * PREVIEW_SCALE)),
-                           8, (0, 255, 0), 2)
+                           (int(c[0] * PREVIEW_SCALE), int(c[1] * PREVIEW_SCALE)),
+                           8, (0, 255, 0) if i == 0 else (110, 110, 110),
+                           2 if i == 0 else 1)
             _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 60])
             payload["frame"] = base64.b64encode(buf).decode()
 
@@ -211,6 +379,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  TARGET_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, TARGET_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS,          TARGET_FPS)
+    apply_focus_settings(cap)
 
     ret, frame = cap.read()
     if not ret:

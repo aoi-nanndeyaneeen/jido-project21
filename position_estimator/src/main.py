@@ -51,7 +51,7 @@ def main():
 
     cam1_ok = cam1.cap.isOpened() and cam1.width > 0
     try:
-        K1, R1, tvec1, K2, R2, tvec2, cam2 = run_calibration_phase(
+        calib1, calib2, cam2 = run_calibration_phase(
             cam1, cam1_ok, cam2_ok_rpi, cam2
         )
     except RuntimeError as e:
@@ -60,7 +60,7 @@ def main():
         cam2.release()
         return
 
-    run_main_loop(cam1, cam2, K1, R1, tvec1, K2, R2, tvec2,
+    run_main_loop(cam1, cam2, calib1, calib2,
                   log_path, alt_sensor, FIELD_POINTS)
 
 

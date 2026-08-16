@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "検知パラメータの唯一の正 (single source of truth)。",
+    "PC側 src/utils/config.py と RPi側 camera_server.py の両方がこのファイルを読む。",
+    "以前は両者に別々の数値がハードコードされていてずれていた (DIFF_THRESHOLD 15 vs 10 など)。",
+    "RPi側だけ調整したい場合は RPi 上のこのファイルを編集すればコード変更不要。"
+  ],
+
+  "diff_threshold": 12,
+  "min_area_px": 40,
+  "max_area_px": 20000,
+  "blur_kernel": 5,
+  "morph_kernel": 5,
+
+  "_comment_candidates": "Phase B で使用。各カメラが1フレームに返す候補の最大数。",
+  "max_candidates": 8,
+
+  "_comment_bg": [
+    "背景差分 (MOG2) の設定。前フレーム差分から移行。",
+    "learning_rate をほぼ 0 にして、キャリブ直後の背景を固定する。",
+    "ドローンはホバリングするため、学習率が高いと静止機体が背景に吸収されて消える。"
+  ],
+  "use_background_subtractor": true,
+  "bg_history": 500,
+  "bg_var_threshold": 24.0,
+  "bg_learning_rate": 0.0005,
+
+  "_comment_vibration": [
+    "前景画素が画面全体のこの割合を超えたフレームは丸ごと破棄する。",
+    "三脚の揺れ・照明の急変・自動露出の追従で全画面が反応した場合の保険。"
+  ],
+  "vibration_reject_ratio": 0.06
+}

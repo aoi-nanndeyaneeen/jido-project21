@@ -1,6 +1,42 @@
+"""
+core/camera.py
+ローカルUSBカメラの制御と動体検知。
+
+検知は「候補を1個に絞って返す」のではなく「候補リストを返す」設計。
+どれが機体かは1枚の画像では決められない（42m先だと機体も人も20px程度で
+大きさも形も区別がつかない）ため、選択は2カメラの幾何整合に任せる。
+"""
+
+import time
+from typing import NamedTuple
+
 import cv2
+
 from core.geometry import approx_camera_matrix
-from utils.config import DIFF_THRESHOLD, MIN_AREA_PX, BLUR_KERNEL, MORPH_KERNEL, CAMERA_FPS
+from utils.config import (DIFF_THRESHOLD, MIN_AREA_PX, MAX_AREA_PX,
+                          BLUR_KERNEL, MORPH_KERNEL, CAMERA_FPS,
+                          MAX_CANDIDATES, USE_BG_SUBTRACTOR,
+                          BG_HISTORY, BG_VAR_THRESHOLD, BG_LEARNING_RATE,
+                          VIBRATION_REJECT_RATIO,
+                          CAMERA_AUTOFOCUS, CAMERA_FOCUS_VALUE,
+                          USE_MEASURED_INTRINSICS,
+                          FALLBACK_HFOV_DEG, FALLBACK_HFOV_DEFAULT)
+
+
+class Candidate(NamedTuple):
+    """1フレーム内の動体候補。どれが機体かはこの時点では未確定。"""
+    u: float
+    v: float
+    area: float
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+# DirectShow の自動露出プロパティは 0.75=自動 / 0.25=手動 という慣習
+DSHOW_EXPOSURE_AUTO   = 0.75
+DSHOW_EXPOSURE_MANUAL = 0.25
 
 
 class CameraTracker:
@@ -27,66 +63,246 @@ class CameraTracker:
 
         self.width  = int(actual_w) if actual_w > 0 else width
         self.height = int(actual_h) if actual_h > 0 else height
-        self.prev_gray = None
 
-        # ── 差分パラメータ（config.py で調整可能） ──────────
+        self._apply_focus_settings()
+
+        # ── 検知パラメータ（detection_params.json 由来） ────────
         self.blur_size      = (BLUR_KERNEL, BLUR_KERNEL)
         self.diff_threshold = DIFF_THRESHOLD
         self.min_area       = MIN_AREA_PX
+        self.max_area       = MAX_AREA_PX
         self._morph_kernel  = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (MORPH_KERNEL, MORPH_KERNEL)
         )
 
+        self.prev_gray = None
+        self._bg = None
+        if USE_BG_SUBTRACTOR:
+            self._bg = self._make_bg_subtractor()
+
+        self.exposure_locked = False
+        self.last_frame_time = 0.0
+        self.last_candidates = []
+        self.vibration_rejected = False
+
+    # ------------------------------------------------------------------
+    # カメラ設定
+    # ------------------------------------------------------------------
+    def _apply_focus_settings(self):
+        """
+        オートフォーカスを切って無限遠に固定する。
+
+        ★ ノイズ対策ではなく幾何精度の話。フォーカスが動くと焦点距離が
+          変わるため、チェッカーボードで測った K が意味を失う。
+          対象は15〜60m先なので無限遠固定で問題ない。
+        """
+        if CAMERA_AUTOFOCUS:
+            print(f"  [{self.label}] [WARN] オートフォーカスが有効のままです。"
+                  "内部パラメータが飛行中に変化します。")
+            return
+        try:
+            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+            self.cap.set(cv2.CAP_PROP_FOCUS, CAMERA_FOCUS_VALUE)
+            af = self.cap.get(cv2.CAP_PROP_AUTOFOCUS)
+            if af and af > 0:
+                print(f"  [{self.label}] [WARN] オートフォーカスを無効化できませんでした。"
+                      "カメラ本体側で固定してください。")
+            else:
+                print(f"  [{self.label}] オートフォーカス無効・無限遠固定")
+        except cv2.error as e:
+            print(f"  [{self.label}] [WARN] フォーカス設定に失敗: {e}")
+
+    def lock_exposure(self):
+        """
+        現在の自動露出・自動WBの結果を読み取り、その値で固定する。
+
+        キャリブレーション完了時点で呼ぶ想定。会場の明るさには自動で
+        合わせたうえで、競技中は変動させない。当日の手作業はゼロ。
+        """
+        if not isinstance(self.camera_url, int):
+            return False
+        try:
+            exposure = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+            wb       = self.cap.get(cv2.CAP_PROP_WB_TEMPERATURE)
+
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, DSHOW_EXPOSURE_MANUAL)
+            self.cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
+            self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+            if wb and wb > 0:
+                self.cap.set(cv2.CAP_PROP_WB_TEMPERATURE, wb)
+
+            mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+            ok = abs(mode - DSHOW_EXPOSURE_MANUAL) < 0.1
+            if ok:
+                print(f"  [{self.label}] 露出を固定 (exposure={exposure:.1f}, wb={wb:.0f})")
+            else:
+                print(f"  [{self.label}] [WARN] 露出の固定に失敗しました。"
+                      "自動のまま続行します（振動フレーム破棄で吸収されます）。")
+            self.exposure_locked = ok
+            return ok
+        except cv2.error as e:
+            print(f"  [{self.label}] [WARN] 露出固定に失敗: {e}")
+            return False
+
+    def get_intrinsics(self):
+        """
+        内部パラメータ (K, dist) を返す。
+
+        事前実測値（calib/intrinsics_<label>.json）があればそれを使い、
+        無ければ公称画角からの概算にフォールバックする。
+        """
+        if USE_MEASURED_INTRINSICS:
+            from utils.calib_store import load_intrinsics
+            m = load_intrinsics(self.label, self.width, self.height)
+            if m is not None:
+                return m["K"], m["dist"]
+
+        hfov = FALLBACK_HFOV_DEG.get(self.label, FALLBACK_HFOV_DEFAULT)
+        print(f"  [{self.label}] [WARN] 実測の内部パラメータがありません。"
+              f"公称画角 {hfov:.1f}° から概算します。")
+        print(f"             tools/calibrate_intrinsics.py --label {self.label} "
+              "で事前に実測してください。")
+        return approx_camera_matrix(self.width, self.height, hfov), None
+
     def get_approx_camera_matrix(self):
-        return approx_camera_matrix(self.width, self.height)
+        """後方互換。新しいコードは get_intrinsics() を使うこと。"""
+        return self.get_intrinsics()[0]
 
-    def read_and_track(self):
-        ret, frame = self.cap.read()
-        if not ret or frame is None:
-            return None, None
+    # ------------------------------------------------------------------
+    # 検知
+    # ------------------------------------------------------------------
+    def _make_bg_subtractor(self):
+        """
+        MOG2 背景差分器を作る。
 
-        gray         = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_blurred = cv2.GaussianBlur(gray, self.blur_size, 0)
+        前フレーム差分ではなく背景差分にする理由:
+          ・前フレーム差分は移動前と移動後の両方が光るため（ゴースト）、
+            重心が実際の機体より後ろにずれ、しかもずれ量が速度で変わる。
+          ・背景差分ならその歪みが出ない。
+        学習率はほぼ0に設定する（config側）。ドローンはホバリングするので
+        学習率が高いと静止した機体が背景に吸収されて消えてしまう。
+        """
+        return cv2.createBackgroundSubtractorMOG2(
+            history=BG_HISTORY,
+            varThreshold=BG_VAR_THRESHOLD,
+            detectShadows=False,
+        )
 
-        center_uv = None
+    def _foreground_mask(self, gray_blurred):
+        """前景マスクを作る。背景差分器が無効なら前フレーム差分にフォールバック。"""
+        if self._bg is not None:
+            mask = self._bg.apply(gray_blurred, learningRate=BG_LEARNING_RATE)
+            _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+            return mask
 
         if self.prev_gray is None:
             self.prev_gray = gray_blurred
-        else:
-            diff = cv2.absdiff(self.prev_gray, gray_blurred)
-            _, thresh = cv2.threshold(
-                diff, self.diff_threshold, 255, cv2.THRESH_BINARY
-            )
-            thresh = cv2.morphologyEx(
-                thresh, cv2.MORPH_OPEN, self._morph_kernel
-            )
+            return None
+        diff = cv2.absdiff(self.prev_gray, gray_blurred)
+        _, mask = cv2.threshold(diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
+        self.prev_gray = gray_blurred
+        return mask
 
-            contours, _ = cv2.findContours(
-                thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            if contours:
-                largest = max(contours, key=cv2.contourArea)
-                if cv2.contourArea(largest) > self.min_area:
-                    M = cv2.moments(largest)
-                    if M["m00"] != 0:
-                        cx = int(M["m10"] / M["m00"])
-                        cy = int(M["m01"] / M["m00"])
-                        center_uv = (cx, cy)
-                        x, y, w, h = cv2.boundingRect(largest)
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                        cv2.circle(frame, center_uv, 5, (0, 0, 255), -1)
-                        cv2.putText(frame, f"({cx},{cy})", (cx+10, cy-10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    def detect(self, frame):
+        """
+        1フレームから動体候補のリストを返す（面積の大きい順、最大 MAX_CANDIDATES 個）。
 
-            self.prev_gray = gray_blurred
+        ここでは「どれが機体か」を決めない。1枚の画像からは決められないため。
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_blurred = cv2.GaussianBlur(gray, self.blur_size, 0)
+
+        mask = self._foreground_mask(gray_blurred)
+        self.vibration_rejected = False
+        if mask is None:
+            return []
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._morph_kernel)
+
+        # ── 振動・照明急変フレームの破棄 ───────────────────
+        # 三脚が揺れる／自動露出が追従する／照明が変わると画面全体が
+        # 前景になる。そのフレームは検知結果を丸ごと捨てる。
+        fg_ratio = cv2.countNonZero(mask) / float(mask.size)
+        if fg_ratio > VIBRATION_REJECT_RATIO:
+            self.vibration_rejected = True
+            return []
+
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        candidates = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < self.min_area or area > self.max_area:
+                continue
+            M = cv2.moments(c)
+            if M["m00"] == 0:
+                continue
+            cu = M["m10"] / M["m00"]
+            cv_ = M["m01"] / M["m00"]
+            x, y, w, h = cv2.boundingRect(c)
+            candidates.append(Candidate(cu, cv_, float(area), x, y, w, h))
+
+        candidates.sort(key=lambda c: -c.area)
+        return candidates[:MAX_CANDIDATES]
+
+    def draw_candidates(self, frame, candidates, best_index=None):
+        """候補を重ねて描く。採用された候補だけ強調する。"""
+        for i, c in enumerate(candidates):
+            is_best = (best_index is not None and i == best_index)
+            color = (0, 255, 0) if is_best else (110, 110, 110)
+            thickness = 2 if is_best else 1
+            cv2.rectangle(frame, (c.x, c.y), (c.x + c.w, c.y + c.h),
+                          color, thickness)
+            if is_best:
+                cv2.circle(frame, (int(c.u), int(c.v)), 5, (0, 0, 255), -1)
+                cv2.putText(frame, f"({int(c.u)},{int(c.v)})",
+                            (int(c.u) + 10, int(c.v) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         cv2.putText(frame, self.label, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 200, 0), 2)
+        if self.vibration_rejected:
+            cv2.putText(frame, "FRAME REJECTED (vibration/lighting)", (10, 66),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 140, 255), 2)
 
+    def read_and_detect(self):
+        """
+        フレームを読んで候補リストを返す。
+
+        Returns:
+            (frame, candidates, timestamp) — 取得失敗時は (None, [], 0.0)
+        """
+        ret, frame = self.cap.read()
+        ts = time.time()
+        if not ret or frame is None:
+            return None, [], 0.0
+
+        candidates = self.detect(frame)
+        self.last_frame_time = ts
+        self.last_candidates = candidates
+        return frame, candidates, ts
+
+    def read_and_track(self):
+        """
+        後方互換API。候補のうち最大面積のものを1点だけ返す。
+
+        ※ Phase B で tracker 側を read_and_detect() に切り替えたら削除する。
+        """
+        frame, candidates, _ = self.read_and_detect()
+        if frame is None:
+            return None, None
+
+        best_index = 0 if candidates else None
+        self.draw_candidates(frame, candidates, best_index)
+        center_uv = (candidates[0].u, candidates[0].v) if candidates else None
         return frame, center_uv
 
     def reset_background(self):
         self.prev_gray = None
+        if self._bg is not None:
+            self._bg = self._make_bg_subtractor()
 
     def release(self):
         self.cap.release()

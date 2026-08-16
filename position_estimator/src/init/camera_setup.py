@@ -8,15 +8,25 @@ Camera2の本接続はキャリブレーション完了後に calibration_flow.p
 import socket
 from core.camera import CameraTracker
 from core.geometry import approx_camera_matrix
-from utils.config import CAMERA_1_URL, CAMERA_W, CAMERA_H, RPI_HOST, RPI_PORT
+from utils.config import (CAMERA_1_URL, CAMERA_W, CAMERA_H, RPI_HOST, RPI_PORT,
+                          FALLBACK_HFOV_DEFAULT)
 
 
 class _DummyCam2:
     """Camera2本接続前のプレースホルダー。tracker.pyから同じインターフェースで呼べる。"""
     width, height = 1280, 720
+    label = "Camera2"
+    last_frame_time = 0.0
+    vibration_rejected = False
+
+    def read_and_detect(self):
+        return None, [], 0.0
 
     def read_and_track(self):
         return None, None
+
+    def draw_candidates(self, frame, candidates, best_index=None):
+        pass
 
     def reset_background(self):
         pass
@@ -24,8 +34,12 @@ class _DummyCam2:
     def release(self):
         pass
 
+    def get_intrinsics(self):
+        return approx_camera_matrix(self.width, self.height,
+                                    FALLBACK_HFOV_DEFAULT), None
+
     def get_approx_camera_matrix(self):
-        return approx_camera_matrix(self.width, self.height)
+        return self.get_intrinsics()[0]
 
 
 def init_cameras():

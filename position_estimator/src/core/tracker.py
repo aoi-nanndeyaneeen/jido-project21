@@ -16,7 +16,7 @@ import time
 import traceback
 from pathlib import Path
 
-from core.geometry     import get_ray, intersect_rays
+from core.geometry     import intersect_rays
 from core.dummy_flight import DummyFlight
 from utils.logger      import FlightLogger
 from utils.config      import (MAX_RESIDUAL_M,
@@ -77,15 +77,14 @@ class PixelJumpFilter:
 
 
 def camera_thread_func(cam1, cam2,
-                       K1, R1, tvec1,
-                       K2, R2, tvec2,
+                       calib1, calib2,
                        log_path: Path,
                        shared: dict,
                        plot_lock: threading.Lock,
                        plot_data: dict):
 
-    O1_fixed = (-R1.T.dot(tvec1)).flatten()
-    O2_fixed = (-R2.T.dot(tvec2)).flatten()
+    O1_fixed = calib1.origin
+    O2_fixed = calib2.origin
 
     log   = FlightLogger(log_path)
     dummy = DummyFlight(DUMMY_ORBIT_RADIUS, DUMMY_ORBIT_ALT, DUMMY_ORBIT_PERIOD)
@@ -131,8 +130,8 @@ def camera_thread_func(cam1, cam2,
                 status_color = (128, 128, 128)
 
                 if uv1 is not None and uv2 is not None:
-                    _, D1 = get_ray(uv1[0], uv1[1], K1, R1, tvec1)
-                    _, D2 = get_ray(uv2[0], uv2[1], K2, R2, tvec2)
+                    _, D1 = calib1.ray(uv1[0], uv1[1])
+                    _, D2 = calib2.ray(uv2[0], uv2[1])
                     P_raw, res = intersect_rays(O1_fixed, D1, O2_fixed, D2)
 
                     if P_raw is None:

@@ -1,6 +1,9 @@
 import socket, json, base64, cv2, time
 import numpy as np
+from core.camera import Candidate
 from core.geometry import approx_camera_matrix
+from utils.config import (USE_MEASURED_INTRINSICS, FALLBACK_HFOV_DEG,
+                          FALLBACK_HFOV_DEFAULT)
 
 RECONNECT_INTERVAL_S = 1.0   # 切断後、何秒おきに再接続を試みるか
 CONNECT_TIMEOUT_S    = 1.0   # 接続試行1回あたりの上限（呼び出し元スレッドを長時間止めないため）
@@ -17,6 +20,8 @@ class RemoteCamera:
         self.height = None
         self._mode  = "STREAM"          # 再接続時に同じモードで繋ぎ直すため保持
         self._next_reconnect_t = 0.0
+        self.last_frame_time    = 0.0
+        self.vibration_rejected = False
 
     def connect(self, mode: str = "STREAM"):
         """
@@ -113,40 +118,65 @@ class RemoteCamera:
         line, self.buf = self.buf.split("\n", 1)
         return line
 
-    def read_and_track(self):
+    @staticmethod
+    def _parse_candidates(d) -> list:
+        """
+        RPiから届いた候補リストを Candidate に変換する。
+
+        新形式 "pts": [[u, v, area, x, y, w, h], ...]
+        旧形式 "pt" : [u, v]                      （古いRPiとの後方互換）
+        """
+        pts = d.get("pts")
+        if pts:
+            out = []
+            for p in pts:
+                if len(p) >= 7:
+                    out.append(Candidate(p[0], p[1], p[2],
+                                         int(p[3]), int(p[4]), int(p[5]), int(p[6])))
+                elif len(p) >= 2:
+                    area = p[2] if len(p) > 2 else 0.0
+                    out.append(Candidate(p[0], p[1], area,
+                                         int(p[0]), int(p[1]), 0, 0))
+            return out
+
+        pt = d.get("pt")
+        if pt:
+            return [Candidate(pt[0], pt[1], 0.0, int(pt[0]), int(pt[1]), 0, 0)]
+        return []
+
+    def read_and_detect(self):
+        """
+        RPiから1フレーム分の検知結果を受け取る。
+
+        Returns:
+            (frame, candidates, timestamp) — 未接続・受信失敗時は (None, [], 0.0)
+            ※ frame は帯域節約のため縮小済みプレビュー。座標はフル解像度基準。
+        """
         if self.sock is None:
             # 切断中：一定間隔でだけ再接続を試み、それ以外は即座に「未検出」として戻る
             self._try_reconnect()
             if self.sock is None:
-                return None, None
+                return None, [], 0.0
 
         try:
             line = self._readline()
             d = json.loads(line)
-            pt = d.get("pt")
-            center_uv = (pt[0], pt[1]) if pt else None
+            candidates = self._parse_candidates(d)
+            # RPi側で打刻した時刻。2カメラの時刻ずれ補正に使う
+            ts = d.get("t") or time.time()
+            self.last_frame_time = ts
+            self.vibration_rejected = bool(d.get("rejected", False))
 
             frame = None
             if "frame" in d:
                 img_bytes = base64.b64decode(d["frame"])
                 arr = np.frombuffer(img_bytes, dtype=np.uint8)
                 frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if frame is not None and center_uv:
-                    scale_x = frame.shape[1] / self.width
-                    scale_y = frame.shape[0] / self.height
-                    dx = int(center_uv[0] * scale_x)
-                    dy = int(center_uv[1] * scale_y)
-                    cv2.circle(frame, (dx, dy), 8, (0, 255, 0), 2)
-                    cv2.putText(frame, f"({int(center_uv[0])},{int(center_uv[1])})",
-                                (dx + 12, dy - 12),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                if frame is not None:
-                    cv2.putText(frame, self.label, (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 200, 0), 2)
-            return frame, center_uv
+
+            return frame, candidates, ts
 
         except (socket.timeout, json.JSONDecodeError):
-            return None, None
+            return None, [], 0.0
 
         except (ConnectionError, OSError) as e:
             # 相手（ラズパイ）の再起動・切断など。ソケットを畳んで次回から再接続を試みる。
@@ -157,10 +187,64 @@ class RemoteCamera:
                 pass
             self.sock = None
             self.buf = ""
-            return None, None
+            return None, [], 0.0
+
+    def draw_candidates(self, frame, candidates, best_index=None):
+        """プレビュー（縮小済み）に候補を描く。座標はフル解像度基準なので変換する。"""
+        if frame is None:
+            return
+        sx = frame.shape[1] / self.width  if self.width  else 1.0
+        sy = frame.shape[0] / self.height if self.height else 1.0
+
+        for i, c in enumerate(candidates):
+            is_best = (best_index is not None and i == best_index)
+            color = (0, 255, 0) if is_best else (110, 110, 110)
+            dx, dy = int(c.u * sx), int(c.v * sy)
+            cv2.circle(frame, (dx, dy), 8 if is_best else 5, color,
+                       2 if is_best else 1)
+            if is_best:
+                cv2.putText(frame, f"({int(c.u)},{int(c.v)})", (dx + 12, dy - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        cv2.putText(frame, self.label, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 200, 0), 2)
+        if self.vibration_rejected:
+            cv2.putText(frame, "FRAME REJECTED", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
+
+    def read_and_track(self):
+        """
+        後方互換API。候補のうち最大面積のものを1点だけ返す。
+
+        ※ Phase B で tracker 側を read_and_detect() に切り替えたら削除する。
+        """
+        frame, candidates, _ = self.read_and_detect()
+        best_index = 0 if candidates else None
+        self.draw_candidates(frame, candidates, best_index)
+        center_uv = (candidates[0].u, candidates[0].v) if candidates else None
+        return frame, center_uv
+
+    def get_intrinsics(self):
+        """
+        内部パラメータ (K, dist) を返す。
+        事前実測値があればそれを使い、無ければ公称画角からの概算にフォールバック。
+        """
+        if USE_MEASURED_INTRINSICS:
+            from utils.calib_store import load_intrinsics
+            m = load_intrinsics(self.label, self.width, self.height)
+            if m is not None:
+                return m["K"], m["dist"]
+
+        hfov = FALLBACK_HFOV_DEG.get(self.label, FALLBACK_HFOV_DEFAULT)
+        print(f"  [{self.label}] [WARN] 実測の内部パラメータがありません。"
+              f"公称画角 {hfov:.1f}° から概算します。")
+        print(f"             tools/calibrate_intrinsics.py --label {self.label} "
+              "で事前に実測してください。")
+        return approx_camera_matrix(self.width, self.height, hfov), None
 
     def get_approx_camera_matrix(self):
-        return approx_camera_matrix(self.width, self.height)
+        """後方互換。新しいコードは get_intrinsics() を使うこと。"""
+        return self.get_intrinsics()[0]
 
     def reset_background(self):
         pass
