@@ -63,8 +63,8 @@ namespace Gain {
 
 // ---- レート (内側ループ) ----  Stage 3 で決めた値をここに写す
 //                        kp      ki      kd
-constexpr float RATE_ROLL [3] = { 0.0200f, 0.0f, 0.00400f };
-constexpr float RATE_PITCH[3] = { 0.0200f, 0.0f, 0.00400f };
+constexpr float RATE_ROLL [3] = { 0.0030f, 0.0f, 0.00004f };
+constexpr float RATE_PITCH[3] = { 0.0030f, 0.0f, 0.00004f };
 
 // ★ ヨーの I項。P制御だけでは定常偏差が残る。
 //   機体には必ず一定のヨートルクが残っている:
@@ -104,7 +104,7 @@ constexpr float YAW_STICK_DEAD    = 0.03f;
 //  出力の単位は [deg/s] です。kp = 4.0 なら「10度傾いていたら 40deg/s で戻す」。
 //  まず kp だけで調整し、ki / kd は基本 0 のままで構いません。
 //                         kp     ki    kd
-constexpr float ANG_ROLL [3] = { 4.0f, 0.0f, 0.0f };
+constexpr float ANG_ROLL [3] = { 40.0f, 0.0f, 2.0f };
 constexpr float ANG_PITCH[3] = { 4.0f, 0.0f, 0.0f };
 
 constexpr float ANG_D_ALPHA = 0.70f;
@@ -136,7 +136,7 @@ constexpr int TELEM_RX_HZ = 200;
 
 // 角度ループが出せる角速度の上限 [deg/s]
 // (大きく傾いたときに、レートループが追えない目標を出さないための蓋)
-constexpr float ANGLE_OUT_LIMIT = 250.0f;
+constexpr float ANGLE_OUT_LIMIT = 2500.0f;
 
 constexpr int MAIN_HZ  = Q::RATE_LOOP_HZ;
 constexpr int DEBUG_HZ = Q::DEBUG_HZ;

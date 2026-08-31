@@ -58,8 +58,8 @@ namespace Q = Quad;
 namespace Gain {
 
 //                        kp      ki      kd
-constexpr float ROLL [3] = { 0.0200f, 0.0f, 0.00400f };
-constexpr float PITCH[3] = { 0.0000f, 0.0f, 0.00000f };
+constexpr float ROLL [3] = { 0.0030f, 0.0f, 0.00004f };
+constexpr float PITCH[3] = { 0.0030f, 0.0f, 0.00004f };
 constexpr float YAW  [3] = { 0.0000f, 0.0f, 0.0f     };
 
 // D項のローパス (0 = フィルタなし、1 に近いほど強い)
