@@ -58,9 +58,9 @@ namespace Q = Quad;
 namespace Gain {
 
 //                        kp      ki      kd
-constexpr float ROLL [3] = { 0.0010f, 0.0f, 0.00002f };
-constexpr float PITCH[3] = { 0.0010f, 0.0f, 0.00002f };
-constexpr float YAW  [3] = { 0.0020f, 0.0f, 0.0f     };
+constexpr float ROLL [3] = { 0.0200f, 0.0f, 0.00400f };
+constexpr float PITCH[3] = { 0.0000f, 0.0f, 0.00000f };
+constexpr float YAW  [3] = { 0.0000f, 0.0f, 0.0f     };
 
 // D項のローパス (0 = フィルタなし、1 に近いほど強い)
 constexpr float D_ALPHA = 0.80f;
@@ -140,6 +140,7 @@ static void stopAllMotors() {
 }
 
 static bool isArmed() {
+    return true;  // ★ とりあえず常にアーム状態にしておく (スロットルカットは無効化)
     if (!S3::USE_SBUS) return false;
     if (!sbus.isSafe()) return false;
     return sbus.Ch_state(Ch::THR_CUT) == Q::ARM_SWITCH_STATE;

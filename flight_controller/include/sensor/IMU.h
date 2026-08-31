@@ -56,9 +56,9 @@ public:
     float getGyroZ_Raw() { return (float)gz_raw / Config::sensor::GYRO_SCALE; }
     
     // ソフトウェア補正適用済みの値 (機体座標系: Forward, Left, Up)
-    float getAccX()  { return -(getAccX_Raw() - Config::sensor::s_ax_bias); } // 前 = -X
-    float getAccY()  { return -(getAccY_Raw() - Config::sensor::s_ay_bias); } // 左 = -Y
-    float getAccZ()  { return  (getAccZ_Raw() - Config::sensor::s_az_bias); } // 上 = +Z
+    float getAccX()  { return (getAccX_Raw() - Config::sensor::s_ax_bias); } // 前 = -X
+    float getAccY()  { return (getAccY_Raw() - Config::sensor::s_ay_bias); } // 左 = -Y
+    float getAccZ()  { return (getAccZ_Raw() - Config::sensor::s_az_bias); } // 上 = Z
 
     float getGyroX() { return -(getGyroX_Raw() - Config::sensor::s_gx_bias); }
     float getGyroY() { return -(getGyroY_Raw() - Config::sensor::s_gy_bias); }

@@ -63,8 +63,8 @@ namespace Gain {
 
 // ---- レート (内側ループ) ----  Stage 3 で決めた値をここに写す
 //                        kp      ki      kd
-constexpr float RATE_ROLL [3] = { 0.0010f, 0.0f, 0.00002f };
-constexpr float RATE_PITCH[3] = { 0.0010f, 0.0f, 0.00002f };
+constexpr float RATE_ROLL [3] = { 0.0200f, 0.0f, 0.00400f };
+constexpr float RATE_PITCH[3] = { 0.0200f, 0.0f, 0.00400f };
 
 // ★ ヨーの I項。P制御だけでは定常偏差が残る。
 //   機体には必ず一定のヨートルクが残っている:

@@ -41,10 +41,10 @@ namespace T = Config::Timing;
 // kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle
 //  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(2.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),//angleをなくすときは291行目からの場所の、RateAnglePIDをRatePIDに変える
+Axis_value Roll(4.0f, 0.0f, 0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),//angleをなくすときは291行目からの場所の、RateAnglePIDをRatePIDに変える
                 // 0.3f, 0.0f, 0.01f, 0.00f, 0.0f, 0.0f, 1.0f, 0.7f, 0.0f, 0.0f, 0.0f),(pを感じた)
                 //0.6f, 0.00f, 0.003f, 10.0f, 0.0f, 0.2f, 1.0f, 0.7f, 0.0f, 0.5f,0.0f,(水平に戻ろうとする、うれしい)
-    Pitch(2.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),
+    Pitch(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),
     Yaw(1.0f, 0.0f, 0.00f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
 
 float BANK_ANGLE = 25.0f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
@@ -356,10 +356,10 @@ void loop() {
         //   張り付かない」範囲まで、thr の位置に応じて補正の上限を絞る。
         const float corr_limit = min(0.5f, min(thr_val, 1.0f - thr_val));
 
-        const float raw1 = -Pitch.cmd + Roll.cmd;
-        const float raw2 =  Pitch.cmd - Roll.cmd;
-        const float raw3 =  Pitch.cmd + Roll.cmd;
-        const float raw4 = -Pitch.cmd - Roll.cmd;
+        const float raw1 = +Pitch.cmd + Roll.cmd;
+        const float raw2 = -Pitch.cmd - Roll.cmd;
+        const float raw3 = +Pitch.cmd - Roll.cmd;
+        const float raw4 = -Pitch.cmd + Roll.cmd;
 
         const float c1 = constrain(raw1, -corr_limit, corr_limit) * mix_auth;
         const float c2 = constrain(raw2, -corr_limit, corr_limit) * mix_auth;
@@ -444,10 +444,10 @@ void updateSensorsAndComms() {
   Mode.update(sbus.Ch_state(SW_TURN), sbus.Ch_state(SW_LEVEL), sbus.Ch_state(SW_HOVER),
               sbus.Ch_state(SW_AUTO), telemetry.groundLinkFresh());
 
-  Roll.update_value(sbus.des[Ch::ROLL], mpu.getPitch(), mpu.getAccY(),
+  Pitch.update_value(sbus.des[Ch::PITCH], mpu.getPitch(), mpu.getAccY(),
                     mpu.getGyroY());
-  Pitch.update_value(sbus.des[Ch::PITCH], mpu.getRoll(), mpu.getAccX(),
-                     mpu.getGyroX());
+  Roll.update_value(sbus.des[Ch::ROLL], mpu.getRoll(), mpu.getAccX(),
+                    mpu.getGyroX());
   Yaw.update_value(sbus.des[Ch::YAW], mpu.getYaw(), mpu.getAccZ(),
                    mpu.getGyroZ());
 

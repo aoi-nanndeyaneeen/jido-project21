@@ -126,8 +126,9 @@ static void stopAllMotors() {
 }
 
 static bool isArmed() {
+    return true;
     if (!S2::USE_SBUS) return false;
-    if (!sbus.isSafe()) return false;
+    if (!sbus.isSafe()||1) return false;
     return sbus.Ch_state(Ch::THR_CUT) == Q::ARM_SWITCH_STATE;
 }
 

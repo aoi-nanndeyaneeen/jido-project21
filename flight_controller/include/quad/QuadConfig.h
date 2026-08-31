@@ -57,7 +57,7 @@ constexpr int MOTOR_COUNT = 4;
 // MOTOR_PIN[0] = M1(左前), [1] = M2(右前), [2] = M3(右後), [3] = M4(左後)
 // ↓ 旧 drone.cpp の motor1..motor4 の割り当てをそのまま初期値にしてあります。
 //    Stage 1 の実測結果で必ず並べ替えてください。
-constexpr int MOTOR_PIN[MOTOR_COUNT] = { 17, 16, 15, 14 };
+constexpr int MOTOR_PIN[MOTOR_COUNT] = { 1,2,3,4 };
 
 // ※ motor::write() (src/sub_lib/Actuators.cpp) は 0.0-1.0 を 1000-2000us 相当に
 //   固定でマッピングしており、set_minPWM / set_maxPWM は参照していません。
@@ -134,12 +134,12 @@ constexpr bool ATTITUDE_PRIORITY = true;
 
 constexpr bool  SWAP_XY    = false;  // IMU が機体に対して90度回って付いている場合 true
 
-constexpr float GYRO_SIGN_ROLL  = +1.0f;  // X軸まわり
+constexpr float GYRO_SIGN_ROLL  = -1.0f;  // X軸まわり
 constexpr float GYRO_SIGN_PITCH = -1.0f;  // Y軸まわり (FLU の左 → FRD の右で反転)
-constexpr float GYRO_SIGN_YAW   = -1.0f;  // Z軸まわり (FLU の上 → FRD の下で反転)
+constexpr float GYRO_SIGN_YAW   = +1.0f;  // Z軸まわり (FLU の上 → FRD の下で反転)
 
-constexpr float ANG_SIGN_ROLL   = +1.0f;  // Madgwick の出力 [deg]
-constexpr float ANG_SIGN_PITCH  = +1.0f;
+constexpr float ANG_SIGN_ROLL   = -1.0f;  // Madgwick の出力 [deg]
+constexpr float ANG_SIGN_PITCH  = -1.0f;
 constexpr float ANG_SIGN_YAW    = +1.0f;
 
 // ============================================================
