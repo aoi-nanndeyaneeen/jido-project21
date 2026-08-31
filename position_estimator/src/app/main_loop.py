@@ -5,16 +5,20 @@ app/main_loop.py
 """
 
 import cv2
+import math
 import numpy as np
 import threading
 import time
 import msvcrt
 from collections import deque
 
-from utils.config import DISP_W, DISP_H, VELOCITY_W, VELOCITY_H
+from utils.config import (DISP_W, DISP_H, VELOCITY_W, VELOCITY_H,
+                          YAW_ENABLED, YAW_INITIAL_ALIGN_DEG,
+                          YAW_SEND_HZ, YAW_SEND_INITIAL_ALIGN)
 from core.tracker import camera_thread_func
 from core.controller import AltitudeController
 from core.geometry import accel_to_angles
+from core.yaw_estimator import YawEstimator
 from core.autopilot import SquarePatrol, HoverHold, WaypointMission, RCCommand
 from ui.dashboard import Dashboard
 from ui.view_velocity import ViewVelocity
@@ -34,7 +38,18 @@ def run_main_loop(cam1, cam2,
         "uv1": None, "uv2": None,
         "updated": False,
         "frame1": None, "frame2": None,
+        "in_dummy": False, "tracking_ok": False, "frame_time": 0.0,
     }
+
+    # ── ヨー方位推定 (YAW_HANDOFF.md) ───────────────────────
+    yaw_est = YawEstimator() if YAW_ENABLED else None
+    last_yaw_send = 0.0
+    if yaw_est is not None:
+        print(f"[Yaw] 推定を有効化 (初期アラインメント "
+              f"{YAW_INITIAL_ALIGN_DEG:+.1f}deg = 機首をフィールド奥+yへ)")
+        if alt_sensor is None:
+            print("[Yaw] [WARN] シリアル未接続のため機体Δvが届きません。"
+                  "ヨーは初期アラインメント値のまま固定されます。")
 
     print()
     print("=" * 56)
@@ -120,19 +135,39 @@ def run_main_loop(cam1, cam2,
     # ── メインループ ──────────────────────────────────────
     while not shared.get("quit", False):
         with plot_lock:
-            updated   = plot_data["updated"]
-            P         = plot_data["P"]
-            O1        = plot_data["O1"]
-            current_z = plot_data["current_z"]
+            updated     = plot_data["updated"]
+            P           = plot_data["P"]
+            O1          = plot_data["O1"]
+            current_z   = plot_data["current_z"]
+            tracking_ok = plot_data.get("tracking_ok", False)
+            frame_time  = plot_data.get("frame_time", 0.0)
+            in_dummy    = plot_data.get("in_dummy", False)
             if updated:
                 plot_data["updated"] = False
+
+        # ── ヨー推定への入力 ────────────────────────────────
+        # カメラ位置は毎フレーム、機体Δvは届いたぶんをまとめて渡す。
+        # 推定器は単一スレッドで扱う（受信スレッドはキューに積むだけ）。
+        if yaw_est is not None:
+            if updated and frame_time > 0.0:
+                yaw_est.add_position(frame_time, P, tracking_ok)
+            if alt_sensor is not None:
+                body_yaw = alt_sensor.get_body_yaw()
+                for (t_ms, dvx, dvy, t_recv) in alt_sensor.drain_body_dv():
+                    yaw_est.add_body_dv(t_ms, dvx, dvy, t_recv, body_yaw)
 
         if updated:
             with plot_lock:
                 f1 = plot_data.get("frame1")
                 f2 = plot_data.get("frame2")
             if f1 is not None:
-                cv2.imshow("Camera 1", cv2.resize(f1, (DISP_W, DISP_H)))
+                disp1 = cv2.resize(f1, (DISP_W, DISP_H))
+                if yaw_est is not None:
+                    ye = yaw_est.current()
+                    cv2.putText(disp1, yaw_est.status_line(), (10, DISP_H - 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (120, 255, 120) if ye.valid else (140, 140, 140), 2)
+                cv2.imshow("Camera 1", disp1)
             if f2 is not None:
                 cv2.imshow("Camera 2", cv2.resize(f2, (DISP_W, DISP_H)))
 
@@ -168,12 +203,33 @@ def run_main_loop(cam1, cam2,
                     autopilot_mode = mode_req
                     print(f"[Mode] → {autopilot_mode}")
 
+            # ── ヨー推定を1ステップ進める ───────────────────
+            # ★ ここでの update() は1ループ1回だけ。参照は current() を使う
+            yaw_rad = None
+            if yaw_est is not None:
+                ye = yaw_est.update(now_ap)
+                if ye.valid:
+                    yaw_rad = math.radians(ye.yaw_deg)
+
             if P is not None and dt_ap > 0:
-                _last_cmd = patrol.update(pos=P, vel=vel_ap, dt=dt_ap)
+                _last_cmd = patrol.update(pos=P, vel=vel_ap, dt=dt_ap,
+                                          heading_rad=yaw_rad,
+                                          is_dummy=in_dummy)
 
             # ── 自律制御コマンドをground_receiver経由でドローンへ送信 ──
             if alt_sensor is not None:
                 alt_sensor.send_autopilot_command(_last_cmd)
+
+                # ヨーは 0.5〜1Hz でよい。速くしても通信ジッタが姿勢に乗るだけ
+                if yaw_est is not None and now_ap - last_yaw_send >= 1.0 / YAW_SEND_HZ:
+                    last_yaw_send = now_ap
+                    ye = yaw_est.current()
+                    if ye.valid:
+                        alt_sensor.send_yaw(ye.yaw_deg, True)
+                    elif YAW_SEND_INITIAL_ALIGN:
+                        # 未収束のあいだは初期アラインメント値を valid=0 で送る。
+                        # 機体側は valid=0 を完全に無視すること
+                        alt_sensor.send_yaw(YAW_INITIAL_ALIGN_DEG, False)
 
             rc_img = view_rc.get_image(_last_cmd)
             cv2.imshow("RC Command", rc_img)

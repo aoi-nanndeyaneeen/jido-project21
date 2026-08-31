@@ -73,7 +73,13 @@ import cv2
 import numpy as np
 
 ROOT_DIR  = Path(__file__).resolve().parent.parent
-CALIB_DIR = ROOT_DIR / "calib"
+# ★ 実行時に読み込む先 (src/utils/calib_store.py の CALIB_DIR) と
+#   同じ場所にすること。calib_store.py 側の ROOT_DIR は歴史的経緯で
+#   実体が src/ を指しており、calib/ の実体は src/calib/ になっている
+#   （src/utils/config.py の PROJECT_DIR のコメント参照）。
+#   ここを ROOT_DIR/"calib"（プロジェクト直下）にすると、保存はできても
+#   本番実行時には見つからない calib/intrinsics_*.json ができてしまう。
+CALIB_DIR = ROOT_DIR / "src" / "calib"
 
 # カバレッジ表示の分割数
 COV_COLS, COV_ROWS = 8, 5
@@ -144,6 +150,23 @@ def draw_coverage(frame: np.ndarray, grid: np.ndarray) -> None:
             cv2.rectangle(frame, p1, p2, color, -1)
 
 
+def sharpness_score(gray: np.ndarray, corners=None) -> float:
+    """
+    ボケ具合の目安（ラプラシアン分散）。値そのものに絶対的な意味はなく、
+    同じ環境での撮影どうしを相対比較する用途。低いほどボケている。
+
+    corners があればその外接矩形だけを見る（ボード以外のボケ・模様の影響を除く）。
+    """
+    if corners is not None:
+        pts = corners.reshape(-1, 2)
+        x0, y0 = max(int(pts[:, 0].min()) - 5, 0), max(int(pts[:, 1].min()) - 5, 0)
+        x1, y1 = int(pts[:, 0].max()) + 5, int(pts[:, 1].max()) + 5
+        roi = gray[y0:y1, x0:x1]
+        if roi.size > 100:
+            gray = roi
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
 def open_live_source(source: str, width: int, height: int, focus: int):
     """ライブカメラを本番と同じ設定で開く。"""
     cap = cv2.VideoCapture(int(source), cv2.CAP_DSHOW)
@@ -170,9 +193,13 @@ def collect_live(source, cols, rows, width, height, focus, target):
     """ライブプレビューで撮影し、検出できたコーナー列を集める。"""
     cap, w, h = open_live_source(source, width, height, focus)
     all_corners = []
+    sharpness_log = []      # 撮影したものだけの sharpness_score() 履歴
     last_capture_t = 0.0
 
     print("\n  SPACE=撮影   C=計算して保存   U=直前を取消   Q=中断\n")
+    print("  画面右上の sharpness の数値を見ながら撮ってください。")
+    print("  値は環境によって変わるので絶対値に意味はありません。")
+    print("  他の撮影と比べて明らかに低いカットはボケています（距離か静止を見直す）。\n")
     win = "Intrinsics Calibration"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, min(w, 1280), min(h, 720))
@@ -185,6 +212,7 @@ def collect_live(source, cols, rows, width, height, focus, target):
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             found, corners = find_corners(gray, cols, rows)
+            sharp = sharpness_score(gray, corners if found else None)
 
             disp = frame.copy()
             if found:
@@ -201,6 +229,17 @@ def collect_live(source, cols, rows, width, height, focus, target):
             cv2.putText(disp, f"captured: {len(all_corners)}/{target}   "
                               f"coverage: {filled}/{total}",
                         (12, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+            # ボケ具合の相対表示。直近の撮影の中央値より明らかに低ければ黄色で警告
+            median_sharp = float(np.median(sharpness_log)) if len(sharpness_log) >= 5 else None
+            sharp_color = (0, 255, 255)
+            sharp_note = ""
+            if median_sharp is not None and sharp < median_sharp * 0.5:
+                sharp_color = (0, 140, 255)
+                sharp_note = "  <- blurry? move back / hold still"
+            cv2.putText(disp, f"sharpness: {sharp:6.0f}{sharp_note}",
+                        (w - 430, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.6, sharp_color, 2)
+
             if time.time() - last_capture_t < 0.6:
                 cv2.putText(disp, "CAPTURED", (12, 104),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
@@ -211,10 +250,14 @@ def collect_live(source, cols, rows, width, height, focus, target):
 
             if key == ord(' ') and found:
                 all_corners.append(corners)
+                sharpness_log.append(sharp)
+                warn = " [WARN] 他より明らかにボケています" if sharp_note else ""
                 last_capture_t = time.time()
-                print(f"  撮影 {len(all_corners)}枚目")
+                print(f"  撮影 {len(all_corners)}枚目  sharpness={sharp:.0f}{warn}")
             elif key == ord('u') and all_corners:
                 all_corners.pop()
+                if sharpness_log:
+                    sharpness_log.pop()
                 print(f"  取消 → {len(all_corners)}枚")
             elif key == ord('c'):
                 break
@@ -272,18 +315,27 @@ def calibrate(all_corners, objp, w, h):
     rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
         obj_points, img_points, (w, h), None, None
     )
+    # calibrateCamera は (1,5) の2次元で返す。以降は1次元で扱う
+    dist = np.asarray(dist).ravel()
 
+    # ★ ここは「1点あたりの平均ユークリッド距離 [px]」を出す必要がある。
+    #   cv2.norm(...)/len(proj) は OpenCV公式チュートリアルにも出てくる書き方だが、
+    #   これは全点の誤差ベクトルをまとめて1本のノルムを取ってから点数Nで割っており、
+    #   実際には 真の平均距離 / sqrt(N) になってしまう（N点なら sqrt(N)倍過小評価）。
+    #   点数が多いボード（17x13=221点など）ほど見た目の数値が異常に小さくなり、
+    #   calibrateCamera が返す全体RMSと整合しなくなる。
     per_image = []
     for i in range(len(obj_points)):
         proj, _ = cv2.projectPoints(obj_points[i], rvecs[i], tvecs[i], K, dist)
-        err = cv2.norm(img_points[i], proj, cv2.NORM_L2) / len(proj)
-        per_image.append(float(err))
+        diff = img_points[i].reshape(-1, 2) - proj.reshape(-1, 2)
+        per_image.append(float(np.linalg.norm(diff, axis=1).mean()))
 
     return rms, K, dist, per_image
 
 
 def report(K, dist, rms, per_image, w, h):
     """結果を人間が判断できる形で表示する。"""
+    dist = np.asarray(dist).ravel()
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
     hfov = 2 * np.degrees(np.arctan(w / (2 * fx)))
@@ -390,9 +442,15 @@ def main():
     objp = build_object_points(args.cols, args.rows, args.square / 1000.0)
     rms, K, dist, per_image = calibrate(all_corners, objp, w, h)
 
-    report(K, dist, rms, per_image, w, h)
+    # ★ 保存を最優先で行う。撮影のやり直しは高くつくので、
+    #   表示側の不具合で結果を失わないようにする。
     save(args.label, K, dist, rms, w, h, n,
          args.cols, args.rows, args.square)
+
+    try:
+        report(K, dist, rms, per_image, w, h)
+    except Exception as e:
+        print(f"\n  [WARN] 結果表示中にエラーが出ましたが、保存は完了しています: {e}")
     return 0
 
 

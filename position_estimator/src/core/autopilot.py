@@ -3,8 +3,10 @@ autopilot.py
 位置PIDによる自律飛行コントローラ。
 
 機首方向:
-    9軸センサ未導入時は速度ベクトルから推定（暫定）。
-    センサ導入後は update() の heading_rad 引数に渡すだけで切り替え可能。
+    カメラ由来のヨー推定（core/yaw_estimator.py）を update() の heading_rad に渡す。
+    未確定のあいだはアーム時の初期アラインメント値を保持する。
+    ★ クアッドでは速度ベクトルから機首方向を推定してはいけない。
+      進行方向と機首方向が一致しないため（YAW_HANDOFF.md §4-2）。
 
 RCCommand の throttle/pitch/roll/yaw は -1.0〜1.0（throttleは0〜1）に
 正規化し、呼び出し元で PWM 変換する。
@@ -23,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 
+from utils.config import YAW_INITIAL_ALIGN_DEG
 from utils.logger import CsvLogger
 
 
@@ -39,6 +42,88 @@ class RCCommand:
                 f"pit={self.pitch:.2f} "
                 f"rol={self.roll:.2f} "
                 f"yaw={self.yaw:.2f}")
+
+
+# ── 座標系と指令の符号 ─────────────────────────────────────────
+# ★★ 飛行前に必ずベンチで確認すること ★★
+#
+# フィールド座標系 (utils/config.py):
+#     x = 幅(右), y = 奥行(奥), z = 上。右手系
+#
+# ヨー角 yaw_rad (core/yaw_estimator.py と同一の定義):
+#     yaw = atan2(nx, ny)   n = 機首方向の水平単位ベクトル
+#     yaw = 0     → 機首がフィールド奥 (+y)
+#     yaw = +90度 → 機首がフィールド右 (+x)   ※右回りが正
+#
+# 機体の指令符号 (flight_controller/include/quad/QuadConfig.h §1):
+#     roll  + = 右へバンク  → 右へ加速
+#     pitch + = 機首が上がる → **後ろへ加速**   ← 前進させたいときは負
+#
+# ⚠️ 2026-08-16 修正: 従来の実装は
+#        fwd_err   =  dx*cos(h) + dy*sin(h)
+#        right_err = -dx*sin(h) + dy*cos(h)
+#        cmd.pitch = PID(fwd_err);  cmd.roll = PID(right_err)
+#    となっており、**ピッチ・ロールともに符号が反転**していた。
+#    (-sin h, cos h) は機体右方向ではなく**左方向**であり、
+#    さらに「前進 = pitch 正」は固定翼の感覚で、クアッドでは逆。
+#    この状態で位置制御ループを閉じると横にも前後にも正帰還になり、
+#    YAW_HANDOFF.md §1 が警告する「機体が飛んでいく」状態になる。
+SIGN_ROLL_FOR_RIGHT    = +1.0   # 右へ動かしたいとき roll に掛ける符号
+SIGN_PITCH_FOR_FORWARD = -1.0   # 前へ動かしたいとき pitch に掛ける符号
+
+
+def body_frame_errors(dx: float, dy: float, yaw_rad: float):
+    """
+    フィールド座標系の位置誤差 (dx, dy) を
+    機体座標系の (前方誤差, 右方誤差) に変換する。
+
+        n = (sin yaw, cos yaw)      機首方向
+        r = (ny, -nx)               機体右方向（上から見て n を時計回りに90度）
+    """
+    nx, ny = math.sin(yaw_rad), math.cos(yaw_rad)
+    rx, ry = ny, -nx
+    return dx * nx + dy * ny, dx * rx + dy * ry
+
+
+# 速度ベクトルから機首方向を推定してよいか。
+# ★ クアッドでは必ず False。
+#   飛行機は横滑りしないので進行方向＝機首方向だが、クアッドは真横にも
+#   真後ろにも飛べるため一致しない。速度から推定すると機首方向を取り違え、
+#   位置制御ループが正帰還になる（YAW_HANDOFF.md §4-2）。
+HEADING_FROM_VELOCITY = False
+
+_warned_no_yaw = False
+
+
+def _resolve_yaw(self, yaw_rad, vx, vy):
+    """
+    使用するヨー角を決める。
+
+    1. カメラ由来のヨーが渡されていればそれを使う（最優先）
+    2. 無ければ前回値を保持する
+       （初期値は config.YAW_INITIAL_ALIGN_DEG ＝ アーム時の初期アラインメント）
+
+    クアッドでは速度ベクトルからの推定にフォールバックしない。
+    """
+    global _warned_no_yaw
+
+    if yaw_rad is not None:
+        return yaw_rad
+
+    if HEADING_FROM_VELOCITY:
+        if math.hypot(vx, vy) > self.MIN_SPEED_FOR_HEADING:
+            # 固定翼用。クアッドでは到達しない
+            return math.atan2(vy, vx)
+        return self.heading
+
+    if not _warned_no_yaw:
+        print("[Autopilot] カメラ由来のヨーが未確定です。"
+              "初期アラインメント値を保持します "
+              f"({math.degrees(self.heading):+.1f}deg)。")
+        print("            速度ベクトルからの推定はクアッドでは行いません"
+              "（正帰還になるため）。")
+        _warned_no_yaw = True
+    return self.heading
 
 
 # ── ログ記録 ───────────────────────────────────────────────────
@@ -154,7 +239,9 @@ class SquarePatrol:
             (x0,     y0 + L, z),   # WP3: +Y
         ]
         self.wp_idx  = 0
-        self.heading = 0.0          # 推定機首方向 [rad]
+        # 機首方位 [rad]。定義は上部 SIGN_* のコメント参照
+        # 初期値はアーム時の初期アラインメント（YAW_HANDOFF.md §6-1）
+        self.heading = math.radians(YAW_INITIAL_ALIGN_DEG)
 
         self.pid_fwd   = PID(self.KP_H, self.KI_H, self.KD_H, limit=0.6)
         self.pid_right = PID(self.KP_H, self.KI_H, self.KD_H, limit=0.6)
@@ -178,7 +265,9 @@ class SquarePatrol:
             pos         : 現在位置 [x, y, z] (m)
             vel         : 現在速度 [vx, vy, vz] (m/s)
             dt          : 前回呼び出しからの経過時間 (s)
-            heading_rad : 機首方向 (rad)。None なら速度ベクトルから推定。
+            heading_rad : 機首方位 (rad)。yaw_estimator の psi と同一定義
+                          (0=フィールド奥+y、右回りが正)。
+                          None なら前回値を保持する（速度からは推定しない）。
             is_dummy    : True の場合、このフレームはログに記録しない
                           （tracker.py が dummy フォールバック中のとき呼び出し側から渡す）
         Returns:
@@ -187,14 +276,8 @@ class SquarePatrol:
         px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
         vx, vy     = float(vel[0]), float(vel[1])
 
-        # ── 機首方向の推定 ────────────────────────────────────
-        if heading_rad is not None:
-            self.heading = heading_rad          # センサ値を優先
-        else:
-            horiz_speed = math.sqrt(vx**2 + vy**2)
-            if horiz_speed > self.MIN_SPEED_FOR_HEADING:
-                self.heading = math.atan2(vy, vx)
-            # else: 低速時は前回値を保持
+        # ── 機首方向の決定 ────────────────────────────────────
+        self.heading = _resolve_yaw(self, heading_rad, vx, vy)
 
         # ── ウェイポイント到達チェック ────────────────────────
         tx, ty, tz = self.waypoints[self.wp_idx]
@@ -214,14 +297,13 @@ class SquarePatrol:
         dy = ty - py
         dz = tz - pz
 
-        ch, sh     = math.cos(self.heading), math.sin(self.heading)
-        fwd_err    =  dx * ch + dy * sh    # 機首方向の誤差 → pitch
-        right_err  = -dx * sh + dy * ch   # 右方向の誤差   → roll
+        fwd_err, right_err = body_frame_errors(dx, dy, self.heading)
 
         # ── PID 計算 ──────────────────────────────────────────
+        # 符号の根拠は上部の SIGN_* 定数のコメントを参照
         cmd = RCCommand()
-        cmd.pitch    = self.pid_fwd.update(fwd_err,    dt)
-        cmd.roll     = self.pid_right.update(right_err, dt)
+        cmd.pitch    = SIGN_PITCH_FOR_FORWARD * self.pid_fwd.update(fwd_err, dt)
+        cmd.roll     = SIGN_ROLL_FOR_RIGHT    * self.pid_right.update(right_err, dt)
         cmd.throttle = self.HOVER_THROTTLE + self.pid_z.update(dz, dt)
         cmd.throttle = max(0.0, min(1.0, cmd.throttle))
 
@@ -277,7 +359,7 @@ class HoverHold:
             self.target = (0.0, 0.0, self.ALTITUDE)
         else:
             self.target = (float(pos[0]), float(pos[1]), float(pos[2]))
-        self.heading = 0.0
+        self.heading = math.radians(YAW_INITIAL_ALIGN_DEG)
 
         self.pid_fwd   = PID(self.KP_H, self.KI_H, self.KD_H, limit=0.6)
         self.pid_right = PID(self.KP_H, self.KI_H, self.KD_H, limit=0.6)
@@ -297,23 +379,16 @@ class HoverHold:
         px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
         vx, vy     = float(vel[0]), float(vel[1])
 
-        if heading_rad is not None:
-            self.heading = heading_rad
-        else:
-            horiz_speed = math.sqrt(vx**2 + vy**2)
-            if horiz_speed > self.MIN_SPEED_FOR_HEADING:
-                self.heading = math.atan2(vy, vx)
+        self.heading = _resolve_yaw(self, heading_rad, vx, vy)
 
         tx, ty, tz = self.target
         dx, dy, dz = tx - px, ty - py, tz - pz
 
-        ch, sh    = math.cos(self.heading), math.sin(self.heading)
-        fwd_err   =  dx * ch + dy * sh
-        right_err = -dx * sh + dy * ch
+        fwd_err, right_err = body_frame_errors(dx, dy, self.heading)
 
         cmd = RCCommand()
-        cmd.pitch    = self.pid_fwd.update(fwd_err, dt)
-        cmd.roll     = self.pid_right.update(right_err, dt)
+        cmd.pitch    = SIGN_PITCH_FOR_FORWARD * self.pid_fwd.update(fwd_err, dt)
+        cmd.roll     = SIGN_ROLL_FOR_RIGHT    * self.pid_right.update(right_err, dt)
         cmd.throttle = self.HOVER_THROTTLE + self.pid_z.update(dz, dt)
         cmd.throttle = max(0.0, min(1.0, cmd.throttle))
 

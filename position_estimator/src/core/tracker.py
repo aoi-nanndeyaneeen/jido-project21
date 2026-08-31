@@ -228,6 +228,14 @@ def camera_thread_func(cam1, cam2,
                     plot_data["residual"]  = residual
                     plot_data["uv1"]       = uv1
                     plot_data["uv2"]       = uv2
+                    # ヨー推定用: この位置が「実測として信用できるか」。
+                    # ダミー円軌道中や棄却フレームを窓に含めると
+                    # 嘘のヨーが出るため、明示的に伝える
+                    plot_data["in_dummy"]      = in_dummy_mode
+                    plot_data["tracking_ok"]   = (P_vec is not None
+                                                  and not in_dummy_mode
+                                                  and not jump_rejected)
+                    plot_data["frame_time"]    = time.time()
                     plot_data["frame1"]    = frame1.copy()
                     plot_data["frame2"]    = frame2.copy() if frame2 is not None else None
                     plot_data["updated"]   = True

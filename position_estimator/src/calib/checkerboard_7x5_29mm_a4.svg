@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="297.0mm" height="210.0mm" viewBox="0 0 297.0 210.0">
+<rect x="0" y="0" width="297.0" height="210.0" fill="#ffffff"/>
+<rect x="61.5000" y="12.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="119.5000" y="12.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="177.5000" y="12.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="235.5000" y="12.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="32.5000" y="41.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="90.5000" y="41.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="148.5000" y="41.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="206.5000" y="41.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="61.5000" y="70.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="119.5000" y="70.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="177.5000" y="70.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="235.5000" y="70.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="32.5000" y="99.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="90.5000" y="99.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="148.5000" y="99.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="206.5000" y="99.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="61.5000" y="128.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="119.5000" y="128.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="177.5000" y="128.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="235.5000" y="128.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="32.5000" y="157.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="90.5000" y="157.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="148.5000" y="157.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<rect x="206.5000" y="157.0000" width="29.0000" height="29.0000" fill="#000000"/>
+<line x1="32.500" y1="191.000" x2="61.500" y2="191.000" stroke="#000000" stroke-width="0.4"/>
+<line x1="32.500" y1="189.400" x2="32.500" y2="192.600" stroke="#000000" stroke-width="0.4"/>
+<line x1="61.500" y1="189.400" x2="61.500" y2="192.600" stroke="#000000" stroke-width="0.4"/>
+<text x="65.500" y="192.600" font-family="monospace" font-size="4.2" fill="#000000">inner corners = 7 x 5   |   square = 29.0 mm   |   A4 100% scale</text>
+<text x="32.500" y="199.000" font-family="monospace" font-size="3.4" fill="#444444">PRINT AT 100% (do NOT "fit to page"), then measure one square with a ruler.</text>
+</svg>

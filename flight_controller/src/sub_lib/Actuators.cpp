@@ -45,7 +45,18 @@ void motor::begin() {
     pinMode(_pin, OUTPUT);
 
     // TeensyのハードウェアPWM設定
-    analogWriteResolution(12);       // 12-bit分解能 (0-4095)
+    // ★ 修正: analogWriteResolution() はチップ全体の分解能を切り替える関数で、
+    //   呼ぶたびに「他のピンで既に analogWriteFrequency() で設定していた周波数」が
+    //   デフォルト値にリセットされてしまう。motor1〜4の begin() をそれぞれ呼ぶたびに
+    //   このリセットが起きていたため、最後に begin() したモーター以外は
+    //   400Hz前提で計算したduty(1638〜3277/4095)が実際の周波数とズレ、
+    //   ESCが受け付けないパルス幅になって回らなくなっていた。
+    //   分解能の設定は全モーター共通で最初の1回だけにする。
+    static bool s_resolution_set = false;
+    if (!s_resolution_set) {
+        analogWriteResolution(12);   // 12-bit分解能 (0-4095)
+        s_resolution_set = true;
+    }
     analogWriteFrequency(_pin, 400); // PWM周波数を400Hzに設定
 
     // ★ 修正: 以前は write(0.0f) を _built = true の前で呼んでいたため、

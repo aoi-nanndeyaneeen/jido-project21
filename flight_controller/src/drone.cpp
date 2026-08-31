@@ -41,10 +41,10 @@ namespace T = Config::Timing;
 // kp_rate  ki_rate  kd_rate  kp_angle  ki_angle  kd_angle
 //  sensitivity　rate_d_alpha, rate_i_limit　angle_d_alpha, angle_i_limit
 
-Axis_value Roll(2.0f, 0.0f, 0.03f, 5.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),//angleをなくすときは291行目からの場所の、RateAnglePIDをRatePIDに変える
+Axis_value Roll(2.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),//angleをなくすときは291行目からの場所の、RateAnglePIDをRatePIDに変える
                 // 0.3f, 0.0f, 0.01f, 0.00f, 0.0f, 0.0f, 1.0f, 0.7f, 0.0f, 0.0f, 0.0f),(pを感じた)
                 //0.6f, 0.00f, 0.003f, 10.0f, 0.0f, 0.2f, 1.0f, 0.7f, 0.0f, 0.5f,0.0f,(水平に戻ろうとする、うれしい)
-    Pitch(2.0f, 0.0f, 0.03f, 5.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),
+    Pitch(2.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.7f, 1.0f, 0.7f,1.0f),
     Yaw(1.0f, 0.0f, 0.00f, 0.0f, 0.0f, 0.0f, 1.0f, 0.8f, 0.0f, 0.0f, 0.0f);
 
 float BANK_ANGLE = 25.0f;  // バンク角 [deg]  ← 0だとラダーも動かないので要注意
@@ -261,10 +261,10 @@ void setup() {
   if (USE_SERVO) {
     Serial.println("Init Actuators...");
 
-    motor1.set_pin(0).set_minPWM(1000).set_maxPWM(2000).begin();//1175,125
-    motor2.set_pin(1).set_minPWM(1000).set_maxPWM(2000).begin();
-    motor3.set_pin(2).set_minPWM(1000).set_maxPWM(2000).begin();
-    motor4.set_pin(3).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor1.set_pin(1).set_minPWM(1000).set_maxPWM(2000).begin();//1175,125
+    motor2.set_pin(2).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor3.set_pin(3).set_minPWM(1000).set_maxPWM(2000).begin();
+    motor4.set_pin(4).set_minPWM(1000).set_maxPWM(2000).begin();
   }
 
   if (USE_IM920) {
@@ -329,7 +329,7 @@ void loop() {
 
     // 4) スロットル出力 (ONの場合のみ)
     if (USE_SERVO) {
-      if (sbus.isSafe()&&sbus.Ch_state(THR_CUT)==down) {  // スロットルカットがOFFの時のみ出力
+      if (sbus.isSafe()&&sbus.Ch_state(THR_CUT)==down||1) {  // スロットルカットがOFFの時のみ出力
         const float thr_val = sbus.des[Ch::THR];
 
         // ★ 修正: 従来は "thr>0.1f ? 補正 : 0" で、スロットルが0.1を
