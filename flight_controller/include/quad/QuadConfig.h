@@ -203,13 +203,19 @@ constexpr int FLOW_CS_PIN = 10;   // ★ PMW3901 の CS。実配線に合わせ�
 
 // センサ X/Y 軸 → 機体座標 (FRD: 前=x, 右=y)
 constexpr bool  FLOW_SWAP_XY = false;
-constexpr float FLOW_SIGN_X  = +1.0f;   // 前進で + になる向き
-constexpr float FLOW_SIGN_Y  = +1.0f;   // 右移動で + になる向き
+constexpr float FLOW_SIGN_X  = -1.0f;   // 前進で + になる向き
+constexpr float FLOW_SIGN_Y  = -1.0f;   // 右移動で + になる向き
 
-// ピクセル ⇔ 角度 の換算 [pixel / rad]。
-//  PMW3901 は 30x30 有効画素・FOV≈42° → 30 / (42°×π/180) ≒ 40.9
-//  de-rotation と 速度換算の両方で使う。s5a のベンチで実測補正する。
-constexpr float FLOW_PX_PER_RAD = 40.9f;
+// 生カウント ⇔ 角度 の換算 [raw count / rad]。
+//  ★ 幾何(画素数/FOV)から出る 40 前後は間違い。PMW3901 の生カウントは
+//    内部でサブピクセル化されていて、実効値は 100倍ほど大きい。
+//    (Crazyflie の flowdeck は換算すると raw ≒ 4098 count/rad 相当)
+//  de-rotation と 速度換算の両方で使う。★必ず s5a のベンチで実測する:
+//    [z] でゼロ → 実測高度 h で実測距離 D を1方向スライド → 積算raw を読む
+//    FLOW_PX_PER_RAD = (積算raw ÷ D[m]) × h[m]
+//  この値が桁で外れていると de-rotation がほぼ効かず (derot ≒ raw)、
+//  速度換算も桁でズレる。
+constexpr float FLOW_PX_PER_RAD = 450.0f;   // ← 仮値。ベンチ実測に置き換えること
 
 // de-rotation: 機体の角速度が作る「見かけの流れ」をジャイロで差し引く。
 //  pitch(Y軸まわり)レート → flow_x に乗る / roll(X軸まわり)レート → flow_y に乗る
@@ -217,14 +223,76 @@ constexpr bool  FLOW_DEROTATE     = true;
 constexpr float FLOW_DEROT_SIGN_X = -1.0f;
 constexpr float FLOW_DEROT_SIGN_Y = -1.0f;
 
+// IMU (≒回転中心) から フローレンズ までのオフセット [m]  (機体座標 FRD: 前+ / 右+)
+//  水平オフセットがあると、機体の回転がテコで並進フローに化ける
+//  (de-rotation では消えない)。新シャシーでは 0.02m 未満を目標。
+//  詰められない場合は ±5mm で実測してここに記録 → s5b でテコ補正に使う。
+constexpr float FLOW_OFFSET_X = 0.00f;   // 前方向のずれ
+constexpr float FLOW_OFFSET_Y = 0.00f;   // 右方向のずれ
+
 // s5b で使う「仮定高度」[m]。距離センサ搭載後 (s5c) は測距値を毎ループ渡す。
 //  ピクセル速度→対地速度の換算はこの値に比例する。テストホバリング高度に合わせること。
 constexpr float FLOW_ASSUMED_HEIGHT_M = 1.0f;
 
 // フロー更新レート [Hz]。1000Hz メインから間引く。
-constexpr int FLOW_LOOP_HZ = 100;
+//  PMW3901 の1カウント分解能は粗い。レートを下げるほど1サンプルに溜まる
+//  カウントが増えて SNR が上がる (代わりに遅延が増える)。50Hz で 20ms 遅延。
+//  ※ Bitcraze ライブラリの readMotionCount は内部 delayMicroseconds で
+//    1回あたり ~1ms ブロックする。レートを下げるとその取りこぼしも減る。
+constexpr int FLOW_LOOP_HZ = 50;
 static_assert(RATE_LOOP_HZ % FLOW_LOOP_HZ == 0,
               "FLOW_LOOP_HZ は RATE_LOOP_HZ の約数にしてください");
 constexpr int FLOW_LOOP_DIV = RATE_LOOP_HZ / FLOW_LOOP_HZ;
+
+// ============================================================
+//  § 7-2  s5b : フロー速度・位置ホールド
+// ============================================================
+//  構造 (カスケード):
+//    位置誤差[m] ──[POS_KP]──► 目標速度[m/s] ──[VEL PID]──► 目標リーン角[deg]
+//                                                        └─► 既存の角度ループへ
+//  スティックを触ると「目標速度」を直接指令し、離すとその場の位置を保持する
+//  (ヘディングホールドと同じ考え方)。スロットルは全モード手動。
+//
+//  ★★ 初回テストは必ず「係留 or 広い床の上・指をモードスイッチに」。
+//     符号(下の *_SIGN)を1つ間違えると即座に壁へ突っ込みます。
+//     まず地面近く 10〜20cm で、手で押したら押し返してくるか確認すること。
+
+// 速度ループ: (目標速度 - 実測速度[m/s]) → 目標リーン角[deg]
+//   kp=6 なら「1 m/s ずれていたら 6度 傾けて戻す」
+constexpr float FLOW_VEL_KP      = 6.0f;
+constexpr float FLOW_VEL_KI      = 2.0f;    // 定常風・機体の取り付け傾きを吸収
+constexpr float FLOW_VEL_KD      = 0.0f;
+constexpr float FLOW_VEL_I_LIMIT = 4.0f;    // I項の上限 [deg]
+constexpr float FLOW_VEL_D_ALPHA = 0.6f;
+
+// 位置ループ(外側): 位置誤差[m] → 目標速度[m/s]
+//   kp=1.0 なら「1m ずれていたら 1 m/s で戻る」。0 にすると純粋な速度ホールド。
+constexpr float FLOW_POS_KP      = 1.0f;
+constexpr float FLOW_POS_VEL_LIM = 0.8f;    // 位置ループが出す目標速度の上限 [m/s]
+
+// スティック → 目標速度 [m/s] (全開で)
+constexpr float FLOW_STICK_VEL  = 1.0f;
+constexpr float FLOW_STICK_DEAD = 0.05f;    // これ以下は「手を離した」と判定
+
+// リーン角の出力上限 [deg] (レートループが追える範囲で小さく)
+constexpr float FLOW_MAX_LEAN   = 8.0f;
+
+// 目標リーン角の符号。手で押して「押し返す」向きにならなければ反転する。
+//  vx(前進ドリフト) を止めるには機首上げ(pitch +)、vy(右ドリフト) を止めるには左バンク(roll -)。
+constexpr float FLOW_LEAN_SIGN_ROLL  = +1.0f;
+constexpr float FLOW_LEAN_SIGN_PITCH = -1.0f;
+
+// スティックの符号 (プロポに合わせる)。ピッチを引いて機体が「後退」する向きが正。
+constexpr float FLOW_STICK_SIGN_X = -1.0f;  // pitch stick → 前後 目標速度
+constexpr float FLOW_STICK_SIGN_Y = +1.0f;  // roll  stick → 左右 目標速度
+
+// 制御に使う速度の LPF (0=なし, 1に近いほど強い)
+constexpr float FLOW_VEL_MEAS_ALPHA = 0.4f;
+
+// |速度| がこれを超えたら異常値。0.5秒続いたらリーン0(水平)に固めて失探とみなす [m/s]
+constexpr float FLOW_VEL_SANE = 3.0f;
+
+// このスロットル以上で「浮いている」とみなしフロー制御を有効化
+constexpr float FLOW_ENABLE_THR = 0.15f;
 
 } // namespace Quad

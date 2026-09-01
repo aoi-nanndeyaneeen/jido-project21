@@ -4,19 +4,20 @@
 //  Stage 4 (drone_s4.cpp) の角度PID + モード切替 + ヘディングホールドを
 //  そのまま土台にして、位置・高度の保持を段階的に足していく。
 //
-//  【このファイルの現在地: s5a — PMW3901 搭載 + ログのみ】
-//    ・制御には一切入れない。s4 と飛びは完全に同じ。
-//    ・PMW3901 を 100Hz で読み、機体座標化 + de-rotation + 対地速度換算まで
-//      やってシリアル表示と 500Hz ログに出すだけ。
-//    ・目的: 符号 (前進で flow_dx が +)、軸の入れ替わり、de-rotation の符号、
-//      ピクセル⇔角度の換算係数 FLOW_PX_PER_RAD をベンチで確定する。
-//      調整先はすべて include/quad/QuadConfig.h の § 7。
+//  【このファイルの現在地: s5b — フロー速度・位置ホールド】
+//    ・s5a (PMW3901 の符号/スケール/de-rotation のベンチ確定) は完了済み。
+//      調整値は include/quad/QuadConfig.h の § 7。
+//    ・SW_AUTO UP で MODE_POSHOLD。フローの対地速度 vx/vy を
+//        位置誤差[m] ─[POS_KP]→ 目標速度[m/s] ─[VEL PID]→ 目標リーン角[deg]
+//      で処理し、roll_axis.ang_tar / pitch_axis.ang_tar に入れる
+//      (MODE_AUTO で ap_roll が入るのと同じ経路)。
+//    ・スティックを触ると目標速度を直接指令、離すとその場を保持。
+//    ・高度は QuadConfig.h の FLOW_ASSUMED_HEIGHT_M 固定 (実測は 'h' で上書き可)。
+//      スロットルは全モード手動。
+//    ・調整は § 7-2 (QuadConfig.h) と シリアル 'p' メニューの [i][j][o]。
+//    ★ 初回は係留 or 広い床、指をモードスイッチに。符号ミス = 即壁行き。
 //
 //  【この先の段取り】(platformio.ini のコメントと対応)
-//    s5b : フロー速度・位置ホールド。flow の vx/vy → 速度PID → 目標リーン角を
-//          roll_axis.ang_tar / pitch_axis.ang_tar に入れる (MODE_AUTO で ap_roll が
-//          入るのと同じ経路)。高度は QuadConfig.h の FLOW_ASSUMED_HEIGHT_M 固定、
-//          スロットルは手動のまま。
 //    s5c : 距離センサ搭載後。高度ホールド (スロットルPID) を足し、
 //          FLOW_ASSUMED_HEIGHT_M を測距値 (flow.setHeight()) に差し替える。
 //    s5d : 高度 + 位置 + ヘディングを1スイッチで同時起動 = 完全自動ホバリング。
@@ -146,7 +147,11 @@ constexpr bool USE_MPU   = true;
 constexpr bool USE_SBUS  = true;
 constexpr bool USE_MOTOR = true;
 constexpr bool USE_IM920 = true;   // 地上局(position_estimator)との無線
-constexpr bool USE_FLOW  = true;   // PMW3901 オプティカルフロー (s5a: 観測のみ)
+constexpr bool USE_FLOW  = true;   // PMW3901 オプティカルフロー
+
+// s5b: SW_AUTO UP のとき、地上局AUTO ではなく「フロー位置ホールド」に入る。
+//  地上局(position_estimator)を使う構成に戻すときは true にする。
+constexpr bool USE_GROUND_AUTO = false;
 
 constexpr float I_ENABLE_THR = 0.15f;
 
@@ -166,10 +171,10 @@ constexpr float ANGLE_OUT_LIMIT = 300.0f;
 constexpr int MAIN_HZ  = Q::RATE_LOOP_HZ;
 constexpr int DEBUG_HZ = Q::DEBUG_HZ;
 
-//  ★ MODE_AUTO を追加 (drone.cpp の MODE_AUTONOMOUS 相当)
-//    SW_AUTO が UP かつ IM920 の受信が新鮮なときだけ入る。
-//    スイッチOFF、またはリンク途絶の瞬間に ANGLE へ自動フォールバックする。
-enum Mode : uint8_t { MODE_RATE = 0, MODE_ANGLE = 1, MODE_AUTO = 2 };
+//  MODE_AUTO     : 地上局(position_estimator)の RC相当コマンドで姿勢制御 (USE_GROUND_AUTO)
+//  MODE_POSHOLD  : オプティカルフローで対地速度/位置を保持 (s5b)。SW_AUTO UP で入る。
+//    どちらも「スイッチOFF or センサ喪失の瞬間に ANGLE へ自動フォールバック」。
+enum Mode : uint8_t { MODE_RATE = 0, MODE_ANGLE = 1, MODE_AUTO = 2, MODE_POSHOLD = 3 };
 
 } // namespace S5
 
@@ -187,6 +192,9 @@ FlightTelemetry telemetry(&Serial3);
 // PMW3901 オプティカルフロー。CS ピンは QuadConfig.h の FLOW_CS_PIN。
 // グローバル SPI (Teensy 4.0: SCK=13 MOSI=11 MISO=12) を使う。
 OpticalFlow flow;
+
+// s5b: フロー速度ループ (対地速度[m/s] → 目標リーン角[deg])。x=前後, y=左右。
+Q::Pid flow_vx_pid, flow_vy_pid;
 
 Q::Axis roll_axis, pitch_axis, yaw_axis;
 
@@ -217,11 +225,33 @@ float g_yaw_hold_kp = Gain::YAW_HOLD_KP;
 // ---- ミキサーの報告 (ログ用) ----
 Q::MixInfo g_mix;
 
-// ---- オプティカルフロー (s5a: 観測のみ。制御には未使用) ----
+// ---- オプティカルフロー観測 ----
 bool  g_flow_ok    = false;   // PMW3901 が初期化できたか
 float g_flow_raw_x = 0.0f, g_flow_raw_y = 0.0f;  // 機体座標の生カウント [px]
 float g_flow_dx    = 0.0f, g_flow_dy    = 0.0f;  // de-rotation 後 [px]
 float g_flow_vx    = 0.0f, g_flow_vy    = 0.0f;  // 対地速度 [m/s] (前 +, 右 +)
+float g_flow_vx_f  = 0.0f, g_flow_vy_f  = 0.0f;  // 表示用にLPFした速度 (ログは生値)
+
+// ---- s5b: フロー位置・速度ホールド ----
+float g_flow_vx_ctl = 0.0f, g_flow_vy_ctl = 0.0f;  // 制御に使う LPF 済み速度 [m/s]
+float g_pos_x = 0.0f, g_pos_y = 0.0f;              // 積分した相対位置 [m] (機体座標)
+float g_pos_hold_x = 0.0f, g_pos_hold_y = 0.0f;    // 保持したい位置 [m]
+bool  g_pos_holding = false;                       // 表示用: いま位置保持中か
+float g_flow_vx_tar = 0.0f, g_flow_vy_tar = 0.0f;  // 速度ループの目標 [m/s]
+float g_flow_lean_roll = 0.0f, g_flow_lean_pitch = 0.0f;  // フローが出した目標リーン角 [deg]
+int   g_flow_bad_count = 0;                        // 異常値が続いた回数 (失探検出)
+
+// シリアルから調整するゲイン (QuadConfig.h の初期値から起動時にコピー)
+float g_flow_vel_kp = Q::FLOW_VEL_KP;
+float g_flow_vel_ki = Q::FLOW_VEL_KI;
+float g_flow_pos_kp = Q::FLOW_POS_KP;
+
+// ---- キャリブレーション用の積算 ----
+//  既知距離をゆっくり動かし、acc_px と実測距離を突き合わせて
+//  QuadConfig.h の FLOW_PX_PER_RAD を決める ([z] でゼロ)。
+double g_flow_acc_raw_x = 0.0, g_flow_acc_raw_y = 0.0; // 生ピクセルの積算 (de-rotation 前)
+double g_flow_acc_px_x  = 0.0, g_flow_acc_px_y  = 0.0; // de-rotation 後ピクセルの積算
+double g_flow_acc_m_x   = 0.0, g_flow_acc_m_y   = 0.0; // 推定変位の積算 [m]
 
 } // anonymous namespace
 
@@ -254,7 +284,10 @@ constexpr char HEADER[] =
     "roll_ratetar,pitch_ratetar,roll_angtar,pitch_angtar,"
     // --- s5a: オプティカルフロー (末尾に追記。analyze_log.py は列名参照なので
     //     既存の解析はそのまま動く。新列を見たいときだけ列名を足す) ---
-    "flow_ok,flow_raw_x,flow_raw_y,flow_dx,flow_dy,flow_vx,flow_vy,flow_h";
+    "flow_ok,flow_raw_x,flow_raw_y,flow_dx,flow_dy,flow_vx,flow_vy,flow_h,"
+    "flow_accx,flow_accy,"
+    // --- s5b: 速度・位置ホールド ---
+    "fh_vxc,fh_vyc,fh_vxt,fh_vyt,fh_leanr,fh_leanp,fh_posx,fh_posy";
 
 bool     active  = false;
 uint32_t dropped = 0;   // USBが詰まって捨てたサンプル数
@@ -300,7 +333,9 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
         "%.4f,%.4f,%.4f,"
         "%.3f,%.3f,%.3f,%.3f,%.3f,%u,"
         "%.1f,%.1f,%.1f,%.1f,"
-        "%d,%.1f,%.1f,%.1f,%.1f,%.3f,%.3f,%.2f\n",
+        "%d,%.1f,%.1f,%.1f,%.1f,%.3f,%.3f,%.2f,"
+        "%.4f,%.4f,"
+        "%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f\n",
         (unsigned long)millis(), (unsigned long)dt_us, mode, armed ? 1 : 0, thr,
         roll_axis.stick,     pitch_axis.stick,     yaw_axis.stick,
         roll_axis.ang_meas,  pitch_axis.ang_meas,  g_yaw_est,
@@ -312,7 +347,10 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
         roll_axis.ang_tar,   pitch_axis.ang_tar,
         g_flow_ok ? 1 : 0,
         g_flow_raw_x, g_flow_raw_y, g_flow_dx, g_flow_dy,
-        g_flow_vx, g_flow_vy, flow.height());
+        g_flow_vx, g_flow_vy, flow.height(),
+        (double)g_flow_acc_m_x, (double)g_flow_acc_m_y,
+        g_flow_vx_ctl, g_flow_vy_ctl, g_flow_vx_tar, g_flow_vy_tar,
+        g_flow_lean_roll, g_flow_lean_pitch, g_pos_x, g_pos_y);
     written++;
 }
 
@@ -339,7 +377,7 @@ static Ticker main_tick (S5::MAIN_HZ);
 static Ticker debug_tick(S5::DEBUG_HZ);
 static Ticker telem_tick(S5::TELEM_TX_HZ);
 static Ticker telem_rx_tick(S5::TELEM_RX_HZ);
-static Ticker flow_tick (Q::FLOW_LOOP_HZ);   // オプティカルフロー読み出し (100Hz)
+static Ticker flow_tick (Q::FLOW_LOOP_HZ);   // オプティカルフロー読み出し (FLOW_LOOP_HZ)
 
 // ============================================================
 //  § 6  出力
@@ -376,13 +414,25 @@ static void resetControllers() {
     g_yaw_est     = 0.0f;
     g_yaw_hold    = 0.0f;
     g_yaw_holding = false;
+
+    // s5b: フロー位置・速度ホールドも「今ここ」を基準に取り直す。
+    flow_vx_pid.reset();
+    flow_vy_pid.reset();
+    g_flow_vx_ctl = g_flow_vy_ctl = 0.0f;
+    g_pos_x = g_pos_y = 0.0f;
+    g_pos_hold_x = g_pos_hold_y = 0.0f;
+    g_pos_holding = false;
+    g_flow_vx_tar = g_flow_vy_tar = 0.0f;
+    g_flow_lean_roll = g_flow_lean_pitch = 0.0f;
+    g_flow_bad_count = 0;
 }
 
 static const char* modeName(S5::Mode m) {
     switch (m) {
-        case S5::MODE_AUTO:  return "AUTO  (地上局)";
-        case S5::MODE_ANGLE: return "ANGLE (水平維持)";
-        default:             return "RATE  (アクロ)";
+        case S5::MODE_AUTO:    return "AUTO   (地上局)";
+        case S5::MODE_POSHOLD: return "POSHOLD(フロー位置保持)";
+        case S5::MODE_ANGLE:   return "ANGLE  (水平維持)";
+        default:               return "RATE   (アクロ)";
     }
 }
 
@@ -398,13 +448,95 @@ static const char* modeName(S5::Mode m) {
 static S5::Mode selectMode() {
     if (!S5::USE_SBUS) return S5::MODE_RATE;
 
-    if (S5::USE_IM920 &&
-        sbus.Ch_state(Ch::SW_AUTO) == up &&
-        telemetry.groundLinkFresh()) {
-        return S5::MODE_AUTO;
+    if (sbus.Ch_state(Ch::SW_AUTO) == up) {
+        // 地上局AUTO を使う構成 (USE_GROUND_AUTO) はそちらを優先
+        if (S5::USE_GROUND_AUTO && S5::USE_IM920 && telemetry.groundLinkFresh())
+            return S5::MODE_AUTO;
+        // s5b: フローが生きていれば POSHOLD。死んでいたら下へフォールバック
+        if (S5::USE_FLOW && g_flow_ok)
+            return S5::MODE_POSHOLD;
     }
     if (sbus.Ch_state(Ch::SW_HOVER) == up) return S5::MODE_ANGLE;
     return S5::MODE_RATE;
+}
+
+// ------------------------------------------------------------
+//  § 6-2  s5b : フロー速度・位置ホールド  (FLOW_LOOP_HZ で呼ぶ)
+//
+//   位置誤差[m] ─[POS_KP]→ 目標速度[m/s] ─[VEL PID]→ 目標リーン角[deg]
+//   出力は g_flow_lean_roll / g_flow_lean_pitch。updateControl() が POSHOLD の
+//   ときに角度ループの目標角として使う。スロットルは触らない (全モード手動)。
+// ------------------------------------------------------------
+static void updateFlowHold(float dt_s) {
+    if (dt_s <= 0.0f) return;
+
+    // 実測速度: 異常値クランプ + 制御用 LPF
+    const float vx_raw = constrain(flow.vx, -Q::FLOW_VEL_SANE, Q::FLOW_VEL_SANE);
+    const float vy_raw = constrain(flow.vy, -Q::FLOW_VEL_SANE, Q::FLOW_VEL_SANE);
+    const float a = Q::FLOW_VEL_MEAS_ALPHA;
+    g_flow_vx_ctl += a * (vx_raw - g_flow_vx_ctl);
+    g_flow_vy_ctl += a * (vy_raw - g_flow_vy_ctl);
+
+    const bool  armed = isArmed();
+    const float thr   = S5::USE_SBUS ? constrain(sbus.des[Ch::THR], 0.0f, 1.0f) : 0.0f;
+    const bool  active = armed && (g_mode == S5::MODE_POSHOLD)
+                      && (thr > Q::FLOW_ENABLE_THR)
+                      && S5::USE_FLOW && g_flow_ok;
+
+    if (!active) {
+        g_pos_x = g_pos_y = 0.0f;
+        g_pos_hold_x = g_pos_hold_y = 0.0f;
+        g_pos_holding = false;
+        g_flow_vx_tar = g_flow_vy_tar = 0.0f;
+        g_flow_lean_roll = g_flow_lean_pitch = 0.0f;
+        flow_vx_pid.reset();
+        flow_vy_pid.reset();
+        g_flow_bad_count = 0;
+        return;
+    }
+
+    // 失探検出: |速度| が上限に張り付き続けたら水平指令に固める
+    if (fabsf(flow.vx) >= Q::FLOW_VEL_SANE || fabsf(flow.vy) >= Q::FLOW_VEL_SANE)
+        g_flow_bad_count++;
+    else
+        g_flow_bad_count = 0;
+    if (g_flow_bad_count > (int)(Q::FLOW_LOOP_HZ / 2)) {   // 0.5 秒
+        g_flow_lean_roll = g_flow_lean_pitch = 0.0f;
+        flow_vx_pid.reset();
+        flow_vy_pid.reset();
+        return;
+    }
+
+    // 位置積分 (機体座標。ヨーはヘディングホールドでほぼ一定という前提)
+    //  TODO(s5c以降): g_yaw_est で地面固定フレームに回してから積分する
+    g_pos_x += g_flow_vx_ctl * dt_s;
+    g_pos_y += g_flow_vy_ctl * dt_s;
+
+    // スティック → 目標速度 (触っている間は速度指令、離すと位置ホールド)
+    const float sx = Q::STICK_SIGN_PITCH * sbus.des[Ch::PITCH];
+    const float sy = Q::STICK_SIGN_ROLL  * sbus.des[Ch::ROLL];
+    const bool stick_active = (fabsf(sx) > Q::FLOW_STICK_DEAD) ||
+                              (fabsf(sy) > Q::FLOW_STICK_DEAD);
+
+    if (stick_active) {
+        g_flow_vx_tar = Q::FLOW_STICK_SIGN_X * sx * Q::FLOW_STICK_VEL;
+        g_flow_vy_tar = Q::FLOW_STICK_SIGN_Y * sy * Q::FLOW_STICK_VEL;
+        g_pos_hold_x  = g_pos_x;   // 目標位置を今の位置に張り付け
+        g_pos_hold_y  = g_pos_y;
+        g_pos_holding = false;
+    } else {
+        const float ex = g_pos_hold_x - g_pos_x;
+        const float ey = g_pos_hold_y - g_pos_y;
+        g_flow_vx_tar = constrain(g_flow_pos_kp * ex, -Q::FLOW_POS_VEL_LIM, Q::FLOW_POS_VEL_LIM);
+        g_flow_vy_tar = constrain(g_flow_pos_kp * ey, -Q::FLOW_POS_VEL_LIM, Q::FLOW_POS_VEL_LIM);
+        g_pos_holding = true;
+    }
+
+    // 内側: 速度PID → 目標リーン角
+    const float px = flow_vx_pid.update(g_flow_vx_tar, g_flow_vx_ctl, dt_s, true);
+    const float py = flow_vy_pid.update(g_flow_vy_tar, g_flow_vy_ctl, dt_s, true);
+    g_flow_lean_pitch = constrain(Q::FLOW_LEAN_SIGN_PITCH * px, -Q::FLOW_MAX_LEAN, Q::FLOW_MAX_LEAN);
+    g_flow_lean_roll  = constrain(Q::FLOW_LEAN_SIGN_ROLL  * py, -Q::FLOW_MAX_LEAN, Q::FLOW_MAX_LEAN);
 }
 
 // ============================================================
@@ -466,11 +598,20 @@ static void updateControl(float dt_s) {
     }
 
     // ------------------------------------------------------------
-    //  外側ループ: 角度 → 目標角速度   (ANGLE / AUTO モード, 200Hz)
+    //  外側ループ: 角度 → 目標角速度   (ANGLE / AUTO / POSHOLD, 200Hz)
     // ------------------------------------------------------------
-    if (g_mode == S5::MODE_ANGLE || g_mode == S5::MODE_AUTO) {
-        roll_axis.ang_tar  = roll_axis.stick  * Q::MAX_ANGLE_ROLL;
-        pitch_axis.ang_tar = pitch_axis.stick * Q::MAX_ANGLE_PITCH;
+    if (g_mode == S5::MODE_ANGLE || g_mode == S5::MODE_AUTO ||
+        g_mode == S5::MODE_POSHOLD) {
+
+        if (g_mode == S5::MODE_POSHOLD) {
+            // 目標角は updateFlowHold() が 50Hz で計算済み (すでにクランプ済み)。
+            // スティックはそこで「目標速度」として使っている。
+            roll_axis.ang_tar  = g_flow_lean_roll;
+            pitch_axis.ang_tar = g_flow_lean_pitch;
+        } else {
+            roll_axis.ang_tar  = roll_axis.stick  * Q::MAX_ANGLE_ROLL;
+            pitch_axis.ang_tar = pitch_axis.stick * Q::MAX_ANGLE_PITCH;
+        }
 
         if (++g_angle_div_count >= Q::ANGLE_LOOP_DIV) {
             g_angle_div_count = 0;
@@ -579,6 +720,9 @@ static void tuningMenu() {
     Serial.println("-- ヘディングホールド (ヨー) --");
     Serial.printf(" [h] Hold  P %9.4f   (0 にすると保持を切って従来のレートのみになる)\n",
                   g_yaw_hold_kp);
+    Serial.println("-- s5b フロー位置ホールド --");
+    Serial.printf(" [i] Vel P %9.4f  [j] Vel I %9.4f  [o] Pos P %9.4f\n",
+                  g_flow_vel_kp, g_flow_vel_ki, g_flow_pos_kp);
     Serial.println(" [q] 抜ける");
     Serial.print("選択 > ");
 
@@ -601,6 +745,21 @@ static void tuningMenu() {
     if (sel[0] == 'h') {
         g_yaw_hold_kp = constrain(v, 0.0f, 20.0f);
         Serial.printf("更新: ヘディングホールド kp=%.4f\n", g_yaw_hold_kp);
+        resetControllers();
+        Serial.setTimeout(old_timeout);
+        Serial.println("再開します。");
+        return;
+    }
+
+    // s5b フロー位置ホールドのゲイン (vx/vy 両方に同じ値を入れる)
+    if (sel[0] == 'i' || sel[0] == 'j' || sel[0] == 'o') {
+        if (sel[0] == 'i') g_flow_vel_kp = constrain(v, 0.0f, 40.0f);
+        if (sel[0] == 'j') g_flow_vel_ki = constrain(v, 0.0f, 20.0f);
+        if (sel[0] == 'o') g_flow_pos_kp = constrain(v, 0.0f, 5.0f);
+        for (Q::Pid* p : { &flow_vx_pid, &flow_vy_pid })
+            p->set_gains(g_flow_vel_kp, g_flow_vel_ki, Q::FLOW_VEL_KD);
+        Serial.printf("更新: Flow vel P=%.3f I=%.3f  pos P=%.3f\n",
+                      g_flow_vel_kp, g_flow_vel_ki, g_flow_pos_kp);
         resetControllers();
         Serial.setTimeout(old_timeout);
         Serial.println("再開します。");
@@ -665,6 +824,27 @@ static void handleSerial() {
             // 500Hz ログの開始/停止。scripts/logger.py と対で使う。
             Log::toggle();
             break;
+        case 'z':
+            // フロー積算のゼロ。既知距離キャリブレーションの開始点。
+            g_flow_acc_raw_x = g_flow_acc_raw_y = 0.0;
+            g_flow_acc_px_x  = g_flow_acc_px_y  = 0.0;
+            g_flow_acc_m_x   = g_flow_acc_m_y   = 0.0;
+            Serial.println("FLOW: 積算をゼロにしました");
+            break;
+        case 'h': {
+            // フローのスケール高度 [m] を手で入れる。
+            // s5a のキャリブレーション中はベンチの実測高度を入れる
+            // (s5c で距離センサに置き換わる箇所)。
+            const unsigned long old_to = Serial.getTimeout();
+            Serial.setTimeout(15000);
+            Serial.print("\nフロー高度 h [m] > ");
+            const float v = Serial.parseFloat();
+            Serial.println(v, 3);
+            flow.setHeight(v);
+            Serial.printf("FLOW: h = %.3f m にしました\n", flow.height());
+            Serial.setTimeout(old_to);
+            break;
+        }
         default:
             break;
     }
@@ -675,12 +855,12 @@ static void handleSerial() {
 // ============================================================
 static void printStatus(uint32_t dt_us) {
     Serial.print("\033[2J\033[H");
-    Serial.println("=== Stage 5a : オプティカルフロー観測 (制御は s4 と同じ) ===");
+    Serial.println("=== Stage 5b : フロー速度・位置ホールド ===");
     Serial.printf("loop dt = %6lu us (%6.1f Hz)   %s   link=%s\n",
                   (unsigned long)dt_us, 1000000.0f / (float)dt_us,
                   isArmed() ? "ARMED" : "DISARMED",
                   sbus.isSafe() ? "OK" : "LOST");
-    Serial.printf("MODE = %s   (SW_AUTO UP+受信新鮮 で AUTO / SW_HOVER UP で ANGLE)\n",
+    Serial.printf("MODE = %s   (SW_AUTO UP で POSHOLD / SW_HOVER UP で ANGLE)\n",
                   modeName(g_mode));
 
     if (S5::USE_IM920) {
@@ -690,12 +870,25 @@ static void printStatus(uint32_t dt_us) {
                       g.ap_roll, g.ap_pitch, g.ap_yaw, g.ap_throttle);
     }
 
-    if (g_mode == S5::MODE_ANGLE || g_mode == S5::MODE_AUTO) {
+    if (g_mode == S5::MODE_ANGLE || g_mode == S5::MODE_AUTO ||
+        g_mode == S5::MODE_POSHOLD) {
         Serial.println("\n[角度ループ]  目標[deg]  実測[deg]  → 角速度目標[deg/s]");
         Serial.printf("  roll  %10.1f %10.1f %18.1f\n",
                       roll_axis.ang_tar, roll_axis.ang_meas, roll_axis.rate_tar);
         Serial.printf("  pitch %10.1f %10.1f %18.1f\n",
                       pitch_axis.ang_tar, pitch_axis.ang_meas, pitch_axis.rate_tar);
+    }
+
+    if (g_mode == S5::MODE_POSHOLD) {
+        Serial.printf("\n[フロー位置ホールド] %s  vel P=%.2f I=%.2f  pos P=%.2f  失探=%d\n",
+                      g_pos_holding ? "HOLD " : "STICK",
+                      g_flow_vel_kp, g_flow_vel_ki, g_flow_pos_kp, g_flow_bad_count);
+        Serial.printf("  速度[m/s]  実測(x,y)=%+6.2f %+6.2f   目標(x,y)=%+6.2f %+6.2f\n",
+                      g_flow_vx_ctl, g_flow_vy_ctl, g_flow_vx_tar, g_flow_vy_tar);
+        Serial.printf("  位置[m]    現在(x,y)=%+6.2f %+6.2f   保持(x,y)=%+6.2f %+6.2f\n",
+                      g_pos_x, g_pos_y, g_pos_hold_x, g_pos_hold_y);
+        Serial.printf("  → 目標リーン角[deg]  roll=%+5.1f  pitch=%+5.1f\n",
+                      g_flow_lean_roll, g_flow_lean_pitch);
     }
 
     Serial.println("\n[レートループ] 目標[deg/s] 実測[deg/s]      cmd      I項");
@@ -734,22 +927,34 @@ static void printStatus(uint32_t dt_us) {
                   (g_mix.sat & 2) ? '1' : '0', (g_mix.sat & 1) ? '1' : '0');
 
     // --- オプティカルフロー (s5a: 観測のみ) ---
-    //  確認手順:
-    //   ・機体を前へ平行移動   → dx が + に大きく振れる (符号は FLOW_SIGN_X)
-    //   ・機体を右へ平行移動   → dy が +               (FLOW_SIGN_Y)
-    //   ・前後に動かして dy が動く / 左右で dx が動く → FLOW_SWAP_XY = true
-    //   ・その場で傾けるだけ (並進させない) → dx,dy が ~0 のまま
-    //       逆に振れる → FLOW_DEROT_SIGN_* を反転 / 量が合わない → FLOW_PX_PER_RAD
+    //  ① 符号/軸: 机の上などで機体を「ゆっくり大きく」平行移動させて acc_px を見る
+    //     ・前へ動かす → acc_px の x が一方向に大きく伸びる (逆なら FLOW_SIGN_X=-1)
+    //     ・右へ動かす → acc_px の y                        (逆なら FLOW_SIGN_Y=-1)
+    //     ・前後に動かして y が伸びる / 左右で x が伸びる     → FLOW_SWAP_XY=true
+    //  ③ スケール ([z]でゼロ → 定規で測った高さ h で、定規で測った距離 D を
+    //     一定高さでスライド → 止めて acc_px を読む):
+    //        counts_per_m    = acc_px ÷ D
+    //        FLOW_PX_PER_RAD = counts_per_m × h        ← これを QuadConfig.h に
+    //     x(前後) と y(左右) を別々に測る。ほぼ同じ値になるはず。
+    //     ※ dt にも仮定高度にも依存しない (counts/m がセンサの素の性質)。
+    //  ② de-rotation: ③のあとで。機体の「位置は固定・向きだけ」前後/左右に傾ける。
+    //     raw は振れるが derot(x,y) が ~0 のままなら OK。
+    //     raw と逆向きに振れる → FLOW_DEROT_SIGN_* を反転。
     if (S5::USE_FLOW) {
-        Serial.printf("\n[フロー] %s  h=%.2fm  raw(x,y)=%+7.1f %+7.1f  "
-                      "derot(x,y)=%+7.1f %+7.1f  v(x,y)=%+6.2f %+6.2f m/s\n",
-                      g_flow_ok ? "OK  " : "FAIL",
-                      flow.height(),
-                      g_flow_raw_x, g_flow_raw_y,
-                      g_flow_dx, g_flow_dy, g_flow_vx, g_flow_vy);
+        Serial.printf("\n[フロー] %s  h=%.2fm  raw(x,y)=%+6.1f %+6.1f  "
+                      "derot(x,y)=%+6.1f %+6.1f\n",
+                      g_flow_ok ? "OK  " : "FAIL", flow.height(),
+                      g_flow_raw_x, g_flow_raw_y, g_flow_dx, g_flow_dy);
+        Serial.printf("         v=%+6.2f %+6.2f m/s (LPF %+6.2f %+6.2f)   [z]ゼロ\n",
+                      g_flow_vx, g_flow_vy, g_flow_vx_f, g_flow_vy_f);
+        Serial.printf("         積算 raw=(%+9.0f,%+9.0f)  derot=(%+9.0f,%+9.0f)  "
+                      "m=(%+7.3f,%+7.3f)\n",
+                      g_flow_acc_raw_x, g_flow_acc_raw_y,
+                      g_flow_acc_px_x,  g_flow_acc_px_y,
+                      g_flow_acc_m_x,   g_flow_acc_m_y);
     }
 
-    Serial.println("\n[p] ゲイン調整  [k] IMUキャリブレーション  [r] PIDリセット  [l] ログ開始/停止");
+    Serial.println("\n[p]ゲイン [k]IMUキャリブ [r]PIDリセット [l]ログ [z]フロー積算ゼロ [h]フロー高度");
 }
 
 // ============================================================
@@ -760,8 +965,9 @@ void setup() {
     const uint32_t start_ms = millis();
     while (!Serial && (millis() - start_ms < 2000)) { }
 
-    Serial.println("\n\n=== Stage 5a : オプティカルフロー観測 + モード切替 ===");
-    Serial.println("!! 制御は Stage 4 と同一。フローはログ/表示のみで制御に入れていません !!");
+    Serial.println("\n\n=== Stage 5b : フロー速度・位置ホールド ===");
+    Serial.println("!! SW_AUTO UP = POSHOLD。初回は係留 or 広い床、指をスイッチに !!");
+    Serial.println("!! 地面近く 10-20cm で、手で押して押し返すか (符号) を先に確認 !!");
 
     roll_axis.rate .set_gains(Gain::RATE_ROLL [0], Gain::RATE_ROLL [1], Gain::RATE_ROLL [2]);
     pitch_axis.rate.set_gains(Gain::RATE_PITCH[0], Gain::RATE_PITCH[1], Gain::RATE_PITCH[2]);
@@ -775,6 +981,13 @@ void setup() {
         ax->rate.set_i_limit(Gain::RATE_I_LIMIT);
         ax->angle.set_d_alpha(Gain::ANG_D_ALPHA);
         ax->angle.set_i_limit(Gain::ANG_I_LIMIT);
+    }
+
+    // s5b: フロー速度ループ (x=前後, y=左右)
+    for (Q::Pid* p : { &flow_vx_pid, &flow_vy_pid }) {
+        p->set_gains(g_flow_vel_kp, g_flow_vel_ki, Q::FLOW_VEL_KD);
+        p->set_d_alpha(Q::FLOW_VEL_D_ALPHA);
+        p->set_i_limit(Q::FLOW_VEL_I_LIMIT);
     }
 
     if (S5::USE_MOTOR) {
@@ -812,9 +1025,9 @@ void loop() {
     }
     if (S5::USE_SBUS) sbus.update();
 
-    // --- オプティカルフロー (100Hz) ---
-    //  s5a: 読んで機体座標化 + de-rotation + 対地速度換算までやって、
-    //       グローバルに置くだけ。制御 (updateControl) では一切参照しない。
+    // --- オプティカルフロー (FLOW_LOOP_HZ) ---
+    //  読んで機体座標化 + de-rotation + 対地速度換算 → updateFlowHold() で
+    //  s5b の速度・位置ホールドを計算 (POSHOLD 以外では出力せず基準を保持)。
     //  de-rotation にはレートループと同じジャイロ値 (g_att) を渡して位相を揃える。
     if (S5::USE_FLOW && g_flow_ok && flow_tick.ready()) {
         const float flow_dt_s = (float)flow_tick.dt_us * 1e-6f;
@@ -822,6 +1035,19 @@ void loop() {
         g_flow_raw_x = flow.raw_x;   g_flow_raw_y = flow.raw_y;
         g_flow_dx    = flow.derot_x; g_flow_dy    = flow.derot_y;
         g_flow_vx    = flow.vx;      g_flow_vy    = flow.vy;
+
+        // キャリブレーション用の積算 (生px / de-rot後px / 推定変位[m])
+        g_flow_acc_raw_x += flow.raw_x;          g_flow_acc_raw_y += flow.raw_y;
+        g_flow_acc_px_x  += flow.derot_x;        g_flow_acc_px_y  += flow.derot_y;
+        g_flow_acc_m_x   += flow.vx * flow_dt_s; g_flow_acc_m_y   += flow.vy * flow_dt_s;
+
+        // 表示用の軽い LPF (生値は g_flow_vx/vy とログに残す)
+        constexpr float A = 0.2f;
+        g_flow_vx_f += A * (flow.vx - g_flow_vx_f);
+        g_flow_vy_f += A * (flow.vy - g_flow_vy_f);
+
+        // s5b: 速度・位置ホールド
+        updateFlowHold(flow_dt_s);
     }
 
     // 地上局からの受信。groundLinkFresh() の判定に使うので制御より前に読む。
