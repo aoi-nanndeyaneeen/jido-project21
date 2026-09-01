@@ -1,6 +1,29 @@
 // ============================================================
-//  drone_s4.cpp  -  Stage 4 : 角度PID (水平維持) + モード切替
+//  drone_s5.cpp  -  Stage 5 : オプティカルフロー / 距離センサ / 自動ホバリング
 // ============================================================
+//  Stage 4 (drone_s4.cpp) の角度PID + モード切替 + ヘディングホールドを
+//  そのまま土台にして、位置・高度の保持を段階的に足していく。
+//
+//  【このファイルの現在地: s5a — PMW3901 搭載 + ログのみ】
+//    ・制御には一切入れない。s4 と飛びは完全に同じ。
+//    ・PMW3901 を 100Hz で読み、機体座標化 + de-rotation + 対地速度換算まで
+//      やってシリアル表示と 500Hz ログに出すだけ。
+//    ・目的: 符号 (前進で flow_dx が +)、軸の入れ替わり、de-rotation の符号、
+//      ピクセル⇔角度の換算係数 FLOW_PX_PER_RAD をベンチで確定する。
+//      調整先はすべて include/quad/QuadConfig.h の § 7。
+//
+//  【この先の段取り】(platformio.ini のコメントと対応)
+//    s5b : フロー速度・位置ホールド。flow の vx/vy → 速度PID → 目標リーン角を
+//          roll_axis.ang_tar / pitch_axis.ang_tar に入れる (MODE_AUTO で ap_roll が
+//          入るのと同じ経路)。高度は QuadConfig.h の FLOW_ASSUMED_HEIGHT_M 固定、
+//          スロットルは手動のまま。
+//    s5c : 距離センサ搭載後。高度ホールド (スロットルPID) を足し、
+//          FLOW_ASSUMED_HEIGHT_M を測距値 (flow.setHeight()) に差し替える。
+//    s5d : 高度 + 位置 + ヘディングを1スイッチで同時起動 = 完全自動ホバリング。
+//
+//  ------------------------------------------------------------
+//  以下、Stage 4 から引き継いだ説明:
+//
 //  【前提】Stage 3 のレートPIDが飛べる状態になっていること。
 //    角度ループは、レートループが安定していない限り絶対に安定しません。
 //    Stage 3 で機体がふらつくなら、ここへ来ても悪化するだけです。
@@ -47,6 +70,7 @@
 #include "Actuators.h"
 #include "Receiver.h"
 #include "sensor/IMU.h"   // 気圧・超音波は使わないので Sensors.h ごとは読まない
+#include "sensor/OpticalFlow.h"  // PMW3901 (SPI)
 #include "Telemetry.h"    // IM920SL (地上局との送受信)
 
 #include "quad/QuadConfig.h"
@@ -116,12 +140,13 @@ constexpr float ANG_I_LIMIT = 30.0f;
 // ============================================================
 //  § 2  このステージの設定
 // ============================================================
-namespace S4 {
+namespace S5 {
 
 constexpr bool USE_MPU   = true;
 constexpr bool USE_SBUS  = true;
 constexpr bool USE_MOTOR = true;
 constexpr bool USE_IM920 = true;   // 地上局(position_estimator)との無線
+constexpr bool USE_FLOW  = true;   // PMW3901 オプティカルフロー (s5a: 観測のみ)
 
 constexpr float I_ENABLE_THR = 0.15f;
 
@@ -146,7 +171,7 @@ constexpr int DEBUG_HZ = Q::DEBUG_HZ;
 //    スイッチOFF、またはリンク途絶の瞬間に ANGLE へ自動フォールバックする。
 enum Mode : uint8_t { MODE_RATE = 0, MODE_ANGLE = 1, MODE_AUTO = 2 };
 
-} // namespace S4
+} // namespace S5
 
 // ============================================================
 //  § 3  インスタンス
@@ -159,6 +184,10 @@ motor motors[Q::MOTOR_COUNT];
 // 配線が違う場合はここを変えること。
 FlightTelemetry telemetry(&Serial3);
 
+// PMW3901 オプティカルフロー。CS ピンは QuadConfig.h の FLOW_CS_PIN。
+// グローバル SPI (Teensy 4.0: SCK=13 MOSI=11 MISO=12) を使う。
+OpticalFlow flow;
+
 Q::Axis roll_axis, pitch_axis, yaw_axis;
 
 // ============================================================
@@ -169,8 +198,8 @@ namespace {
 Q::Attitude g_att;
 float       g_out[Q::MOTOR_COUNT] = {0};
 
-S4::Mode g_mode      = S4::MODE_RATE;
-S4::Mode g_prev_mode = S4::MODE_RATE;
+S5::Mode g_mode      = S5::MODE_RATE;
+S5::Mode g_prev_mode = S5::MODE_RATE;
 bool     g_prev_armed = false;
 
 // 角度ループの間引きカウンタと、実際の経過時間
@@ -187,6 +216,12 @@ float g_yaw_hold_kp = Gain::YAW_HOLD_KP;
 
 // ---- ミキサーの報告 (ログ用) ----
 Q::MixInfo g_mix;
+
+// ---- オプティカルフロー (s5a: 観測のみ。制御には未使用) ----
+bool  g_flow_ok    = false;   // PMW3901 が初期化できたか
+float g_flow_raw_x = 0.0f, g_flow_raw_y = 0.0f;  // 機体座標の生カウント [px]
+float g_flow_dx    = 0.0f, g_flow_dy    = 0.0f;  // de-rotation 後 [px]
+float g_flow_vx    = 0.0f, g_flow_vy    = 0.0f;  // 対地速度 [m/s] (前 +, 右 +)
 
 } // anonymous namespace
 
@@ -208,7 +243,7 @@ Q::MixInfo g_mix;
 namespace Log {
 
 constexpr int  LOG_HZ = 500;                    // 記録レート [Hz]
-constexpr int  DIV    = S4::MAIN_HZ / LOG_HZ;   // メインループ何回に1回
+constexpr int  DIV    = S5::MAIN_HZ / LOG_HZ;   // メインループ何回に1回
 constexpr char HEADER[] =
     "t_ms,dt_us,mode,armed,thr,"
     "roll_sbus,pitch_sbus,yaw_sbus,"
@@ -216,7 +251,10 @@ constexpr char HEADER[] =
     "roll_gyr,pitch_gyr,yaw_gyr,"
     "roll_cmd,pitch_cmd,yaw_cmd,"
     "m1,m2,m3,m4,corr_limit,sat,"
-    "roll_ratetar,pitch_ratetar,roll_angtar,pitch_angtar";
+    "roll_ratetar,pitch_ratetar,roll_angtar,pitch_angtar,"
+    // --- s5a: オプティカルフロー (末尾に追記。analyze_log.py は列名参照なので
+    //     既存の解析はそのまま動く。新列を見たいときだけ列名を足す) ---
+    "flow_ok,flow_raw_x,flow_raw_y,flow_dx,flow_dy,flow_vx,flow_vy,flow_h";
 
 bool     active  = false;
 uint32_t dropped = 0;   // USBが詰まって捨てたサンプル数
@@ -261,7 +299,8 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
         "%.2f,%.2f,%.2f,"
         "%.4f,%.4f,%.4f,"
         "%.3f,%.3f,%.3f,%.3f,%.3f,%u,"
-        "%.1f,%.1f,%.1f,%.1f\n",
+        "%.1f,%.1f,%.1f,%.1f,"
+        "%d,%.1f,%.1f,%.1f,%.1f,%.3f,%.3f,%.2f\n",
         (unsigned long)millis(), (unsigned long)dt_us, mode, armed ? 1 : 0, thr,
         roll_axis.stick,     pitch_axis.stick,     yaw_axis.stick,
         roll_axis.ang_meas,  pitch_axis.ang_meas,  g_yaw_est,
@@ -270,7 +309,10 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
         g_out[0], g_out[1], g_out[2], g_out[3],
         g_mix.span_limit, (unsigned)g_mix.sat,
         roll_axis.rate_tar,  pitch_axis.rate_tar,
-        roll_axis.ang_tar,   pitch_axis.ang_tar);
+        roll_axis.ang_tar,   pitch_axis.ang_tar,
+        g_flow_ok ? 1 : 0,
+        g_flow_raw_x, g_flow_raw_y, g_flow_dx, g_flow_dy,
+        g_flow_vx, g_flow_vy, flow.height());
     written++;
 }
 
@@ -293,16 +335,17 @@ struct Ticker {
     }
 };
 
-static Ticker main_tick (S4::MAIN_HZ);
-static Ticker debug_tick(S4::DEBUG_HZ);
-static Ticker telem_tick(S4::TELEM_TX_HZ);
-static Ticker telem_rx_tick(S4::TELEM_RX_HZ);
+static Ticker main_tick (S5::MAIN_HZ);
+static Ticker debug_tick(S5::DEBUG_HZ);
+static Ticker telem_tick(S5::TELEM_TX_HZ);
+static Ticker telem_rx_tick(S5::TELEM_RX_HZ);
+static Ticker flow_tick (Q::FLOW_LOOP_HZ);   // オプティカルフロー読み出し (100Hz)
 
 // ============================================================
 //  § 6  出力
 // ============================================================
 static void writeMotors() {
-    if (!S4::USE_MOTOR) return;
+    if (!S5::USE_MOTOR) return;
     for (int i = 0; i < Q::MOTOR_COUNT; ++i) motors[i].write(g_out[i]);
 }
 
@@ -313,7 +356,7 @@ static void stopAllMotors() {
 }
 
 static bool isArmed() {
-    if (!S4::USE_SBUS) return false;
+    if (!S5::USE_SBUS) return false;
     if (!sbus.isSafe()) return false;
     return sbus.Ch_state(Ch::THR_CUT) == Q::ARM_SWITCH_STATE;
 }
@@ -335,10 +378,10 @@ static void resetControllers() {
     g_yaw_holding = false;
 }
 
-static const char* modeName(S4::Mode m) {
+static const char* modeName(S5::Mode m) {
     switch (m) {
-        case S4::MODE_AUTO:  return "AUTO  (地上局)";
-        case S4::MODE_ANGLE: return "ANGLE (水平維持)";
+        case S5::MODE_AUTO:  return "AUTO  (地上局)";
+        case S5::MODE_ANGLE: return "ANGLE (水平維持)";
         default:             return "RATE  (アクロ)";
     }
 }
@@ -352,16 +395,16 @@ static const char* modeName(S4::Mode m) {
 //    下の優先順位へ自動的にフォールバックする (安全側)。
 //    drone.cpp の Flight_mode::update() と同じ考え方。
 // ------------------------------------------------------------
-static S4::Mode selectMode() {
-    if (!S4::USE_SBUS) return S4::MODE_RATE;
+static S5::Mode selectMode() {
+    if (!S5::USE_SBUS) return S5::MODE_RATE;
 
-    if (S4::USE_IM920 &&
+    if (S5::USE_IM920 &&
         sbus.Ch_state(Ch::SW_AUTO) == up &&
         telemetry.groundLinkFresh()) {
-        return S4::MODE_AUTO;
+        return S5::MODE_AUTO;
     }
-    if (sbus.Ch_state(Ch::SW_HOVER) == up) return S4::MODE_ANGLE;
-    return S4::MODE_RATE;
+    if (sbus.Ch_state(Ch::SW_HOVER) == up) return S5::MODE_ANGLE;
+    return S5::MODE_RATE;
 }
 
 // ============================================================
@@ -388,7 +431,7 @@ static void updateControl(float dt_s) {
     if (!armed) { stopAllMotors(); return; }
 
     const float thr = constrain(sbus.des[Ch::THR], 0.0f, 1.0f);
-    const bool  integrate = (thr > S4::I_ENABLE_THR);
+    const bool  integrate = (thr > S5::I_ENABLE_THR);
 
     // --- 測定値 ---
     roll_axis.rate_meas  = g_att.roll_rate;
@@ -411,7 +454,7 @@ static void updateControl(float dt_s) {
     //    このコード全体の安全上の不変条件として崩さない。
     //    g.ap_throttle はあえて使わない。
     // ------------------------------------------------------------
-    if (g_mode == S4::MODE_AUTO) {
+    if (g_mode == S5::MODE_AUTO) {
         const GroundData& g = telemetry.lastGroundData();
         roll_axis.stick  = constrain(g.ap_roll,  -1.0f, 1.0f);
         pitch_axis.stick = constrain(g.ap_pitch, -1.0f, 1.0f);
@@ -425,7 +468,7 @@ static void updateControl(float dt_s) {
     // ------------------------------------------------------------
     //  外側ループ: 角度 → 目標角速度   (ANGLE / AUTO モード, 200Hz)
     // ------------------------------------------------------------
-    if (g_mode == S4::MODE_ANGLE || g_mode == S4::MODE_AUTO) {
+    if (g_mode == S5::MODE_ANGLE || g_mode == S5::MODE_AUTO) {
         roll_axis.ang_tar  = roll_axis.stick  * Q::MAX_ANGLE_ROLL;
         pitch_axis.ang_tar = pitch_axis.stick * Q::MAX_ANGLE_PITCH;
 
@@ -442,12 +485,12 @@ static void updateControl(float dt_s) {
             roll_axis.rate_tar = constrain(
                 roll_axis.angle.update(roll_axis.ang_tar, roll_axis.ang_meas,
                                        ang_dt_s, integrate),
-                -S4::ANGLE_OUT_LIMIT, S4::ANGLE_OUT_LIMIT);
+                -S5::ANGLE_OUT_LIMIT, S5::ANGLE_OUT_LIMIT);
 
             pitch_axis.rate_tar = constrain(
                 pitch_axis.angle.update(pitch_axis.ang_tar, pitch_axis.ang_meas,
                                         ang_dt_s, integrate),
-                -S4::ANGLE_OUT_LIMIT, S4::ANGLE_OUT_LIMIT);
+                -S5::ANGLE_OUT_LIMIT, S5::ANGLE_OUT_LIMIT);
         }
         // 間引かれたループでは、前回の rate_tar をそのまま使う
     } else {
@@ -611,7 +654,7 @@ static void handleSerial() {
         case 'k':
             stopAllMotors();
             Serial.println("CALIBRATE: 機体を水平に置いて動かさないでください");
-            if (S4::USE_MPU) mpu.recalibrate();
+            if (S5::USE_MPU) mpu.recalibrate();
             resetControllers();
             break;
         case 'r':
@@ -632,7 +675,7 @@ static void handleSerial() {
 // ============================================================
 static void printStatus(uint32_t dt_us) {
     Serial.print("\033[2J\033[H");
-    Serial.println("=== Stage 4 : 角度PID + モード切替 ===");
+    Serial.println("=== Stage 5a : オプティカルフロー観測 (制御は s4 と同じ) ===");
     Serial.printf("loop dt = %6lu us (%6.1f Hz)   %s   link=%s\n",
                   (unsigned long)dt_us, 1000000.0f / (float)dt_us,
                   isArmed() ? "ARMED" : "DISARMED",
@@ -640,14 +683,14 @@ static void printStatus(uint32_t dt_us) {
     Serial.printf("MODE = %s   (SW_AUTO UP+受信新鮮 で AUTO / SW_HOVER UP で ANGLE)\n",
                   modeName(g_mode));
 
-    if (S4::USE_IM920) {
+    if (S5::USE_IM920) {
         const GroundData& g = telemetry.lastGroundData();
         Serial.printf("IM920 link=%s   AP: roll=%+.3f pitch=%+.3f yaw=%+.3f (thr=%+.3f 未使用)\n",
                       telemetry.groundLinkFresh() ? "FRESH" : "STALE",
                       g.ap_roll, g.ap_pitch, g.ap_yaw, g.ap_throttle);
     }
 
-    if (g_mode == S4::MODE_ANGLE || g_mode == S4::MODE_AUTO) {
+    if (g_mode == S5::MODE_ANGLE || g_mode == S5::MODE_AUTO) {
         Serial.println("\n[角度ループ]  目標[deg]  実測[deg]  → 角速度目標[deg/s]");
         Serial.printf("  roll  %10.1f %10.1f %18.1f\n",
                       roll_axis.ang_tar, roll_axis.ang_meas, roll_axis.rate_tar);
@@ -690,6 +733,22 @@ static void printStatus(uint32_t dt_us) {
                   (g_mix.sat & 8) ? '1' : '0', (g_mix.sat & 4) ? '1' : '0',
                   (g_mix.sat & 2) ? '1' : '0', (g_mix.sat & 1) ? '1' : '0');
 
+    // --- オプティカルフロー (s5a: 観測のみ) ---
+    //  確認手順:
+    //   ・機体を前へ平行移動   → dx が + に大きく振れる (符号は FLOW_SIGN_X)
+    //   ・機体を右へ平行移動   → dy が +               (FLOW_SIGN_Y)
+    //   ・前後に動かして dy が動く / 左右で dx が動く → FLOW_SWAP_XY = true
+    //   ・その場で傾けるだけ (並進させない) → dx,dy が ~0 のまま
+    //       逆に振れる → FLOW_DEROT_SIGN_* を反転 / 量が合わない → FLOW_PX_PER_RAD
+    if (S5::USE_FLOW) {
+        Serial.printf("\n[フロー] %s  h=%.2fm  raw(x,y)=%+7.1f %+7.1f  "
+                      "derot(x,y)=%+7.1f %+7.1f  v(x,y)=%+6.2f %+6.2f m/s\n",
+                      g_flow_ok ? "OK  " : "FAIL",
+                      flow.height(),
+                      g_flow_raw_x, g_flow_raw_y,
+                      g_flow_dx, g_flow_dy, g_flow_vx, g_flow_vy);
+    }
+
     Serial.println("\n[p] ゲイン調整  [k] IMUキャリブレーション  [r] PIDリセット  [l] ログ開始/停止");
 }
 
@@ -701,8 +760,8 @@ void setup() {
     const uint32_t start_ms = millis();
     while (!Serial && (millis() - start_ms < 2000)) { }
 
-    Serial.println("\n\n=== Stage 4 : 角度PID + モード切替 ===");
-    Serial.println("!! Stage 3 のレートPIDが飛べる状態であることが前提です !!");
+    Serial.println("\n\n=== Stage 5a : オプティカルフロー観測 + モード切替 ===");
+    Serial.println("!! 制御は Stage 4 と同一。フローはログ/表示のみで制御に入れていません !!");
 
     roll_axis.rate .set_gains(Gain::RATE_ROLL [0], Gain::RATE_ROLL [1], Gain::RATE_ROLL [2]);
     pitch_axis.rate.set_gains(Gain::RATE_PITCH[0], Gain::RATE_PITCH[1], Gain::RATE_PITCH[2]);
@@ -718,7 +777,7 @@ void setup() {
         ax->angle.set_i_limit(Gain::ANG_I_LIMIT);
     }
 
-    if (S4::USE_MOTOR) {
+    if (S5::USE_MOTOR) {
         Serial.println("Init motors...");
         for (int i = 0; i < Q::MOTOR_COUNT; ++i) {
             motors[i].set_pin(Q::MOTOR_PIN[i]).begin();
@@ -727,9 +786,16 @@ void setup() {
         stopAllMotors();
     }
 
-    if (S4::USE_SBUS)  { Serial.println("Init SBUS...");  sbus.begin(); }
-    if (S4::USE_MPU)   { Serial.println("Init IMU...");   mpu.begin();  }
-    if (S4::USE_IM920) { Serial.println("Init IM920..."); telemetry.begin(); }
+    if (S5::USE_SBUS)  { Serial.println("Init SBUS...");  sbus.begin(); }
+    if (S5::USE_MPU)   { Serial.println("Init IMU...");   mpu.begin();  }
+    if (S5::USE_IM920) { Serial.println("Init IM920..."); telemetry.begin(); }
+    if (S5::USE_FLOW) {
+        Serial.println("Init OpticalFlow (PMW3901)...");
+        g_flow_ok = flow.begin();
+        Serial.println(g_flow_ok
+            ? "  PMW3901 OK"
+            : "  !! PMW3901 応答なし (CSピン/SPI配線/電源を確認) !!");
+    }
 
     resetControllers();
     Serial.println("--- Setup complete ---");
@@ -740,28 +806,40 @@ void loop() {
 
     const float dt_s = (float)main_tick.dt_us * 1e-6f;
 
-    if (S4::USE_MPU) {
+    if (S5::USE_MPU) {
         mpu.update();
         g_att = Q::readAttitude(mpu);
     }
-    if (S4::USE_SBUS) sbus.update();
+    if (S5::USE_SBUS) sbus.update();
+
+    // --- オプティカルフロー (100Hz) ---
+    //  s5a: 読んで機体座標化 + de-rotation + 対地速度換算までやって、
+    //       グローバルに置くだけ。制御 (updateControl) では一切参照しない。
+    //  de-rotation にはレートループと同じジャイロ値 (g_att) を渡して位相を揃える。
+    if (S5::USE_FLOW && g_flow_ok && flow_tick.ready()) {
+        const float flow_dt_s = (float)flow_tick.dt_us * 1e-6f;
+        flow.update(flow_dt_s, g_att.roll_rate, g_att.pitch_rate);
+        g_flow_raw_x = flow.raw_x;   g_flow_raw_y = flow.raw_y;
+        g_flow_dx    = flow.derot_x; g_flow_dy    = flow.derot_y;
+        g_flow_vx    = flow.vx;      g_flow_vy    = flow.vy;
+    }
 
     // 地上局からの受信。groundLinkFresh() の判定に使うので制御より前に読む。
     // (PIDゲインのリモート調整やリモートリセットは行わない。receive() は
     //  GroundData を取り込んで鮮度を更新するだけ)
-    if (S4::USE_IM920 && telem_rx_tick.ready()) telemetry.receive();
+    if (S5::USE_IM920 && telem_rx_tick.ready()) telemetry.receive();
 
     updateControl(dt_s);
     handleSerial();
 
     // 500Hz ログ (制御の直後。この周期の指令と出力が揃った状態で落とす)
     Log::sample(main_tick.dt_us, (int)g_mode, isArmed(),
-                S4::USE_SBUS ? sbus.des[Ch::THR] : 0.0f);
+                S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f);
 
     // 姿勢テレメトリの送信 (10Hz)
     //  yaw はヘディングホールドの積分値を送る。Madgwick の6軸ヨーは
     //  絶対方位として意味を持たないため。
-    if (S4::USE_IM920 && telem_tick.ready()) {
+    if (S5::USE_IM920 && telem_tick.ready()) {
         telemetry.sendAttitudeOnly(g_att.roll, g_att.pitch, g_yaw_est);
     }
 

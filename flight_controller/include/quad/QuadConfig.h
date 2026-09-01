@@ -183,4 +183,48 @@ static_assert(RATE_LOOP_HZ % ANGLE_LOOP_HZ == 0,
               "ANGLE_LOOP_HZ は RATE_LOOP_HZ の約数にしてください");
 constexpr int ANGLE_LOOP_DIV = RATE_LOOP_HZ / ANGLE_LOOP_HZ;
 
+// ============================================================
+//  § 7  オプティカルフロー (PMW3901)   ※ Stage 5 (drone_s5) で使用
+// ============================================================
+//  バス: グローバル SPI を使う。Teensy 4.0 では SCK=13 / MOSI=11 / MISO=12。
+//        IMU は I2C (Wire) なので競合しない。モーターは 1..4、
+//        SBUS=Serial5(20/21)、IM920=Serial3(14/15) なので下の CS と重ならない。
+//
+//  【s5a でやること】プロペラを外し、drone_s5 を書き込んでシリアル表示とログを見る:
+//   1. 機体を手で「前」へ平行移動  → flow_dx が一方向に大きく動くか
+//   2. 機体を手で「右」へ平行移動  → flow_dy
+//      前後に動かしたのに flow_dy が動くなら軸が入れ替わっている → FLOW_SWAP_XY = true
+//   3. 前進で flow_dx が + になるように FLOW_SIGN_X、右移動で + になるように FLOW_SIGN_Y
+//   4. 機体を「回転だけ」させる (その場でヨー以外に傾ける)。
+//      de-rotation が正しければ flow_dx / flow_dy がほぼ 0 のまま。
+//      逆に振れるなら FLOW_DEROT_SIGN_* を反転。量が合わなければ FLOW_PX_PER_RAD を調整。
+
+constexpr int FLOW_CS_PIN = 10;   // ★ PMW3901 の CS。実配線に合わせて変更すること
+
+// センサ X/Y 軸 → 機体座標 (FRD: 前=x, 右=y)
+constexpr bool  FLOW_SWAP_XY = false;
+constexpr float FLOW_SIGN_X  = +1.0f;   // 前進で + になる向き
+constexpr float FLOW_SIGN_Y  = +1.0f;   // 右移動で + になる向き
+
+// ピクセル ⇔ 角度 の換算 [pixel / rad]。
+//  PMW3901 は 30x30 有効画素・FOV≈42° → 30 / (42°×π/180) ≒ 40.9
+//  de-rotation と 速度換算の両方で使う。s5a のベンチで実測補正する。
+constexpr float FLOW_PX_PER_RAD = 40.9f;
+
+// de-rotation: 機体の角速度が作る「見かけの流れ」をジャイロで差し引く。
+//  pitch(Y軸まわり)レート → flow_x に乗る / roll(X軸まわり)レート → flow_y に乗る
+constexpr bool  FLOW_DEROTATE     = true;
+constexpr float FLOW_DEROT_SIGN_X = -1.0f;
+constexpr float FLOW_DEROT_SIGN_Y = -1.0f;
+
+// s5b で使う「仮定高度」[m]。距離センサ搭載後 (s5c) は測距値を毎ループ渡す。
+//  ピクセル速度→対地速度の換算はこの値に比例する。テストホバリング高度に合わせること。
+constexpr float FLOW_ASSUMED_HEIGHT_M = 1.0f;
+
+// フロー更新レート [Hz]。1000Hz メインから間引く。
+constexpr int FLOW_LOOP_HZ = 100;
+static_assert(RATE_LOOP_HZ % FLOW_LOOP_HZ == 0,
+              "FLOW_LOOP_HZ は RATE_LOOP_HZ の約数にしてください");
+constexpr int FLOW_LOOP_DIV = RATE_LOOP_HZ / FLOW_LOOP_HZ;
+
 } // namespace Quad

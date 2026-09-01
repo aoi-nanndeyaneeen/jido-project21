@@ -25,7 +25,7 @@ build_src_filter = -<*> +<sub_lib/*.cpp> +<${PIOENV}.cpp>
 | `pio run -e drone_s4` | `src/drone_s4.cpp` + `src/sub_lib/*.cpp` |
 | `pio run -e auto_flight` | `src/auto_flight.cpp` + `src/sub_lib/*.cpp` |
 
-`drone.cpp` と `drone_s1`〜`s4.cpp` の5つが**同時に動くことはありません**。
+`drone.cpp` と `drone_s1`〜`s5.cpp` が**同時に動くことはありません**。
 それぞれが独立した `setup()` / `loop()` を持つ、別々のファームウェアです。
 
 何もオプションを付けずに `pio run` とだけ打った場合は、`default_envs` の環境が選ばれます。
@@ -68,7 +68,19 @@ git の記録では次の順です。
 | `drone_s2` | X配置ミキサーとセンサ軸の確認 | **外す** | ロール指令で正しいモーターが速くなるか、符号は合っているか |
 | `drone_s3` | レートPID（アクロ） | 付ける | **初飛行はここ**。内側ループのゲイン決め |
 | `drone_s4` | 角度PID + モード切替 + ヨー保持 + 自律 + ログ | 付ける | 実運用はここ。RATE / ANGLE / AUTO の3モード |
+| `drone_s5` | オプティカルフロー / 距離センサ / 自動ホバリング | 付ける | s4 の上に位置・高度保持を段階的に追加（下記） |
 | `esc_calib` | ESCキャリブレーション専用 | **外す** | 起動後10秒間 2000us を出力 |
+
+`drone_s5` の内部段階（同一ファイルに順に足していく。現在 **s5a**）:
+
+| 段階 | 内容 | 高度源 | スロットル |
+|---|---|---|---|
+| **s5a** | PMW3901 搭載 + ログ/表示のみ（制御に入れない）。符号・軸・de-rotation・`FLOW_PX_PER_RAD` をベンチで確定 | — | 手動 |
+| s5b | フロー速度・位置ホールド。`vx/vy` → 速度PID → 目標リーン角（`ang_tar`） | `FLOW_ASSUMED_HEIGHT_M` 固定 | 手動 |
+| s5c | 高度ホールド（スロットルPID）を追加。仮定高度を測距値に差し替え | 距離センサ実測 | 自動 |
+| s5d | 高度 + 位置 + ヘディングを1スイッチで同時起動 = 完全自動ホバリング | 距離センサ実測 | 自動 |
+
+フロー関連の調整先はすべて `include/quad/QuadConfig.h` の `§ 7`。ドライバは `include/sensor/OpticalFlow.h`。
 
 Stage 1/2 で判明した機体固有の値（ピン配置、ミキサー係数、センサ符号）は
 すべて **`include/quad/QuadConfig.h` の1箇所**に書きます。
@@ -150,7 +162,7 @@ flight_controller/
 ├── platformio.ini          # ★ ビルド環境の定義。build_src_filter がすべての鍵
 ├── DEVELOPMENT_PLAN.md     # 振動・発熱問題の切り分け計画 (2026-08-09)
 ├── src/
-│   ├── drone_s1..s4.cpp    # ★ クアッド 段階的開発 (現行)
+│   ├── drone_s1..s5.cpp    # ★ クアッド 段階的開発 (現行。s5 = フロー/測距/自動ホバリング)
 │   ├── drone.cpp           #   クアッド 旧版 (レガシー。ヨー無制御)
 │   ├── esc_calib.cpp       #   ESCキャリブレーション
 │   ├── auto_flight.cpp     #   双発固定翼
@@ -165,6 +177,8 @@ flight_controller/
 │   │   └── BodyFrame.h     #   IMU (FLU) → 機体座標 (FRD) の変換
 │   ├── Config.h            # 制御周期 (MAIN_Hz = 1000)、センサスケール、チャンネル定義
 │   ├── sensor/IMU.h        # MPU6050 + Madgwick
+│   ├── sensor/OpticalFlow.h # PMW3901 (SPI) ラッパ。de-rotation + 対地速度換算。drone_s5 専用
+│   ├── sensor/EZ2.h        # 超音波測距ドライバ (未配線。s5c で使用予定)
 │   ├── sensor/Barometer.h  # BMP280
 │   ├── Control.h           # 旧PID (drone.cpp / auto_flight.cpp が使用)
 │   ├── Receiver.h          # SBUS
