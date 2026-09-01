@@ -58,7 +58,7 @@ BarometerSensor barometer(1013.25, 0.1, &Wire);  // 海面気圧1013.25hPa, α=0
 // EZ2Sensor       ez2(Config::sensor::EZ2_PW_PIN, Config::sensor::EZ2_ALPHA);
 // // 停止中 (搭載無し)
 
-Sbus sbus(&Serial2);
+Sbus sbus(&Serial5);
 FlightTelemetry telemetry(&Serial3);
 
 Flight_mode Mode;

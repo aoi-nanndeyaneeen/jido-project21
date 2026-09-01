@@ -135,11 +135,11 @@ constexpr bool ATTITUDE_PRIORITY = true;
 constexpr bool  SWAP_XY    = false;  // IMU が機体に対して90度回って付いている場合 true
 
 constexpr float GYRO_SIGN_ROLL  = -1.0f;  // X軸まわり
-constexpr float GYRO_SIGN_PITCH = -1.0f;  // Y軸まわり (FLU の左 → FRD の右で反転)
+constexpr float GYRO_SIGN_PITCH = +1.0f;  // Y軸まわり (FLU の左 → FRD の右で反転)
 constexpr float GYRO_SIGN_YAW   = +1.0f;  // Z軸まわり (FLU の上 → FRD の下で反転)
 
 constexpr float ANG_SIGN_ROLL   = -1.0f;  // Madgwick の出力 [deg]
-constexpr float ANG_SIGN_PITCH  = -1.0f;
+constexpr float ANG_SIGN_PITCH  = +1.0f;
 constexpr float ANG_SIGN_YAW    = +1.0f;
 
 // ============================================================
