@@ -353,6 +353,24 @@ def check_attitude(d, fs, hover_thr):
 
     check_bias(d, armed)
 
+    # --- スティックが端に張り付いていないか ---
+    #  角度ループの目標は stick * MAX_ANGLE。-1.0 に張り付いている間は
+    #  「30度傾けろ」と言われ続けるので、その間は絶対に離陸できない。
+    #  操縦者が機体と喧嘩しているときに起きる (2026-09-04 に実際に起きた)。
+    if "roll_stick" in a:
+        for nm, k in (("ロール", "roll_stick"), ("ピッチ", "pitch_stick")):
+            v = a[k]
+            sat = np.mean(np.abs(v) >= 0.99) * 100
+            print(f"  {nm}スティック  平均 {v.mean():+.2f}  "
+                  f"端(±1.0)に張り付き {sat:.1f} %  "
+                  f"(平均で目標角 {v.mean()*MAX_ANGLE:+.1f} deg)")
+            if sat > 10:
+                print(f"     ★ {nm}スティックが {sat:.0f} % の時間 端に張り付いています。")
+                print(f"        その間ずっと {np.sign(v.mean())*MAX_ANGLE:+.0f} 度傾けろと")
+                print("        言われ続けるので、離陸できません。機体と喧嘩せず、")
+                print("        スティックは中立のまま原因を潰してください。")
+        print()
+
     # --- 離陸したか ---
     print(f"  ARMED {armed.sum() / fs:.1f} 秒   "
           f"スロットル 最大 {a['thr'].max():.3f} / 平均 {a['thr'].mean():.3f}")
@@ -363,6 +381,25 @@ def check_attitude(d, fs, hover_thr):
                   f"ホバー基準 ALT_HOVER_THR = {hover_thr:.2f}。推力が足りません。")
             print("     地面近くで半端な推力のまま粘ると、片脚だけ荷重が抜けて")
             print("     支点になり転がります。ホバー付近まで1秒以内で上げること。")
+
+    # --- 推力の問題か制御の問題かの切り分け ---
+    #  「4発とも高い出力が出ていて、機体はほぼ水平で、それでも浮かない」
+    #  なら、それはゲインの話ではない。推力・重量・プロペラ・電池を見る。
+    mavg = (a["m1"] + a["m2"] + a["m3"] + a["m4"]) / 4.0
+    level = np.hypot(a["roll"], a["pitch"]) < 15.0
+    hot = level & (mavg > 0.6)
+    if hot.sum() >= 2 and a["airborne"].max() < 0.5:
+        print(f"  ★ ほぼ水平 (傾き<15度) で 4発平均 {mavg[hot].mean():.2f} "
+              f"(最大 {mavg[hot].max():.2f}) 出しているのに離陸していません。")
+        print("     これは姿勢ゲインの問題ではありません。次を疑ってください:")
+        print("       ・電池の残量 / 電圧降下 (今日ずっと飛ばしているなら最有力)")
+        print("       ・プロペラの向き・破損、モーターの回転方向")
+        print("       ・ESC キャリブレーション (指令値と実出力のずれ)")
+        print("       ・機体重量に対してプロペラ/モーターが足りていない")
+        print(f"     ※ ALT_HOVER_THR は {hover_thr:.2f} という前提ですが、"
+              "実測していないなら")
+        print("       この数字自体が根拠を持ちません。")
+        print()
 
     # --- 転倒の検出 ---
     tilt = np.hypot(a["roll"], a["pitch"])
