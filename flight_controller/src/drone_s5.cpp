@@ -322,6 +322,8 @@ float       g_out[Q::MOTOR_COUNT] = {0};
 S5::Mode g_mode      = S5::MODE_ANGLE;
 S5::Mode g_prev_mode = S5::MODE_ANGLE;
 bool     g_prev_armed = false;
+// アームの瞬間に SW_HOVER が ANGLE 側だったか (isArmed / armGateOk 参照)
+bool     g_arm_latched = false;
 
 // 角度ループの間引きカウンタと、実際の経過時間
 int      g_angle_div_count = 0;
@@ -729,10 +731,45 @@ static void stopAllMotors() {
     writeMotors();
 }
 
+// ★ POSHOLD の位置ではアームさせない (2026-09-04 追加)
+//
+//  2026-09-04 の飛行ログ 008〜013 で、操縦者が ANGLE のつもりで飛ばしていた
+//  6本すべてが実際には POSHOLD だった (mode=3 が 94〜100%)。POSHOLD では
+//  角度目標がフロー位置ループから来るのでスティックで姿勢を直せず、離陸
+//  検知が立った瞬間に最大リーン (FLOW_MAX_LEAN=8deg) が出て機体が飛んで
+//  いく。外からは「ANGLE が飛ばない」としか見えない。
+//
+//  SW_HOVER の向きが思っているのと逆でもアームできてしまうのが原因なので、
+//  「アームの瞬間は必ず ANGLE 側」を強制する。いったんアームしたあとに
+//  POSHOLD へ切り替えるのは従来どおり自由 (bail-out も従来どおり)。
+static bool armGateOk() {
+    if (!S5::USE_SBUS) return true;
+    return sbus.Ch_state(Ch::SW_HOVER) != up;   // up = POSHOLD 側
+}
+
 static bool isArmed() {
     if (!S5::USE_SBUS) return false;
     if (!sbus.isSafe()) return false;
-    return sbus.Ch_state(Ch::THR_CUT) == Q::ARM_SWITCH_STATE;
+    if (sbus.Ch_state(Ch::THR_CUT) != Q::ARM_SWITCH_STATE) {
+        g_arm_latched = false;
+        return false;
+    }
+    // アーム操作の瞬間だけ SW_HOVER の位置を見る。
+    if (!g_arm_latched) {
+        if (!armGateOk()) {
+            static uint32_t last_warn_ms = 0;
+            if (millis() - last_warn_ms > 2000) {
+                last_warn_ms = millis();
+                Serial.println("\n!! ARM 拒否: SW_HOVER が POSHOLD 側です。");
+                Serial.println("   ANGLE 側 (bail-out 位置) に戻してからアームしてください。");
+                Serial.println("   ★スイッチの向きが思っているのと逆になっていないか確認を。");
+                Serial.println("   地上局の画面の MODE= 表示が ANGLE であることを見てください。");
+            }
+            return false;
+        }
+        g_arm_latched = true;
+    }
+    return true;
 }
 
 // PIDの内部状態と目標値の両方をクリアする。
