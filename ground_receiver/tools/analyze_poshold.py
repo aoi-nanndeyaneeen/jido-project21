@@ -246,6 +246,87 @@ def check_alt(d, seg, fs, thr_auth):
 
 
 
+
+# 角度ループのゲイン (Gain::ANG_ROLL[0]) と最大指令角 (Q::MAX_ANGLE_ROLL)。
+# QuadConfig.h / drone_s5.cpp を変えたらここも合わせること。
+ANG_KP = 4.0
+MAX_ANGLE = 30.0
+
+
+def check_bias(d, armed):
+    """静止しているはずの区間から、姿勢推定とスティックのずれを出す。
+
+    ここが 0 でないと「離陸しようとすると必ず一方向へ流れる」になる。
+    2026-09-04 の実機で、ロールスティックが中立のつもりで +0.318 ずれており、
+    角度ループが常時「+9.5度傾け」と言われていた。外見上は水平なので
+    機体を見ても分からない。数字でしか出ない。
+    """
+    still = (armed
+             & (d["m1"] < 0.01) & (d["m2"] < 0.01)
+             & (d["m3"] < 0.01) & (d["m4"] < 0.01)
+             & (np.abs(d["roll_gyr"]) < 3) & (np.abs(d["pitch_gyr"]) < 3))
+    if still.sum() < 5:
+        print("  (静止・モーター停止の区間が足りず、バイアス点検はできません)")
+        print()
+        return
+
+    roll, pitch = d["roll"][still], d["pitch"][still]
+    print(f"  [静止 {still.sum()} 行から逆算したバイアス] "
+          "★機体を水平に置き、スティック中立で記録すること")
+    print(f"    姿勢推定      roll {roll.mean():+7.2f}  pitch {pitch.mean():+7.2f} [deg]"
+          "   ← 水平なら 0")
+
+    # 角度ループ: rate_tar = ANG_KP * (ang_tar - ang_meas)
+    r_tar = roll + d["roll_ratetar"][still] / ANG_KP
+    p_tar = pitch + d["pitch_ratetar"][still] / ANG_KP
+    print(f"    角度ループ目標 roll {r_tar.mean():+7.2f}  pitch {p_tar.mean():+7.2f} [deg]"
+          "   ← 中立なら 0")
+
+    if "roll_stick" in d.dtype.names:
+        rs, ps = d["roll_stick"][still].mean(), d["pitch_stick"][still].mean()
+        print(f"    スティック実測 roll {rs:+7.3f}  pitch {ps:+7.3f}"
+              f"   (= 目標角 {rs*MAX_ANGLE:+.1f} / {ps*MAX_ANGLE:+.1f} deg)")
+    else:
+        rs, ps = r_tar.mean() / MAX_ANGLE, p_tar.mean() / MAX_ANGLE
+        print(f"    スティック逆算 roll {rs:+7.3f}  pitch {ps:+7.3f}"
+              "   (機体を焼き直すと実測値が入ります)")
+
+    gr, gp = d["roll_gyr"][still].mean(), d["pitch_gyr"][still].mean()
+    print(f"    ジャイロ       roll {gr:+7.2f}  pitch {gp:+7.2f} [deg/s]   ← 静止なら 0")
+
+    bad = False
+    if max(abs(rs), abs(ps)) > 0.03:
+        bad = True
+        ax = "ロール" if abs(rs) > abs(ps) else "ピッチ"
+        v = rs if abs(rs) > abs(ps) else ps
+        print()
+        print(f"  ★ {ax}スティックが {v:+.3f} ずれています "
+              f"(角度ループへ {v*MAX_ANGLE:+.1f} 度の指令)。")
+        print("     プロポのトリムを中立に戻してください。これがある限り、")
+        print("     スロットルを上げた瞬間からその方向へ傾き続けます。")
+        print("     ゲインをいくらいじっても直りません。")
+
+    if max(abs(roll.mean()), abs(pitch.mean())) > 2.0:
+        bad = True
+        print()
+        print(f"  ★ 機体が水平なのに姿勢推定が roll {roll.mean():+.1f} / "
+              f"pitch {pitch.mean():+.1f} 度を出しています。")
+        print("     角度ループはこれを 0 にしようとするので、機体は物理的に")
+        print("     逆向きへ傾いて釣り合い、その方向へ加速します。")
+        print("     水平な床に置いて静止させ、シリアル 'k' で再キャリブしてください")
+        print("     (recalibrate は加速度バイアスも取り直します)。")
+
+    if max(abs(gr), abs(gp)) > 1.0:
+        bad = True
+        print()
+        print(f"  ★ 静止しているのにジャイロが roll {gr:+.1f} / pitch {gp:+.1f} deg/s。")
+        print("     ジャイロバイアスが残っています。'k' で再キャリブを。")
+
+    if not bad:
+        print("    → バイアスは許容範囲です。")
+    print()
+
+
 # ============================================================
 #  2b. 姿勢ループ / モーター (C フレーム)
 # ============================================================
@@ -263,11 +344,14 @@ def check_attitude(d, fs, hover_thr):
         print("  ARMED の区間がありません。")
         return
 
-    a = {k: d[k][armed] for k in
-         ("thr", "roll", "pitch", "m1", "m2", "m3", "m4", "mixsat",
-          "roll_gyr", "pitch_gyr", "roll_ratetar", "pitch_ratetar",
-          "roll_cmd", "pitch_cmd", "yaw_cmd", "range_raw", "airborne")}
+    cols = ["thr", "roll", "pitch", "m1", "m2", "m3", "m4", "mixsat",
+            "roll_gyr", "pitch_gyr", "roll_ratetar", "pitch_ratetar",
+            "roll_cmd", "pitch_cmd", "range_raw", "airborne"]
+    cols += [c for c in ("roll_stick", "pitch_stick") if c in d.dtype.names]
+    a = {k: d[k][armed] for k in cols}
     t = (d["rx_ms"][armed] - d["rx_ms"][armed][0]) / 1000.0
+
+    check_bias(d, armed)
 
     # --- 離陸したか ---
     print(f"  ARMED {armed.sum() / fs:.1f} 秒   "
@@ -316,20 +400,22 @@ def check_attitude(d, fs, hover_thr):
         print("  → 特定のモーターだけ働いています。重心のずれ、モーター取付角、")
         print("     プロペラの CW/CCW 取り違え、ESC の個体差を疑ってください。")
 
-    # --- レートループの追従 ---
+    # --- 角速度の大きさ ---
+    #  ★ 相関で「追従しているか」を判定してはいけない。レートループは
+    #    1000Hz で回っているのに、ここに来る C フレームは 7.5Hz。
+    #    3.75Hz より上は折り返して混ざるので、相関係数は意味を持たない。
+    #    (実際、地上で機体を手で動かしただけのログでも r≒0 になった)
+    #    見てよいのは「どれくらいの角速度が出ていたか」という大きさだけ。
+    #    レートループの追従を見るには USB + 500Hz ログを使うこと。
     print()
     for ax, meas, tar in (("roll", "roll_gyr", "roll_ratetar"),
                           ("pitch", "pitch_gyr", "pitch_ratetar")):
         m_, t_ = a[meas], a[tar]
-        err = t_ - m_
-        print(f"  {ax:<6} 角速度 実測 RMS {np.sqrt(np.mean(m_**2)):6.1f} / "
-              f"目標 RMS {np.sqrt(np.mean(t_**2)):6.1f} / "
-              f"追従誤差 RMS {np.sqrt(np.mean(err**2)):6.1f} [deg/s]")
-        if np.std(t_) > 1.0:
-            r = np.corrcoef(t_, m_)[0, 1]
-            if r < 0.2:
-                print(f"    → 目標にまったく追従していません (r={r:+.2f})。"
-                      "レートPIDの符号かゲインを疑ってください。")
+        print(f"  {ax:<6} 角速度 実測 RMS {np.sqrt(np.mean(m_**2)):6.1f} "
+              f"(最大 {np.max(np.abs(m_)):6.1f}) / "
+              f"目標 RMS {np.sqrt(np.mean(t_**2)):6.1f} [deg/s]")
+    print("    ※ 7.5Hz のテレメトリなのでレートループの追従はここでは判定できません")
+    print("      (3.75Hz より上は折り返す)。発振を追うなら USB + 500Hz ログを。")
 
     # --- 定常的な傾き (I項の要否はここで判断する) ---
     air = a["airborne"] > 0.5

@@ -584,7 +584,16 @@ inline void sendAtt(int mode) {
 
     c.roll_cmd  = S5T::q16(roll_axis.cmd,  S5T::SC_1E4);
     c.pitch_cmd = S5T::q16(pitch_axis.cmd, S5T::SC_1E4);
-    c.yaw_cmd   = S5T::q16(yaw_axis.cmd,   S5T::SC_1E4);
+
+    // ★ roll_axis.stick ではなく sbus から直接読む。roll_axis.stick は
+    //   updateControl() の !armed で return する前には入らないので、
+    //   非アーム中は 0 のままになる。トリム確認は飛ばす前にやりたい。
+    if (S5::USE_SBUS) {
+        const float rs = constrain(sbus.des[Ch::ROLL],  -1.0f, 1.0f);
+        const float ps = constrain(sbus.des[Ch::PITCH], -1.0f, 1.0f);
+        c.roll_stick  = (int8_t)constrain(lroundf(rs * S5T::SC_STICK), -127L, 127L);
+        c.pitch_stick = (int8_t)constrain(lroundf(ps * S5T::SC_STICK), -127L, 127L);
+    }
 
     if (!s5tx.send(c)) tx_drop_flag = true;
 }

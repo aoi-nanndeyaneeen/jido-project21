@@ -74,7 +74,7 @@ static const char CSV_HEADER[] =
     "fh_leanr,fh_leanp,"
     "m1,m2,m3,m4,mixsat,"
     "roll_gyr,pitch_gyr,yaw_gyr,roll_ratetar,pitch_ratetar,"
-    "roll_cmd,pitch_cmd,yaw_cmd";
+    "roll_cmd,pitch_cmd,roll_stick,pitch_stick";
 
 // ------------------------------------------------------------
 //  状態
@@ -220,7 +220,7 @@ static void emitData(uint32_t rx_ms, uint32_t t_ms, uint8_t seq, int fresh) {
         "%.2f,%.2f,"
         "%.3f,%.3f,%.3f,%.3f,%u,"
         "%.1f,%.1f,%.1f,%.1f,%.1f,"
-        "%.4f,%.4f,%.4f\n",
+        "%.4f,%.4f,%.2f,%.2f\n",
         (unsigned long)rx_ms, (unsigned long)t_ms, (unsigned)seq,
         (unsigned long)n_lost, last_rssi, fresh,
         (unsigned)S5T::unpackMode(m), (unsigned)S5T::unpackAltState(m),
@@ -247,7 +247,7 @@ static void emitData(uint32_t rx_ms, uint32_t t_ms, uint8_t seq, int fresh) {
         c.yaw_rate_dd / S5T::SC_DDEG,
         c.roll_rate_tar_dd / S5T::SC_DDEG, c.pitch_rate_tar_dd / S5T::SC_DDEG,
         c.roll_cmd / S5T::SC_1E4, c.pitch_cmd / S5T::SC_1E4,
-        c.yaw_cmd / S5T::SC_1E4);
+        c.roll_stick / S5T::SC_STICK, c.pitch_stick / S5T::SC_STICK);
 }
 
 // ------------------------------------------------------------
@@ -347,9 +347,16 @@ static void printStatus() {
                       c.yaw_rate_dd / S5T::SC_DDEG,
                       c.roll_rate_tar_dd / S5T::SC_DDEG,
                       c.pitch_rate_tar_dd / S5T::SC_DDEG);
-        Serial.printf("  cmd  : roll=%+.4f pitch=%+.4f yaw=%+.4f\n",
-                      c.roll_cmd / S5T::SC_1E4, c.pitch_cmd / S5T::SC_1E4,
-                      c.yaw_cmd / S5T::SC_1E4);
+        Serial.printf("  cmd  : roll=%+.4f pitch=%+.4f\n",
+                      c.roll_cmd / S5T::SC_1E4, c.pitch_cmd / S5T::SC_1E4);
+        // ★ 中立のはずなのに 0 でなければプロポのトリムずれ。
+        //   角度ループはこれに MAX_ANGLE(30deg) を掛けた角度を目標にする。
+        const float rs = c.roll_stick / S5T::SC_STICK;
+        const float ps = c.pitch_stick / S5T::SC_STICK;
+        Serial.printf("  stick: roll=%+.2f pitch=%+.2f  (目標角 %+.1f / %+.1f deg)%s\n",
+                      rs, ps, rs * 30.0f, ps * 30.0f,
+                      (fabsf(rs) > 0.03f || fabsf(ps) > 0.03f)
+                        ? "  ★中立でないならトリムずれ" : "");
     }
 
     if (have_param) {

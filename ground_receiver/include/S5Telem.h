@@ -61,7 +61,7 @@
 namespace S5T {
 
 // 構造体を変えたら必ずインクリメントすること (地上局が不一致を検出する)
-constexpr uint8_t VERSION = 3;
+constexpr uint8_t VERSION = 4;
 
 // IM920sL の実効ペイロード上限 [byte]。これを超えると黙って切られる。
 constexpr size_t IM920SL_MAX_PAYLOAD = 32;
@@ -80,6 +80,7 @@ constexpr float SC_MM   = 1000.0f;   // 1 mm / 1 mm/s
 constexpr float SC_CM   = 100.0f;    // 1 cm      (位置は ±327m まで)
 constexpr float SC_1E4  = 10000.0f;  // スロットル割合 0.0001
 constexpr float SC_GAIN = 1000.0f;   // ゲイン 0.001 刻み (±32.7)
+constexpr float SC_STICK = 100.0f;   // スティック 0.01 刻み (int8, ±1.27)
 
 // flags のビット割り当て (A/B 共通)
 enum Flag : uint16_t {
@@ -166,6 +167,8 @@ static_assert(sizeof(PosFrame) == PACKET_BYTES, "PosFrame が 28 byte ではあ�
 //
 //  ★ 角速度は 0.1 deg/s 刻み (±3276 deg/s)。トルク指令 cmd は [-1,1] を
 //    1e-4 刻みで。モーター出力は 0..250 = 0.000..1.000 (分解能 0.004)。
+//  ★ yaw_cmd は入っていない (28バイトに入らなかった)。ヨーの問題は
+//    yaw_rate_dd で見る。枠はスティック2本に使っている。
 struct __attribute__((__packed__)) AttFrame {
     Header  h;                 //  6
     uint8_t modes;             //  7
@@ -178,7 +181,14 @@ struct __attribute__((__packed__)) AttFrame {
     int16_t pitch_rate_tar_dd; // 22
     int16_t roll_cmd;          // 24  ミキサーへ渡したトルク指令 [1e-4]
     int16_t pitch_cmd;         // 26
-    int16_t yaw_cmd;           // 28
+    // ★ 受信機から読んだ生のスティック値 (STICK_SIGN を掛ける前)。
+    //   トリムずれの検出用。2026-09-04、ロールスティックが中立のつもりで
+    //   +0.318 ずれており、角度ループが常時「+9.5度傾け」と言われていた。
+    //   これが「離陸しようとすると必ず一方向へ流れる」の正体だった。
+    //   逆算でしか分からず時間を溶かしたので、以後は直接載せる。
+    //   ※ 非アーム中でも入る (sbus から直接読む)。飛ばす前に地上で確認できる。
+    int8_t  roll_stick;        // 27  [0.01] -1.00..+1.00
+    int8_t  pitch_stick;       // 28
 };
 static_assert(sizeof(AttFrame) == PACKET_BYTES, "AttFrame が 28 byte ではありません");
 
