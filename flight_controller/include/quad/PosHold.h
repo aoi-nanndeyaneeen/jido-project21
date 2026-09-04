@@ -162,6 +162,9 @@ public:
     }
     void  setPosKp(float kp) { _pos_kp = kp; }
     float posKp() const      { return _pos_kp; }
+    // テレメトリで「今どのゲインで飛んでいるか」を送るための読み出し。
+    // x/y は setVelGains() で必ず同じ値にしているので x 側だけ見ればよい。
+    const Pid& velPid() const { return _vx_pid; }
 
 private:
     static constexpr float DEG2RAD = 0.01745329252f;

@@ -1,0 +1,187 @@
+# s5 (POSHOLD) テレメトリ — 地上局でログを取って解析するまで
+
+実飛行では機体に USB を挿せないので、`flight_controller/scripts/logger.py` の
+500Hz ログが取れない。代わりに **POSHOLD の解析に必要な信号だけ** を
+IM920sL で 15Hz 落とし、地上局側で CSV にする。
+
+```
+機体 (Teensy 4.0)                     地上局 (XIAO RP2040)            PC
+drone_s5.cpp                          tools/s5_log.cpp
+  A: 高度+姿勢   ┐                      受信・checksum検証   ──USB──> s5_logger.py
+  B: 水平位置    ├ 15Hz ──IM920sL──>    A/B を forward-fill          └> logs/s5_NNN_*.csv
+  P: ゲイン一覧  ┘  (交互)               CSV / 人間向け表示           └> analyze_poshold.py
+```
+
+## ★ 実機で測った制約 (2026-09-04)
+
+| | 値 | 根拠 |
+|---|---|---|
+| IM920s**L** の実効ペイロード | **32 バイト** | 33B 以上は送信側 `OK` なのに受信側で先頭32Bに切り詰められる |
+| 持続できるパケットレート | **15Hz** (上限 約19Hz) | 10/12/15Hz 欠落0%、20Hz 5%、25Hz 22.5% |
+| マルチホップ (ENHP/DSHP) | **両機で一致必須** | 不一致だと一切受信できない (現状は両機 DSHP) |
+
+`Config.h` にあった「64 - 4 = 60 バイト」は IM920 / IM920s の値で、
+IM920s**L** には当てはまらない。旧 `PlaneData` (28+4=32) はたまたま上限
+ちょうどだったので動いていただけ。**`GroundData` (42+4=46) は最初から
+切り詰められていて、`ap_*` は一度も届いていない**（`drone_s5.cpp` は
+`USE_GROUND_AUTO = false` なので今は影響なし）。
+
+32 バイトには全部載らないので、**A(高度+姿勢) と B(水平位置) を交互に
+送る**（各 7.5Hz）。地上局は届くたびに「もう片方は前回値」で 1 行を組み立てる。
+
+## 何が見えて、何が見えないか
+
+| | 見える | 見えない |
+|---|---|---|
+| 高度ホールド (0.1〜2Hz) | ○ 誤差・上昇速度追従・スロットル権限飽和 | |
+| 水平位置ホールド (0.1〜2Hz) | ○ 位置ドリフト・速度追従・リーン飽和 | |
+| 姿勢ループ (数十Hz) | | × 各フレーム 7.5Hz なので 3.7Hz より上は原理的に見えない |
+
+姿勢の発振を追うときは今まで通り USB + `flight_controller/scripts/logger.py`
+(500Hz) を使うこと。ここで扱うのは s5 で足した高度・位置ループの話。
+
+## 手順
+
+### 1. 焼く
+
+```bash
+# 機体側 (テレメトリ送信は drone_s5.cpp に組み込み済み)
+cd flight_controller
+pio run -e drone_s5 -t upload
+pio device monitor -e drone_s5
+
+# 地上局側
+cd ground_receiver
+pio run -e xiao_s5_log -t upload
+pio device monitor -e xiao_s5_log
+```
+
+| | ボード | ポート | ディレクトリ | env | ソース |
+|---|---|---|---|---|---|
+| 機体 | Teensy 4.0 | COM8 | `flight_controller` | `drone_s5` | `src/drone_s5.cpp` |
+| 地上局 | XIAO RP2040 | COM5 | `ground_receiver` | `xiao_s5_log` | `src/tools/s5_log.cpp` |
+
+`ground_receiver` の `default_envs` は `xiao_s5_log` にしてある（以前は
+`teensy40` = 旧 `main_pc.cpp` だった）。**VSCode のツールバーの Upload /
+Serial Monitor は「アクティブなプロジェクトの default env」を使う**ので、
+ここが違っていると押しても別のボードが焼かれる。旧地上局 `main_pc.cpp` を
+使うときだけ `-e teensy40` / `-e seeed_xiao_rp2040` を明示すること。
+
+`monitor_port` は COM番号ではなく USB の VID:PID (`hwgrep://2E8A:000A` =
+XIAO、`hwgrep://16C0:0483` = Teensy) で固定してある。Bluetooth の仮想COM
+(COM3/COM4) や相手のボードを掴む事故が起きず、挿し直しで COM番号が
+変わっても追従する。
+
+配線は `im920_passthrough.cpp` と同じ (XIAO TX=D6/GP0 → IM920 RXD、
+XIAO RX=D7/GP1 ← IM920 TXD)。**IM920 の電源は 3V3 から取ること。**
+5V ピンから取ると XIAO が USB 列挙に失敗して書き込めなくなる。
+
+### 2. 記録する ← CSV ファイルを作るのはこれ
+
+```bash
+cd ground_receiver
+python tools/s5_logger.py          # ポート自動検出、すぐ記録開始
+```
+
+`logs/s5_NNN_YYYYMMDD_HHMMSS.csv` と、同名の `.params.txt`
+(そのとき機体で効いていたゲイン) が残る。終了は Ctrl+C。
+
+> **★ シリアルモニタで `l` を押してもファイルはできません。**
+> 基板側の `l` は「画面に `DATA,...` を吐く」だけのスイッチです。
+> ファイルに落とすのは PC 側の `s5_logger.py` で、起動時に自動で `l` を
+> 送るのでキーを押す必要はありません。
+> モニタと `s5_logger.py` は同じ COM ポートを取り合うので、**モニタは閉じてから**
+> 実行してください。
+
+### 3. リンクがおかしいときの切り分け
+
+```bash
+pio device monitor -e xiao_s5_log
+```
+
+1秒ごとに状態が流れる (画面クリアはしない。モニタによって崩れるため)。
+
+* `IM920 生受信: 0 bytes` … 無線以前の問題。IM920 の TXD が D7(GP1) に来ているか、
+  電源が 3V3 か、ボーレート 19200 か。`im920_passthrough` の `PINS` で確認。
+* バイトは増えるのに `A=0 B=0` … 相手が違うか、マルチホップ設定 (ENHP/DSHP) が
+  食い違っているか、パケット定義がずれている。`d` キーで生の行をそのまま
+  表示できる。`badlen` が増えていれば `S5Telem.h` が機体側とずれている。
+  ホップ設定は両機で `RPRM` を読んで比べる (`im920_test` / `im920_passthrough`)。
+* `欠落率` が 30% 超 … `S5::TELEM_TX_HZ` を下げる (下の「帯域」参照)。
+
+キーは押せば必ず1行返事が出る (`# ...`)。何も出なければキー入力自体が
+基板に届いていない。
+
+飛ばし方は今まで通り: ANGLE で安定ホバリング → SW_HOVER を上げて POSHOLD。
+解析は POSHOLD かつ ARMED の区間だけを見る。
+
+### 4. 解析する
+
+```bash
+python tools/analyze_poshold.py            # 最新のログ
+python tools/analyze_poshold.py --plot     # グラフも
+```
+
+出るもの:
+
+1. **リンク品質** — 欠落率が 30% を超えていたら以下の数字は当てにしない
+2. **高度ホールド** — 誤差 RMS / 定常偏差 / 上昇速度の追従 / `ALT_THR_AUTH` 飽和率 / 振動周波数
+3. **水平位置ホールド** — 保持点からのずれ / 一定方向のドリフト (符号ミスか風か) / `FLOW_MAX_LEAN` 飽和率 / 振動周波数
+4. **センサ健全性** — 測距の失探時間、フローの `bad` カウンタ、ミキサー飽和
+
+振動周波数から、速い (>0.6〜0.8Hz) なら内側 = 速度ループ (`FLOW_VEL_KP` /
+`ALT_RATE_KP`)、遅いなら外側 = 位置ループ (`FLOW_POS_KP` / `ALT_POS_KP`) を
+0.7倍する、という向きまで出す。
+
+**調整の順番は 高度 → 水平。** 高度が上下しているとフローの見かけ速度が
+高さ変化で汚れ、水平の調整が成立しない。
+
+## 送っている中身
+
+`S5Telem.h` を参照。すべて **28 バイト + チェックサム 4 = 32 バイト**。
+float は入らないので int16 に量子化してある
+(位置 1cm / 速度 1mm/s / 角度 0.01deg / スロットル 1e-4 / ゲイン 0.001)。
+
+* `S5T::AltFrame` (A) — 姿勢 roll/pitch/yaw、対地高度 (補正後/生)、目標高度、
+  上昇速度 実測/目標、スロットル補正/出力、スロットルスティック
+* `S5T::PosFrame` (B) — フロー速度 実測/目標 (機体座標)、地面固定フレームの
+  位置と保持点、目標リーン角、フロー失探カウンタ
+* `S5T::ParamFrame` (P) — 5秒に1回。そのとき効いているゲイン一式。
+  シリアル `p` メニューで飛行中に変えられるので、CSV だけ見て
+  「どのゲインの結果か」が分かるようにするため。
+
+A/B 共通のヘッダに `flags` (armed / range_valid / alt_act / pos_hold /
+airborne / mixer sat …) と `mode`/`alt_state` が入っているので、どちらの
+フレームだけでも状態は分かる。
+
+機体時刻は 28 バイトに `uint32` の `millis()` が載らないので **10ms 単位の
+`uint16`** で送り、655 秒ごとの巻き戻しを地上局が展開している。
+
+### 帯域
+
+IM920sL の UART は 19200bps。TXDA は 1バイト = 16進2文字なので
+1パケットで `5 + 32*2 + 2 = 71` 文字 ≒ **37ms**。15Hz で占有率およそ 55%。
+
+* 送信は **非ブロッキング** (`S5T::Tx::service()` を毎ループ)。
+  `Serial3.print` を直接呼ぶと TX バッファ (40B) が溢れた時点でブロックし、
+  1000Hz の制御ループが数十 ms 止まる = それ自体が振動源になる。
+* 欠落が多いときは `drone_s5.cpp` の `S5::TELEM_TX_HZ` を 15 → 12 → 10 と下げる。
+  欠落は `seq` で数えているので、解析側にはちゃんと出る。
+
+## 構造体を変えるとき
+
+`S5Telem.h` は **機体側と地上局側の両方に同じ内容で置いてある**。
+
+```
+flight_controller/include/S5Telem.h
+ground_receiver/include/S5Telem.h
+```
+
+片方だけ直すとチェックサムは通るのに値だけ壊れる。必ず両方そろえ、
+`S5T::VERSION` を上げること。地上局は長さ / type / ver の不一致を
+`# 長さ不一致 ...` / `# 未知の type ...` / `# !! パケットバージョン不一致`
+として画面に出す。
+
+`S5T::Tx::send()` に `static_assert` を入れてあるので、**28 バイトを超える
+構造体を送ろうとするとコンパイルが止まる**。実行時に黙って壊れるより先に
+気づけるようにしてある。

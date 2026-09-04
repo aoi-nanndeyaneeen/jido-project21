@@ -87,6 +87,7 @@
 #include "sensor/OpticalFlow.h"  // PMW3901 (SPI)
 #include "sensor/Rangefinder.h"  // 測距 (QuadConfig の RANGE_BACKEND で ToF/SONAR 切替)
 #include "Telemetry.h"    // IM920SL (地上局との送受信)
+#include "S5Telem.h"     // s5 解析用テレメトリ (POSHOLD を地上局でCSV化)
 
 #include "quad/QuadConfig.h"
 #include "quad/QuadPID.h"
@@ -198,8 +199,21 @@ constexpr bool POSHOLD_ON_HOVER_SW = true;  // (歴史的フラグ。今は常�
 
 constexpr float I_ENABLE_THR = 0.15f;
 
-// 姿勢テレメトリの送信レート [Hz] (IM920SL の帯域を食い過ぎない範囲で)
-constexpr int TELEM_TX_HZ = 10;
+// s5 解析テレメトリの送信レート [Hz]。
+//  ★ 2026-09-04 実機実測: IM920sL が持続できるのは 15Hz まで。
+//       10Hz 欠落0% / 12Hz 0% / 15Hz 0% / 20Hz 5% / 25Hz 22.5% (≒19Hzで頭打ち)
+//     1パケット32B = "TXDA "+64桁+CRLF = 71文字 = 19200bps で 37ms。
+//     15Hz で UART 占有率 55%。
+//  ★ A(高度)/B(水平) を交互に送るので、各フレームは実質 7.5Hz。
+//     0.3〜2Hz の高度・位置ループを見るには足りる。
+//  地上局の欠落率が上がるようなら 12 -> 10 と下げる。
+constexpr int TELEM_TX_HZ = 15;
+
+// ゲイン一覧 (S5T::Param) を送る周期 [秒]。
+//  シリアル 'p' メニューで飛行中にゲインを変えられるので、CSV だけ見て
+//  「どのゲインの結果か」が分かるように定期的に混ぜる。
+//  この回だけ State を1つ落とすので、あまり短くしないこと。
+constexpr uint32_t TELEM_PARAM_MS = 5000;
 
 // 受信のポーリングレート [Hz]
 //  IM920SL は 19200 baud なので 200Hz でも 1回あたり最大12バイト程度。
@@ -232,6 +246,11 @@ motor motors[Q::MOTOR_COUNT];
 // IM920SL。drone.cpp と同じ Serial3 に合わせてある。
 // 配線が違う場合はここを変えること。
 FlightTelemetry telemetry(&Serial3);
+
+// s5 解析テレメトリの送信側。Serial3 は telemetry.begin() が開くので、
+// こちらは begin() を呼ばない (同じポートを二重に開かない)。
+// ★ 送信は必ず非ブロッキング。s5tx.service() を毎ループ回すこと。
+S5T::Tx s5tx(&Serial3);
 
 // PMW3901 オプティカルフロー。CS ピンは QuadConfig.h の FLOW_CS_PIN。
 // グローバル SPI (Teensy 4.0: SCK=13 MOSI=11 MISO=12) を使う。
@@ -428,6 +447,144 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
 }
 
 } // namespace Log
+
+// ============================================================
+//  § 4-3  s5 解析テレメトリ (IM920SL -> 地上局CSV)
+// ============================================================
+//  Log:: の 500Hz USBログは「PCを繋いだ地上テスト」でしか取れない。
+//  実飛行では USB が無いので、POSHOLD の解析に要る信号だけを 10Hz で
+//  無線に落とし、地上局 (ground_receiver の env:xiao_s5_log) が CSV に
+//  書く。列の意味と分解能は S5Telem.h を参照。
+//
+//  ★ 姿勢ループ (数十Hz) の解析には使えない。10Hz で見えるのは
+//    高度ホールド / 位置ホールドの 1〜2Hz の挙動まで。それがまさに
+//    今調整したいループなので、この帯域で足りる。
+// isArmed() の実体は § 6。フラグを詰めるためにここで前方宣言しておく。
+static bool isArmed();
+
+namespace S5Tel {
+
+uint8_t  seq           = 0;
+uint32_t last_param_ms = 0;
+bool     tx_drop_flag  = false;  // 直前の送信が捨てられたか (次パケットで通知)
+bool     send_pos_next = false;  // A/B 交互送信のトグル
+
+// A/B 共通のヘッダを埋める。
+inline void fillHeader(S5T::Header& h, uint8_t type) {
+    h.type = type;
+    h.seq  = seq++;
+
+    uint16_t f = 0;
+    if (isArmed())              f |= S5T::F_ARMED;
+    if (g_flow_ok)              f |= S5T::F_FLOW_OK;
+    if (g_range_ok)             f |= S5T::F_RANGE_OK;
+    if (g_range_valid)          f |= S5T::F_RANGE_VALID;
+    if (g_alt_hold_enable)      f |= S5T::F_ALT_EN;
+    if (althold.active())       f |= S5T::F_ALT_ACT;
+    if (poshold.holding())      f |= S5T::F_POS_HOLD;
+    if (althold.airborne())     f |= S5T::F_AIRBORNE;
+    if (g_dry_run)              f |= S5T::F_DRY_RUN;
+    if (g_mix.sat)              f |= S5T::F_SAT;
+    if (tx_drop_flag)         { f |= S5T::F_TX_DROP; tx_drop_flag = false; }
+    h.flags = f;
+
+    // 28バイトに uint32 の millis は載らないので 10ms 単位。
+    // 655.35秒で一周する。地上側 (s5_log.cpp) が展開する。
+    h.t_cs = (uint16_t)(millis() / 10u);
+}
+
+// A: 高度ループ + 姿勢
+inline void sendAlt(int mode, float thr_stick) {
+    S5T::AltFrame a{};
+    fillHeader(a.h, S5T::TYPE_ALT);
+    a.modes = S5T::packModes((uint8_t)mode, (uint8_t)althold.state());
+    a.thr   = S5T::qu8(thr_stick, 250.0f);
+
+    a.roll_cd  = S5T::q16(g_att.roll,  S5T::SC_CDEG);
+    a.pitch_cd = S5T::q16(g_att.pitch, S5T::SC_CDEG);
+    a.yaw_dd   = S5T::q16(g_yaw_est,   S5T::SC_DDEG);
+
+    a.range_h_mm      = S5T::q16(g_range_h_m,       S5T::SC_MM);
+    a.range_raw_mm    = S5T::q16(g_range_raw_m,     S5T::SC_MM);
+    a.alt_hold_mm     = S5T::q16(althold.holdM(),   S5T::SC_MM);
+    a.climb_mmps      = S5T::q16(g_climb_mps,       S5T::SC_MM);
+    a.alt_vz_tar_mmps = S5T::q16(althold.vzTar(),   S5T::SC_MM);
+    a.alt_thr_corr    = S5T::q16(althold.thrCorr(), S5T::SC_1E4);
+    a.alt_thr_out     = S5T::qu16(althold.active() ? althold.thrOut() : 0.0f,
+                                  S5T::SC_1E4);
+
+    if (!s5tx.send(a)) tx_drop_flag = true;
+}
+
+// B: 水平位置ループ
+inline void sendPos(int mode) {
+    S5T::PosFrame b{};
+    fillHeader(b.h, S5T::TYPE_POS);
+    b.modes = S5T::packModes((uint8_t)mode, (uint8_t)althold.state());
+    b.bad   = (uint8_t)constrain(poshold.badCount(), 0, 255);
+
+    b.vx_mmps      = S5T::q16(poshold.vxCtl(), S5T::SC_MM);
+    b.vy_mmps      = S5T::q16(poshold.vyCtl(), S5T::SC_MM);
+    b.vx_tar_mmps  = S5T::q16(poshold.vxTar(), S5T::SC_MM);
+    b.vy_tar_mmps  = S5T::q16(poshold.vyTar(), S5T::SC_MM);
+    b.pos_n_cm     = S5T::q16(poshold.posN(),  S5T::SC_CM);
+    b.pos_e_cm     = S5T::q16(poshold.posE(),  S5T::SC_CM);
+    b.hold_n_cm    = S5T::q16(poshold.holdN(), S5T::SC_CM);
+    b.hold_e_cm    = S5T::q16(poshold.holdE(), S5T::SC_CM);
+    b.lean_roll_cd  = S5T::q16(poshold.leanRoll(),  S5T::SC_CDEG);
+    b.lean_pitch_cd = S5T::q16(poshold.leanPitch(), S5T::SC_CDEG);
+
+    if (!s5tx.send(b)) tx_drop_flag = true;
+}
+
+// P: 今どのゲインで飛んでいるか。数秒に1回。
+inline void sendParam() {
+    S5T::ParamFrame p{};
+    p.type = S5T::TYPE_PARAM;
+    p.seq  = seq++;
+    p.ver  = S5T::VERSION;
+    p.cfg_flags = (uint8_t)((g_alt_hold_enable ? S5T::PF_ALT_HOLD_EN : 0) |
+                            (g_dry_run         ? S5T::PF_DRY_RUN     : 0) |
+                            ((Q::RANGE_BACKEND == Q::RangeBackend::Sonar_EZ)
+                                               ? S5T::PF_SONAR       : 0) |
+                            (Q::ALT_STICK_VZ_ENABLE ? S5T::PF_STICK_VZ : 0));
+
+    // 実際に効いている値を読む (シリアル 'p' で飛行中に変えられるため)
+    const Quad::Pid& vp = poshold.velPid();
+    p.flow_vel_kp = S5T::q16(vp.kp(), S5T::SC_GAIN);
+    p.flow_vel_ki = S5T::q16(vp.ki(), S5T::SC_GAIN);
+    p.flow_vel_kd = S5T::q16(vp.kd(), S5T::SC_GAIN);
+    p.flow_pos_kp = S5T::q16(poshold.posKp(), S5T::SC_GAIN);
+
+    const Quad::Pid& ap = althold.ratePid();
+    p.alt_pos_kp  = S5T::q16(althold.posKp(), S5T::SC_GAIN);
+    p.alt_rate_kp = S5T::q16(ap.kp(), S5T::SC_GAIN);
+    p.alt_rate_ki = S5T::q16(ap.ki(), S5T::SC_GAIN);
+    p.alt_rate_kd = S5T::q16(ap.kd(), S5T::SC_GAIN);
+
+    p.alt_hover_thr = S5T::q16(Q::ALT_HOVER_THR, S5T::SC_GAIN);
+    p.alt_target_m  = S5T::q16(Q::ALT_TARGET_M,  S5T::SC_GAIN);
+    p.flow_max_lean = S5T::q16(Q::FLOW_MAX_LEAN, S5T::SC_GAIN);
+    p.alt_thr_auth  = S5T::q16(Q::ALT_THR_AUTH,  S5T::SC_GAIN);
+
+    if (!s5tx.send(p)) tx_drop_flag = true;
+}
+
+// telem_tick から呼ぶ。1回につき1パケットしか送れない (IM920sL は 32B 制限)。
+//  A と B を交互に出し、数秒に1回だけ P を割り込ませる。
+inline void tick(int mode, float thr_stick) {
+    const uint32_t now = millis();
+    if (now - last_param_ms >= S5::TELEM_PARAM_MS) {
+        last_param_ms = now;
+        sendParam();
+        return;
+    }
+    send_pos_next = !send_pos_next;
+    if (send_pos_next) sendPos(mode);
+    else               sendAlt(mode, thr_stick);
+}
+
+} // namespace S5Tel
 
 // ============================================================
 //  § 5  周期実行のヘルパ
@@ -1008,6 +1165,11 @@ static void printStatus(uint32_t dt_us) {
         Serial.printf("IM920 link=%s   AP: roll=%+.3f pitch=%+.3f yaw=%+.3f (thr=%+.3f 未使用)\n",
                       telemetry.groundLinkFresh() ? "FRESH" : "STALE",
                       g.ap_roll, g.ap_pitch, g.ap_yaw, g.ap_throttle);
+        // s5 解析テレメトリの送信状況。drop が増え続けるなら
+        // S5::TELEM_TX_HZ が UART の帯域(19200bps) に対して速すぎる。
+        Serial.printf("TELEM tx=%lu drop=%lu %s\n",
+                      (unsigned long)s5tx.sent(), (unsigned long)s5tx.dropped(),
+                      s5tx.busy() ? "(sending)" : "");
     }
 
     if (g_mode == S5::MODE_ANGLE || g_mode == S5::MODE_AUTO ||
@@ -1279,12 +1441,16 @@ void loop() {
     Log::sample(main_tick.dt_us, (int)g_mode, isArmed(),
                 S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f);
 
-    // 姿勢テレメトリの送信 (10Hz)
+    // s5 解析テレメトリの送信 (TELEM_TX_HZ = 10Hz)。地上局が CSV に落とす。
     //  yaw はヘディングホールドの積分値を送る。Madgwick の6軸ヨーは
     //  絶対方位として意味を持たないため。
+    //  ★ ここでは送信バッファに積むだけ。実際の UART 書き込みは下の
+    //    s5tx.service() が空きぶんずつ進める (ブロックさせない)。
     if (S5::USE_IM920 && telem_tick.ready()) {
-        telemetry.sendAttitudeOnly(g_att.roll, g_att.pitch, g_yaw_est);
+        S5Tel::tick((int)g_mode, S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f);
     }
+    // 送りかけのテレメトリを毎ループ吐き出す (非ブロッキング)
+    if (S5::USE_IM920) s5tx.service();
 
     // ログ中は画面表示を止める。同じUSBシリアルを奪い合うと
     // ログが落ちるうえ、logger.py 側のパースも乱れる。
