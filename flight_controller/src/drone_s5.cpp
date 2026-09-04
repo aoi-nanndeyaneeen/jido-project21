@@ -492,6 +492,276 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
 } // namespace Log
 
 // ============================================================
+//  § 4-4  RamLog  -  スロットル投入時だけ RAM に 500Hz で記録し、
+//                    着陸後に USB へまとめて吐き出す
+// ============================================================
+//  Log:: (直上) は「USB を挿しっぱなしのベンチ試験」専用だった。実飛行は
+//  USB を挿せないので、s5 解析テレメトリ (IM920SL, 7.5〜15Hz) しか手段が
+//  無く、姿勢ループの発振や離陸直後の転倒は追えなかった。
+//
+//  この機体の飛行は毎回 5 秒に満たない。それなら 500Hz のフル解像度の
+//  ログを「本体の RAM に溜めておいて、着陸後に USB を挿してから吐き出す」
+//  ほうが無線よりずっと濃い情報が手に入る。Teensy 4.0 の RAM (1024KB) の
+//  うち、これは DMAMEM 領域 (OCRAM2, 512KB) に確保するので、通常の変数や
+//  スタックとは競合しない。
+//
+//  ★ 記録レコードは Log::HEADER と同じ 57 列の値を持つが、RAM を食わない
+//    よう int16/uint8 に量子化して積む (S5Telem.h の q16/qu8/qu16 を流用)。
+//    ダンプ時に Log::sample() と "同じ printf フォーマット" で書き戻すので、
+//    scripts/logger.py と scripts/analyze_log.py は無改造でそのまま使える。
+//
+//  ★ RAM は揮発性。着陸後、バッテリーを抜く前に USB を挿して 'v' で
+//    ダンプすること。ここで作った内容は電源を切ると消える。
+//
+//  運用:
+//    thr が RAMLOG_THR_GATE (既定 0.20) を超えている間、アーム中だけ記録。
+//    リングバッファ (古い方から上書き) なので、記録が長引いても直近
+//    RAMLOG_SECONDS 秒ぶんが必ず残る。ディスアームで記録を止めて凍結する
+//    (次にスロットルを上げた瞬間、また 0 から録り直す)。
+//    'v' キーで USB へダンプ (HEADER/LOG_START/DATA.../LOG_STOP)。
+// ------------------------------------------------------------
+namespace RamLog {
+
+// スロットルがこれを超えている間だけ記録する。地面で粘っている待機時間や
+// 着陸後の惰性回転を録っても仕方が無いので、飛行に関係する区間だけに絞る。
+constexpr float    RAMLOG_THR_GATE = 0.20f;
+// 何秒ぶん持つか。500Hz x 8秒 x 約100B/行 ≒ 400KB (OCRAM2 512KBに収まる)。
+constexpr uint32_t RAMLOG_SECONDS  = 8;
+constexpr uint32_t RAMLOG_HZ       = 500;
+constexpr uint32_t CAPACITY        = RAMLOG_SECONDS * RAMLOG_HZ;   // 4000
+constexpr int       DIV            = S5::MAIN_HZ / RAMLOG_HZ;
+
+// flags のビット (S5Telem.h の Flag と揃えてある。無線とは無関係、内部専用)
+enum RFlag : uint16_t {
+    RF_ARMED    = 1u << 0,
+    RF_FLOW_OK  = 1u << 1,
+    RF_RANGE_OK = 1u << 2,
+    RF_ALT_EN   = 1u << 3,
+    RF_ALT_ACT  = 1u << 4,
+    RF_HOLDING  = 1u << 5,   // poshold.holding()
+};
+
+struct __attribute__((packed)) Rec {
+    uint32_t t_ms;
+    uint16_t dt_us;
+    uint16_t flags;
+    uint8_t  mode;
+    uint8_t  mixsat;
+    uint8_t  thr;                                  // /250
+    int8_t   roll_stick, pitch_stick, yaw_stick;    // x100
+    int16_t  roll_ang, pitch_ang, yaw_est;          // cdeg
+    int16_t  roll_rate, pitch_rate, yaw_rate;       // ddeg/s
+    int16_t  roll_cmd, pitch_cmd, yaw_cmd;          // 1e4
+    uint8_t  m1, m2, m3, m4;                        // /250
+    int16_t  span_limit;                            // 1e3
+    int16_t  roll_ratetar, pitch_ratetar;           // ddeg/s
+    int16_t  roll_angtar, pitch_angtar;             // cdeg
+    int16_t  flow_raw_x, flow_raw_y, flow_dx, flow_dy;  // dpx (x10)
+    int16_t  flow_vx, flow_vy;                      // mm/s
+    int16_t  flow_h;                                // mm
+    float    flow_accx, flow_accy;                  // m (蓄積値なので float のまま)
+    int16_t  fh_vxc, fh_vyc, fh_vxt, fh_vyt;        // mm/s
+    int16_t  fh_leanr, fh_leanp;                    // cdeg
+    int16_t  fh_posn, fh_pose, fh_holdn, fh_holde;  // mm
+    int16_t  range_raw, range_h;                    // mm
+    int16_t  climb;                                 // mm/s
+    int16_t  alt_holdm;                             // mm
+    int16_t  alt_vzt;                               // mm/s
+    int16_t  alt_corr;                              // 1e4
+    uint8_t  alt_thr_out;                           // /250
+};
+
+// OCRAM2 (DMAMEM) に置く。RAM1 (スタック/大半の変数) と競合しない。
+DMAMEM Rec buf[CAPACITY];
+
+uint32_t head     = 0;      // 次に書く位置
+uint32_t count    = 0;      // 埋まっている行数 (CAPACITY で頭打ち)
+bool     wrapped  = false;  // CAPACITY を超えて上書きが始まったか
+bool     recording = false;
+int      div_cnt  = 0;
+
+inline void resetBuffer() {
+    head = 0; count = 0; wrapped = false; div_cnt = 0;
+}
+
+// 呼び出しは Log::sample() と同じ場所・同じ引数。
+inline void update(uint32_t dt_us, int mode, bool armed, float thr) {
+    const bool want = armed && (thr > RAMLOG_THR_GATE);
+
+    if (want && !recording) {
+        // 新しい記録セッションの開始。前回ぶんは上書きされて消える。
+        resetBuffer();
+        recording = true;
+    } else if (!want && recording) {
+        // スロットルが下がった/ディスアームされた → 記録を止めて凍結する。
+        // (再度上げたら resetBuffer() から録り直す。ここではバッファは
+        //  そのまま残すので、直後に 'v' でダンプできる)
+        recording = false;
+    }
+    if (!recording) return;
+
+    if (++div_cnt < DIV) return;
+    div_cnt = 0;
+
+    Rec& r = buf[head];
+    r.t_ms = millis();
+    r.dt_us = (uint16_t)constrain(dt_us, 0u, 65535u);
+
+    uint16_t f = 0;
+    if (armed)               f |= RF_ARMED;
+    if (g_flow_ok)           f |= RF_FLOW_OK;
+    if (g_range_ok)          f |= RF_RANGE_OK;
+    if (g_alt_hold_enable)   f |= RF_ALT_EN;
+    if (althold.active())    f |= RF_ALT_ACT;
+    if (poshold.holding())   f |= RF_HOLDING;
+    r.flags = f;
+
+    r.mode   = (uint8_t)mode;
+    r.mixsat = g_mix.sat;
+    r.thr    = S5T::qu8(thr, 250.0f);
+
+    r.roll_stick  = (int8_t)constrain(lroundf(roll_axis.stick  * 100.0f), -127L, 127L);
+    r.pitch_stick = (int8_t)constrain(lroundf(pitch_axis.stick * 100.0f), -127L, 127L);
+    r.yaw_stick   = (int8_t)constrain(lroundf(yaw_axis.stick   * 100.0f), -127L, 127L);
+
+    r.roll_ang  = S5T::q16(roll_axis.ang_meas,  S5T::SC_CDEG);
+    r.pitch_ang = S5T::q16(pitch_axis.ang_meas, S5T::SC_CDEG);
+    r.yaw_est   = S5T::q16(g_yaw_est,           S5T::SC_CDEG);
+
+    r.roll_rate  = S5T::q16(roll_axis.rate_meas,  S5T::SC_DDEG);
+    r.pitch_rate = S5T::q16(pitch_axis.rate_meas, S5T::SC_DDEG);
+    r.yaw_rate   = S5T::q16(yaw_axis.rate_meas,   S5T::SC_DDEG);
+
+    r.roll_cmd = S5T::q16(roll_axis.cmd,  S5T::SC_1E4);
+    r.pitch_cmd = S5T::q16(pitch_axis.cmd, S5T::SC_1E4);
+    r.yaw_cmd   = S5T::q16(yaw_axis.cmd,   S5T::SC_1E4);
+
+    r.m1 = S5T::qu8(g_out[0], 250.0f);
+    r.m2 = S5T::qu8(g_out[1], 250.0f);
+    r.m3 = S5T::qu8(g_out[2], 250.0f);
+    r.m4 = S5T::qu8(g_out[3], 250.0f);
+
+    r.span_limit = S5T::q16(g_mix.span_limit, 1000.0f);
+
+    r.roll_ratetar  = S5T::q16(roll_axis.rate_tar,  S5T::SC_DDEG);
+    r.pitch_ratetar = S5T::q16(pitch_axis.rate_tar, S5T::SC_DDEG);
+    r.roll_angtar   = S5T::q16(roll_axis.ang_tar,   S5T::SC_CDEG);
+    r.pitch_angtar  = S5T::q16(pitch_axis.ang_tar,  S5T::SC_CDEG);
+
+    r.flow_raw_x = S5T::q16(g_flow_raw_x, 10.0f);
+    r.flow_raw_y = S5T::q16(g_flow_raw_y, 10.0f);
+    r.flow_dx    = S5T::q16(g_flow_dx,    10.0f);
+    r.flow_dy    = S5T::q16(g_flow_dy,    10.0f);
+    r.flow_vx    = S5T::q16(g_flow_vx, S5T::SC_MM);
+    r.flow_vy    = S5T::q16(g_flow_vy, S5T::SC_MM);
+    r.flow_h     = S5T::q16(flow.height(), S5T::SC_MM);
+    r.flow_accx  = (float)g_flow_acc_m_x;
+    r.flow_accy  = (float)g_flow_acc_m_y;
+
+    r.fh_vxc = S5T::q16(poshold.vxCtl(), S5T::SC_MM);
+    r.fh_vyc = S5T::q16(poshold.vyCtl(), S5T::SC_MM);
+    r.fh_vxt = S5T::q16(poshold.vxTar(), S5T::SC_MM);
+    r.fh_vyt = S5T::q16(poshold.vyTar(), S5T::SC_MM);
+    r.fh_leanr = S5T::q16(poshold.leanRoll(),  S5T::SC_CDEG);
+    r.fh_leanp = S5T::q16(poshold.leanPitch(), S5T::SC_CDEG);
+    r.fh_posn  = S5T::q16(poshold.posN(),  S5T::SC_MM);
+    r.fh_pose  = S5T::q16(poshold.posE(),  S5T::SC_MM);
+    r.fh_holdn = S5T::q16(poshold.holdN(), S5T::SC_MM);
+    r.fh_holde = S5T::q16(poshold.holdE(), S5T::SC_MM);
+
+    r.range_raw = S5T::q16(g_range_raw_m, S5T::SC_MM);
+    r.range_h   = S5T::q16(g_range_h_m,   S5T::SC_MM);
+    r.climb     = S5T::q16(g_climb_mps,   S5T::SC_MM);
+
+    r.alt_holdm     = S5T::q16(althold.holdM(),  S5T::SC_MM);
+    r.alt_vzt       = S5T::q16(althold.vzTar(),  S5T::SC_MM);
+    r.alt_corr      = S5T::q16(althold.thrCorr(), S5T::SC_1E4);
+    r.alt_thr_out   = S5T::qu8(althold.thrOut(), 250.0f);
+
+    head = (head + 1) % CAPACITY;
+    if (count < CAPACITY) ++count;
+    else wrapped = true;
+}
+
+inline void status() {
+    const float secs = (float)count / (float)RAMLOG_HZ;
+    Serial.printf("RamLog: %s  %lu 行 (%.1f 秒)%s  容量 %lu 行 (%lu 秒)\n",
+                  recording ? "記録中" : (count ? "停止(ダンプ待ち)" : "空"),
+                  (unsigned long)count, secs, wrapped ? " [満杯/上書き済]" : "",
+                  (unsigned long)CAPACITY, (unsigned long)RAMLOG_SECONDS);
+}
+
+// ダンプ中は制御ループが数十ms〜数百ms止まる。着陸後にしか呼ばないこと
+// (handleSerial は main_tick の後に呼ばれているので、ここでブロックしても
+//  無線テレメトリと違って「今まさに飛んでいる」状態では想定していない)。
+inline void dump() {
+    if (recording) {
+        Serial.println("!! まだ記録中です (スロットルを下げるかディスアームしてから 'v')");
+        return;
+    }
+    if (count == 0) {
+        Serial.println("RamLog: 記録がありません (スロットル > "
+                       "RAMLOG_THR_GATE でアームして飛ばすと記録されます)");
+        return;
+    }
+
+    status();
+    Serial.println();
+    Serial.print("HEADER,"); Serial.println(Log::HEADER);
+    Serial.println("LOG_START");
+
+    const uint32_t start = wrapped ? head : 0;   // 最古の位置
+    for (uint32_t i = 0; i < count; ++i) {
+        const Rec& r = buf[(start + i) % CAPACITY];
+
+        const float thrBase = (r.flags & RF_ALT_ACT) ? Q::ALT_HOVER_THR : 0.0f;
+
+        Serial.printf(
+            "DATA,%lu,%lu,%d,%d,%.3f,"
+            "%.3f,%.3f,%.3f,"
+            "%.2f,%.2f,%.2f,"
+            "%.2f,%.2f,%.2f,"
+            "%.4f,%.4f,%.4f,"
+            "%.3f,%.3f,%.3f,%.3f,%.3f,%u,"
+            "%.1f,%.1f,%.1f,%.1f,"
+            "%d,%.1f,%.1f,%.1f,%.1f,%.3f,%.3f,%.2f,"
+            "%.4f,%.4f,"
+            "%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,"
+            "%.3f,%.3f,%d,"
+            "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f\n",
+            (unsigned long)r.t_ms, (unsigned long)r.dt_us, (int)r.mode,
+            (r.flags & RF_ARMED) ? 1 : 0, r.thr / 250.0f,
+            r.roll_stick / 100.0f, r.pitch_stick / 100.0f, r.yaw_stick / 100.0f,
+            r.roll_ang / S5T::SC_CDEG, r.pitch_ang / S5T::SC_CDEG, r.yaw_est / S5T::SC_CDEG,
+            r.roll_rate / S5T::SC_DDEG, r.pitch_rate / S5T::SC_DDEG, r.yaw_rate / S5T::SC_DDEG,
+            r.roll_cmd / S5T::SC_1E4, r.pitch_cmd / S5T::SC_1E4, r.yaw_cmd / S5T::SC_1E4,
+            r.m1 / 250.0f, r.m2 / 250.0f, r.m3 / 250.0f, r.m4 / 250.0f,
+            r.span_limit / 1000.0f, (unsigned)r.mixsat,
+            r.roll_ratetar / S5T::SC_DDEG, r.pitch_ratetar / S5T::SC_DDEG,
+            r.roll_angtar / S5T::SC_CDEG, r.pitch_angtar / S5T::SC_CDEG,
+            (r.flags & RF_FLOW_OK) ? 1 : 0,
+            r.flow_raw_x / 10.0f, r.flow_raw_y / 10.0f, r.flow_dx / 10.0f, r.flow_dy / 10.0f,
+            r.flow_vx / S5T::SC_MM, r.flow_vy / S5T::SC_MM, r.flow_h / S5T::SC_MM,
+            (double)r.flow_accx, (double)r.flow_accy,
+            r.fh_vxc / S5T::SC_MM, r.fh_vyc / S5T::SC_MM, r.fh_vxt / S5T::SC_MM, r.fh_vyt / S5T::SC_MM,
+            r.fh_leanr / S5T::SC_CDEG, r.fh_leanp / S5T::SC_CDEG,
+            r.fh_posn / S5T::SC_MM, r.fh_pose / S5T::SC_MM,
+            r.fh_holdn / S5T::SC_MM, r.fh_holde / S5T::SC_MM,
+            (r.flags & RF_HOLDING) ? 1 : 0,
+            (r.flags & RF_RANGE_OK) ? 1 : 0, r.range_raw / S5T::SC_MM, r.range_h / S5T::SC_MM,
+            r.climb / S5T::SC_MM,
+            (r.flags & RF_ALT_EN) ? 1 : 0, (r.flags & RF_ALT_ACT) ? 1 : 0,
+            r.alt_holdm / S5T::SC_MM, r.alt_vzt / S5T::SC_MM, thrBase,
+            r.alt_corr / S5T::SC_1E4, r.alt_thr_out / 250.0f);
+    }
+
+    Serial.println("LOG_STOP");
+    Serial.printf("INFO: RamLog %lu 行をダンプしました\n", (unsigned long)count);
+}
+
+} // namespace RamLog
+
+// ============================================================
 //  § 4-3  s5 解析テレメトリ (IM920SL -> 地上局CSV)
 // ============================================================
 //  Log:: の 500Hz USBログは「PCを繋いだ地上テスト」でしか取れない。
@@ -1271,8 +1541,18 @@ static void handleSerial() {
             Serial.println("PID reset");
             break;
         case 'l':
-            // 500Hz ログの開始/停止。scripts/logger.py と対で使う。
+            // 500Hz ログの開始/停止 (USB 直結時のみ)。scripts/logger.py と対で使う。
             Log::toggle();
+            break;
+        case 'v':
+            // RAM ログ (実飛行中に自動記録した分) を USB へダンプする。
+            // 記録中 (スロットルがまだ RAMLOG_THR_GATE を超えている) なら
+            // 拒否メッセージを出すだけで安全に呼べる。
+            RamLog::dump();
+            break;
+        case 'y':
+            // RamLog の状態だけ見る (何行溜まっているか)。ダンプはしない。
+            RamLog::status();
             break;
         case 'g': {
             // s5c: 高度ホールド (スロットルPID) の ON/OFF トグル。
@@ -1454,7 +1734,7 @@ static void printStatus(uint32_t dt_us) {
     }
 
     Serial.println("\n[p]ゲイン [k]IMUキャリブ(EEPROM保存) [x]キャリブ消去 [r]PIDリセット "
-                   "[l]ログ [z]フロー積算ゼロ "
+                   "[l]ログ(USB直結時) [v]RAMログdump [y]RAMログ状態 [z]フロー積算ゼロ "
                    "[h]フロー高度(手動) [g]高度ホールド切替 [i]I2Cスキャン [m]ドライラン切替");
 }
 
@@ -1612,6 +1892,12 @@ void loop() {
     // 500Hz ログ (制御の直後。この周期の指令と出力が揃った状態で落とす)
     Log::sample(main_tick.dt_us, (int)g_mode, isArmed(),
                 S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f);
+
+    // RAM ログ: スロットル投入中だけ 500Hz で本体 RAM に記録。着陸後に
+    // 'v' で USB へダンプする (実飛行では USB が無いので、この経路だけが
+    // 姿勢ループのフル解像度を残せる)。
+    RamLog::update(main_tick.dt_us, (int)g_mode, isArmed(),
+                   S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f);
 
     // s5 解析テレメトリの送信 (TELEM_TX_HZ = 10Hz)。地上局が CSV に落とす。
     //  yaw はヘディングホールドの積分値を送る。Madgwick の6軸ヨーは
