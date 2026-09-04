@@ -221,7 +221,7 @@ constexpr float FLOW_PX_PER_RAD = 450.0f;   // ← 仮値。ベンチ実測に�
 //  pitch(Y軸まわり)レート → flow_x に乗る / roll(X軸まわり)レート → flow_y に乗る
 constexpr bool  FLOW_DEROTATE     = true;
 constexpr float FLOW_DEROT_SIGN_X = -1.0f;
-constexpr float FLOW_DEROT_SIGN_Y = -1.0f;
+constexpr float FLOW_DEROT_SIGN_Y = +1.0f;
 
 // IMU (≒回転中心) から フローレンズ までのオフセット [m]  (機体座標 FRD: 前+ / 右+)
 //  水平オフセットがあると、機体の回転がテコで並進フローに化ける
@@ -303,6 +303,12 @@ constexpr float FLOW_VEL_SANE = 3.0f;
 // このスロットル以上で「浮いている」とみなしフロー制御を有効化
 constexpr float FLOW_ENABLE_THR = 0.15f;
 
+// 離陸するまで水平ホールドの積分 (位置積分・速度I項) を止めるか。
+//  true  = AltHold が離陸を検知するまで PosHold は出力 0 のまま待つ。
+//          地上でリーン角が溜まって離陸直後に飛び出すのを防ぐ。
+//  false = 従来動作 (スロットルが FLOW_ENABLE_THR を超えた時点で効き始める)。
+constexpr bool  FLOW_REQUIRE_AIRBORNE = true;
+
 // ============================================================
 //  § 7-3  距離センサ   ※ Stage 5 s5c で使用
 // ============================================================
@@ -370,7 +376,9 @@ constexpr float RANGE_H_ALPHA  = 0.30f;
 constexpr float RANGE_VZ_ALPHA = 0.20f;
 
 // 外れ値がこの時間続いたら「失探」= valid() を false に落とす [ms]
-//  失探中は OpticalFlow は FLOW_ASSUMED_HEIGHT_M に自動フォールバック。
+//  失探中も OpticalFlow は「最後に有効だった高度」を持ち続ける
+//  (setHeight() が範囲外を弾くだけで、FLOW_ASSUMED_HEIGHT_M へ戻す処理は無い)。
+//  FLOW_ASSUMED_HEIGHT_M は begin() 時の初期値としてしか使われない。
 constexpr uint32_t RANGE_FAULT_MS = 1000;
 
 // ============================================================
@@ -418,17 +426,40 @@ constexpr float ALT_THR_AUTH = 0.30f;
 
 // ホバースロットルの基準 [割合]。★実飛行前に ANGLE ホバリングで実測して入れる。
 //  0 のままだと高度ホールドは engage しない (SW_AUTO を上げても効かない)。
-constexpr float ALT_HOVER_THR = 0.0f;
+//  ★ POSHOLD 中はこの値だけが基準スロットルになる。プロポのスロットル位置は
+//    一切参照しない (以前は未設定時に突入時のスティック値を掴んでいたため、
+//    スティックが 100% だと base=1.00 になって飽和していた)。
+constexpr float ALT_HOVER_THR = 0.60f;
 
 // 保持したい対地高度 [m]。0 = engage した瞬間の実測高度をそのまま目標にする。
 constexpr float ALT_TARGET_M  = 0.5f;
 
+// POSHOLD 中にスロットルスティックを「上昇/下降指令」として使うか。
+//  false = 完全自動。スロットルは ALT_ENABLE_THR を超えているかの
+//          enable ゲートにしか使わず、出力は測距だけで決まる。
+//  true  = 従来動作 (基準からの偏差で上昇速度を指令できる)。
+constexpr bool  ALT_STICK_VZ_ENABLE = false;
+
 // スロットルスティックを基準 (ALT_HOVER_THR) からこれだけ動かしたら「上昇/下降指令」 [割合]
+//  (ALT_STICK_VZ_ENABLE = true のときのみ有効)
 constexpr float ALT_STICK_DEAD = 0.08f;
 // スティック偏差 1.0 あたりの上昇速度指令 [m/s]
 constexpr float ALT_STICK_VZ   = 0.8f;
 
 // このスロットル以上で高度ホールドを有効化 (地上での暴走防止)
 constexpr float ALT_ENABLE_THR = 0.15f;
+
+// ---- 離陸検知 (地上での積分ワインドアップ対策) ----------------
+//  地上に置いたままだと フロー速度は常に 0、高度も上がらないので、
+//  PosHold の速度I項も AltHold のI項も「効かない誤差」を溜め続ける。
+//  離陸した瞬間にその溜まった分が一気に出て飛び出すため、
+//  「浮いた」と判定できるまで PosHold の積分を止める。
+//
+//  engage 時の高度から これだけ上がったら離陸とみなす [m]
+constexpr float ALT_AIRBORNE_RISE_M      = 0.10f;
+//  engage 時の高度が これを超えていたら「空中で引き継いだ」とみなして
+//  最初から離陸済み扱いにする [m] (ANGLE ホバリングからの移行用)。
+//  地面に置いたときの測距値より確実に大きい値にすること。
+constexpr float ALT_AIRBORNE_GROUND_MAX_M = 0.40f;
 
 } // namespace Quad

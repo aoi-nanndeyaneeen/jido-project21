@@ -92,7 +92,8 @@
 #include "quad/QuadPID.h"
 #include "quad/Mixer.h"
 #include "quad/BodyFrame.h"
-#include "quad/PosHold.h"   // s5b/s5d: フロー水平ホールド (地面固定フレーム)
+#include "quad/PosHold.h"
+#include "quad/AltHold.h"   // s5b/s5d: フロー水平ホールド (地面固定フレーム)
 
 namespace Q = Quad;
 
@@ -244,8 +245,9 @@ Rangefinder rangefinder;
 //  すべて内包する (quad/PosHold.h)。出力は leanRoll()/leanPitch() [deg]。
 Q::PositionHold poshold;
 
-// s5c: 高度ホールドの内側ループ (目標上昇速度[m/s] → スロットル補正[割合])。
-Q::Pid alt_rate_pid;
+// s5c: 高度ホールド。位置ループ・上昇速度PID・engage 状態遷移をすべて内包する
+//  (quad/AltHold.h)。出力は active() / throttle()。
+Q::AltitudeHold althold;
 
 Q::Axis roll_axis, pitch_axis, yaw_axis;
 
@@ -307,16 +309,9 @@ float g_range_h_m   = 0.0f;    // 鉛直対地高度 [m] (flow.setHeight() に�
 float g_climb_mps   = 0.0f;    // 上昇速度 [m/s] (上 +)
 
 // ---- s5c: 高度ホールド ----
+//  状態は Q::AltitudeHold (althold) が保持する。参照は althold.xxx()。
 bool  g_alt_hold_enable = S5::USE_ALT_HOLD;  // シリアル 'g' でトグル
-bool  g_alt_active   = false;   // いま実際にスロットルを握っているか
-float g_alt_hold_m   = 0.0f;    // 保持したい高度 [m]
-float g_alt_thr_base = 0.0f;    // POSHOLD 突入時に掴んだホバースロットル [割合]
-float g_alt_vz_tar   = 0.0f;    // 目標上昇速度 [m/s]
-float g_alt_thr_corr = 0.0f;    // PID が出したスロットル補正 [割合]
-float g_alt_thr_out  = 0.0f;    // 最終スロットル指令 [割合] (active 時のみ使用)
-
-// シリアルから調整するゲイン (QuadConfig.h の初期値から起動時にコピー)
-float g_alt_pos_kp = Q::ALT_POS_KP;   // 高度誤差[m] → 目標上昇速度[m/s]
+bool  g_range_fresh     = false;             // 今回 新しい測距が入ったか
 
 // ドライラン: true の間は ESC へ 0 しか送らない (g_out は計算・記録する)
 bool  g_dry_run = S5::DRY_RUN;
@@ -426,8 +421,9 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
         poshold.leanRoll(), poshold.leanPitch(), poshold.posN(), poshold.posE(),
         poshold.holdN(), poshold.holdE(), poshold.holding() ? 1 : 0,
         g_range_ok ? 1 : 0, g_range_raw_m, g_range_h_m, g_climb_mps,
-        g_alt_hold_enable ? 1 : 0, g_alt_active ? 1 : 0,
-        g_alt_hold_m, g_alt_vz_tar, g_alt_thr_base, g_alt_thr_corr, g_alt_thr_out);
+        g_alt_hold_enable ? 1 : 0, althold.active() ? 1 : 0,
+        althold.holdM(), althold.vzTar(), althold.thrBase(),
+        althold.thrCorr(), althold.thrOut());
     written++;
 }
 
@@ -441,6 +437,10 @@ struct Ticker {
     uint32_t prev_us = 0;
     uint32_t dt_us   = 0;
     explicit Ticker(uint32_t hz) : period_us(1000000UL / hz) {}
+    // setup() の最後に呼ぶ。これが無いと prev_us=0 のまま起動するので、
+    // 初回 ready() の dt_us が「起動からの経過時間」(数秒) になり、
+    // その dt で PID や積分が一気に進んでしまう。
+    void prime() { prev_us = micros(); }
     bool ready() {
         const uint32_t now = micros();
         if (now - prev_us < period_us) return false;
@@ -502,13 +502,7 @@ static void resetControllers() {
     poshold.reset();
 
     // s5c: 高度ホールドも「今ここ」を基準に取り直す。
-    alt_rate_pid.reset();
-    g_alt_active   = false;
-    g_alt_hold_m   = g_range_valid ? g_range_h_m : Q::FLOW_ASSUMED_HEIGHT_M;
-    g_alt_thr_base = 0.0f;
-    g_alt_vz_tar   = 0.0f;
-    g_alt_thr_corr = 0.0f;
-    g_alt_thr_out  = 0.0f;
+    althold.reset(g_range_valid ? g_range_h_m : 0.0f);
 }
 
 static const char* modeName(S5::Mode m) {
@@ -547,14 +541,29 @@ static S5::Mode selectMode() {
 //   出力は poshold.leanRoll() / leanPitch() [deg]。updateControl() が POSHOLD の
 //   ときに角度ループの目標角として使う。スロットルは触らない (高度は § 6-3)。
 //
-//   ★ active の条件に注意: アーム済 && POSHOLD && スロットル > FLOW_ENABLE_THR。
+//   ★ active の条件: アーム済 && POSHOLD && スロットル > FLOW_ENABLE_THR
+//                    && 離陸検知済 (FLOW_REQUIRE_AIRBORNE)。
 //     地上でスロットルを下げたままだとフロー制御は一切出力しない (安全)。
 //     ドライラン('m')で符号を確認するときも、スティックを上げる必要がある。
 // ------------------------------------------------------------
 static void updateFlowHold(float dt_s) {
     const float thr = S5::USE_SBUS ? constrain(sbus.des[Ch::THR], 0.0f, 1.0f) : 0.0f;
+
+    // ★ 離陸するまでは効かせない (FLOW_REQUIRE_AIRBORNE)。
+    //   地上ではフロー速度が常に 0 なので、位置積分がノイズを溜め、
+    //   速度I項が FLOW_VEL_I_LIMIT まで巻き上がる。実際、地上のドライランで
+    //   目標リーン角が -3〜-5deg まで育つのを確認している。そのまま浮くと
+    //   離陸直後に飛び出すため、AltHold の離陸検知が立つまで待つ。
+    //   ★ 測距が無い構成 (USE_RANGE=false / センサ初期化失敗) では離陸を
+    //     検知できないので、このゲートは無効にして s5b と同じ動作に戻す。
+    //     ゲートしたままだと水平ホールドが永久に立ち上がらない。
+    const bool can_detect_takeoff = S5::USE_RANGE && g_range_ok;
+    const bool airborne = !Q::FLOW_REQUIRE_AIRBORNE || !can_detect_takeoff
+                        || althold.airborne();
+
     const bool  active = isArmed() && (g_mode == S5::MODE_POSHOLD)
                       && (thr > Q::FLOW_ENABLE_THR)
+                      && airborne
                       && S5::USE_FLOW && g_flow_ok;
 
     // スティックは機体座標のまま渡す (パイロットの前後左右 = 機首基準)
@@ -569,82 +578,26 @@ static void updateFlowHold(float dt_s) {
 // ------------------------------------------------------------
 //  § 6-3  s5c : 高度ホールド  (RANGE_LOOP_HZ で呼ぶ)
 //
-//   高度誤差[m] ─[ALT_POS_KP]→ 目標上昇速度[m/s] ─[ALT_RATE PID]→
-//     スロットル補正[割合] → (突入時に掴んだホバースロットル) + 補正
+//   中身は quad/AltHold.h (Q::AltitudeHold) に移した。ここは入力を集めて
+//   渡すだけの薄い層。カスケードと engage 状態遷移はクラス側にある。
 //
-//   出力は g_alt_thr_out。updateControl() が「active かつ POSHOLD」の
-//   ときだけ、これを手動スロットルの代わりにミキサーへ渡す。
-//   それ以外は g_alt_thr_out は手動スロットルに追従させて bumpless にする。
+//   ★ POSHOLD 中、プロポのスロットルは「ALT_ENABLE_THR を超えているか」の
+//     enable ゲートにしか使わない。出力は測距だけで決まる。
+//   ★ fresh (新しい測距サンプルが入ったか) を渡す。ソナーは ~20Hz なので、
+//     50Hz で無条件に PID を回すと同じ climb 値で D項がスパイクする。
 // ------------------------------------------------------------
 static void updateAltHold(float dt_s) {
-    if (dt_s <= 0.0f) return;
+    const float thr = S5::USE_SBUS ? constrain(sbus.des[Ch::THR], 0.0f, 1.0f) : 0.0f;
 
-    const bool  armed = isArmed();
-    const float thr   = S5::USE_SBUS ? constrain(sbus.des[Ch::THR], 0.0f, 1.0f) : 0.0f;
-
-    // POSHOLD は完全自動。モードに入っていて浮いていて測距が生きていれば effective。
-    //  抜けるのは SW_HOVER=down (→ANGLE) か THR_CUT のみ。
-    const bool  want  = g_alt_hold_enable && armed
-                     && (g_mode == S5::MODE_POSHOLD)
-                     && (thr > Q::ALT_ENABLE_THR)
-                     && S5::USE_RANGE && g_range_valid;
-
-    if (!want) {
-        alt_rate_pid.reset();
-        g_alt_vz_tar   = 0.0f;
-        g_alt_thr_corr = 0.0f;
-
-        // ★ POSHOLD 継続中に「測距だけ」を失った場合 (超音波はプロペラ後流で
-        //   一時的に飛ぶことがある): スロットルをスティック値へいきなり戻すと
-        //   落下する。直前のホバースロットルで保持し続け、手動復帰は
-        //   SW_HOVER を下げてもらう。
-        const bool lost_range_only = g_alt_active
-                                  && (g_mode == S5::MODE_POSHOLD)
-                                  && armed
-                                  && (g_alt_thr_base > 0.05f);
-        if (lost_range_only) {
-            g_alt_thr_out = g_alt_thr_base;   // g_alt_active は true のまま
-            return;
-        }
-
-        // 通常の非active (ANGLE など): 手動スロットルへ bumpless 追従
-        g_alt_active   = false;
-        g_alt_thr_base = thr;
-        g_alt_hold_m   = g_range_valid ? g_range_h_m : g_alt_hold_m;
-        g_alt_thr_out  = thr;
-        return;
-    }
-
-    if (!g_alt_active) {
-        // inactive → active:
-        //  基準スロットル = 実測ホバースロットル (ALT_HOVER_THR>0)。
-        //                   未設定なら POSHOLD 突入時のスティック値を掴む
-        //                   (→ ANGLE で安定ホバリングしてから SW_HOVER を上げること)。
-        //  保持高度       = ALT_TARGET_M (>0) か、0 なら突入時の実測高度。
-        g_alt_active   = true;
-        g_alt_thr_base = (Q::ALT_HOVER_THR > 0.01f) ? Q::ALT_HOVER_THR : thr;
-        g_alt_hold_m   = (Q::ALT_TARGET_M   > 0.0f)  ? Q::ALT_TARGET_M  : g_range_h_m;
-        alt_rate_pid.reset();
-    }
-
-    // スロットルスティックをホバー基準からずらしている間は上昇/下降速度指令。
-    // 戻すとその高度を保持。
-    const float thr_dev = thr - g_alt_thr_base;
-    if (fabsf(thr_dev) > Q::ALT_STICK_DEAD) {
-        g_alt_vz_tar = thr_dev * Q::ALT_STICK_VZ;
-        g_alt_hold_m = g_range_h_m;               // 目標高度を今へ張り付け
-    } else {
-        g_alt_vz_tar = constrain(g_alt_pos_kp * (g_alt_hold_m - g_range_h_m),
-                                 -Q::ALT_POS_VZ_LIM, Q::ALT_POS_VZ_LIM);
-    }
-
-    // 内側: 上昇速度PID → スロットル補正
-    g_alt_thr_corr = constrain(
-        alt_rate_pid.update(g_alt_vz_tar, g_climb_mps, dt_s, true),
-        -Q::ALT_THR_AUTH, Q::ALT_THR_AUTH);
-
-    // ホバースロットル ± 補正。完全停止しないよう下限を残す。
-    g_alt_thr_out = constrain(g_alt_thr_base + g_alt_thr_corr, 0.05f, 1.0f);
+    althold.update(dt_s,
+                   g_alt_hold_enable && S5::USE_RANGE,
+                   isArmed(),
+                   g_mode == S5::MODE_POSHOLD,
+                   g_range_valid,
+                   g_range_fresh,
+                   g_range_h_m,
+                   g_climb_mps,
+                   thr);
 }
 
 // ============================================================
@@ -671,10 +624,10 @@ static void updateControl(float dt_s) {
     if (!armed) { stopAllMotors(); return; }
 
     // s5c: 高度ホールドが active なら、ミキサーへ渡すスロットルを
-    //  ホバースロットル±PID補正 (g_alt_thr_out) に差し替える。
+    //  ホバースロットル±PID補正 (althold.throttle()) に差し替える。
     //  それ以外は従来どおり物理プロポのスロットルをそのまま使う。
     const float thr_stick = constrain(sbus.des[Ch::THR], 0.0f, 1.0f);
-    const float thr = g_alt_active ? g_alt_thr_out : thr_stick;
+    const float thr = althold.active() ? althold.throttle() : thr_stick;
     const bool  integrate = (thr > S5::I_ENABLE_THR);
 
     // --- 測定値 ---
@@ -837,7 +790,8 @@ static void tuningMenu() {
                   g_flow_vel_kp, g_flow_vel_ki, g_flow_pos_kp);
     Serial.println("-- s5c 高度ホールド --");
     Serial.printf(" [s] Pos P %9.4f  [t] Rate P %9.4f  [u] Rate I %9.4f  [v] Rate D %9.5f\n",
-                  g_alt_pos_kp, alt_rate_pid.kp(), alt_rate_pid.ki(), alt_rate_pid.kd());
+                  althold.posKp(), althold.ratePid().kp(),
+                  althold.ratePid().ki(), althold.ratePid().kd());
     Serial.println(" [q] 抜ける");
     Serial.print("選択 > ");
 
@@ -883,15 +837,16 @@ static void tuningMenu() {
 
     // s5c 高度ホールドのゲイン
     if (sel[0] == 's' || sel[0] == 't' || sel[0] == 'u' || sel[0] == 'v') {
-        if (sel[0] == 's') g_alt_pos_kp = constrain(v, 0.0f, 5.0f);
-        if (sel[0] == 't') alt_rate_pid.set_gains(constrain(v, 0.0f, 2.0f),
-                                                  alt_rate_pid.ki(), alt_rate_pid.kd());
-        if (sel[0] == 'u') alt_rate_pid.set_gains(alt_rate_pid.kp(),
-                                                  constrain(v, 0.0f, 2.0f), alt_rate_pid.kd());
-        if (sel[0] == 'v') alt_rate_pid.set_gains(alt_rate_pid.kp(), alt_rate_pid.ki(),
+        Q::Pid& arp = althold.ratePid();
+        if (sel[0] == 's') althold.setPosKp(constrain(v, 0.0f, 5.0f));
+        if (sel[0] == 't') arp.set_gains(constrain(v, 0.0f, 2.0f),
+                                                  arp.ki(), arp.kd());
+        if (sel[0] == 'u') arp.set_gains(arp.kp(),
+                                                  constrain(v, 0.0f, 2.0f), arp.kd());
+        if (sel[0] == 'v') arp.set_gains(arp.kp(), arp.ki(),
                                                   constrain(v, 0.0f, 1.0f));
         Serial.printf("更新: Alt pos P=%.3f  rate P=%.3f I=%.3f D=%.5f\n",
-                      g_alt_pos_kp, alt_rate_pid.kp(), alt_rate_pid.ki(), alt_rate_pid.kd());
+                      althold.posKp(), arp.kp(), arp.ki(), arp.kd());
         resetControllers();
         Serial.setTimeout(old_timeout);
         Serial.println("再開します。");
@@ -997,7 +952,7 @@ static void handleSerial() {
             //    ホバー中に切るときは、スロットルスティックを今の
             //    ホバー位置に戻してから 'g' を押すこと (段差防止)。
             g_alt_hold_enable = !g_alt_hold_enable;
-            if (!g_alt_hold_enable) { g_alt_active = false; alt_rate_pid.reset(); }
+            if (!g_alt_hold_enable) althold.reset(g_range_valid ? g_range_h_m : 0.0f);
             Serial.printf("\n>>> 高度ホールド = %s%s\n",
                           g_alt_hold_enable ? "ON" : "OFF (スロットル手動)",
                           (g_alt_hold_enable && !g_range_valid)
@@ -1088,11 +1043,18 @@ static void printStatus(uint32_t dt_us) {
         Serial.printf("[高度ホールド] %s  %s  hold=%.2fm  vz_tar=%+.2fm/s  "
                       "base=%.2f corr=%+.3f → thr=%.2f\n",
                       g_alt_hold_enable ? "ENABLED" : "OFF(手動)",
-                      g_alt_active ? "ACTIVE" : "standby",
-                      g_alt_hold_m, g_alt_vz_tar,
-                      g_alt_thr_base, g_alt_thr_corr, g_alt_thr_out);
+                      althold.stateName(),
+                      althold.holdM(), althold.vzTar(),
+                      althold.thrBase(), althold.thrCorr(), althold.thrOut());
+        Serial.printf("  base=ALT_HOVER_THR(%.2f)固定  スティックvz=%s  "
+                      "離陸=%s (engage時h=%.2fm)  → スロットルは高度のみで決まる\n",
+                      Q::ALT_HOVER_THR,
+                      Q::ALT_STICK_VZ_ENABLE ? "有効" : "無効",
+                      althold.airborne() ? "検知済" : "未検知(水平ホールド待機)",
+                      althold.engageH());
         Serial.printf("  gains: pos P=%.2f  rate P=%.2f I=%.2f D=%.3f   ['g']切替  ['p']-[s..v]調整\n",
-                      g_alt_pos_kp, alt_rate_pid.kp(), alt_rate_pid.ki(), alt_rate_pid.kd());
+                      althold.posKp(), althold.ratePid().kp(),
+                      althold.ratePid().ki(), althold.ratePid().kd());
     }
 
     Serial.println("\n[レートループ] 目標[deg/s] 実測[deg/s]      cmd      I項");
@@ -1194,9 +1156,7 @@ void setup() {
     poshold.setPosKp(g_flow_pos_kp);
 
     // s5c: 高度ホールドの内側ループ (上昇速度[m/s] → スロットル補正[割合])
-    alt_rate_pid.set_gains(Q::ALT_RATE_KP, Q::ALT_RATE_KI, Q::ALT_RATE_KD);
-    alt_rate_pid.set_d_alpha(Q::ALT_RATE_D_ALPHA);
-    alt_rate_pid.set_i_limit(Q::ALT_RATE_I_LIMIT);
+    althold.begin();
 
     if (S5::USE_MOTOR) {
         Serial.println("Init motors...");
@@ -1235,11 +1195,17 @@ void setup() {
         }
         Serial.printf("  高度ホールド: %s (POSHOLD で自動)。ホバースロットル=%s  目標高度=%s\n",
                       g_alt_hold_enable ? "有効" : "無効(POSHOLDでも手動)",
-                      (Q::ALT_HOVER_THR > 0.01f) ? "実測値" : "POSHOLD突入時のスティック",
+                      (Q::ALT_HOVER_THR > 0.01f) ? "実測値" : "未設定(engageしない)",
                       (Q::ALT_TARGET_M  > 0.0f)  ? "固定"   : "突入時の高度");
     }
 
     resetControllers();
+
+    // 全 Ticker の基準時刻をここでそろえる。これが無いと初回 ready() の
+    // dt_us が「起動からの経過時間」になり、その dt で積分が一気に進む。
+    for (Ticker* t : { &main_tick, &debug_tick, &telem_tick, &telem_rx_tick,
+                       &flow_tick, &range_tick }) t->prime();
+
     Serial.println("--- Setup complete ---");
 }
 
@@ -1280,11 +1246,16 @@ void loop() {
     }
 
     // --- s5c: 距離センサ (RANGE_LOOP_HZ) ---
-    //  VL53L1X を非ブロッキングで読み、傾き補正した鉛直高度を毎回 flow へ渡す。
-    //  失探したら valid() が false になり、flow は FLOW_ASSUMED_HEIGHT_M へ戻る。
+    //  測距を非ブロッキングで読み、傾き補正した鉛直高度を flow へ渡す。
+    //  ★ 失探しても flow の height は「最後に有効だった値」を保持する
+    //    (OpticalFlow::setHeight が範囲外を弾くだけで、
+    //     FLOW_ASSUMED_HEIGHT_M へ戻る処理はどこにも無い)。
+    //    急に 1.0m へ飛ぶより最後の値を持つほうが安全なので、これで良い。
+    //  ★ fresh = このループで新しいサンプルが入ったか。センサ (ソナー ~20Hz)
+    //    より速い RANGE_LOOP_HZ で回すので、PID を進めてよい回を区別する。
     if (S5::USE_RANGE && g_range_ok && range_tick.ready()) {
         const float range_dt_s = (float)range_tick.dt_us * 1e-6f;
-        rangefinder.update(g_att.roll, g_att.pitch);
+        g_range_fresh = rangefinder.update(g_att.roll, g_att.pitch);
         g_range_valid = rangefinder.valid();
         g_range_raw_m = rangefinder.rawM();
         g_range_h_m   = rangefinder.heightM();

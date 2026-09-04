@@ -39,9 +39,10 @@ public:
     // 戻り値 false = センサが応答しない (ToF のみ判定可能。Sonar は常に true を返し、
     //         実際の失探は update() の stale 判定で valid() が落ちる)
     bool begin() {
-        _have_h = false;
-        _bad_ms = 0;
-        _last_ms = 0;
+        _have_h    = false;
+        _bad_ms    = 0;
+        _last_ms   = 0;
+        _last_h_ms = 0;
 
         if (Quad::RANGE_BACKEND == Quad::RangeBackend::Sonar_EZ) {
             _min_m = Quad::RANGE_SONAR_MIN_M;
@@ -131,14 +132,20 @@ public:
             _height_m += a * (h - _height_m);
 
             // --- 上昇速度 = 高度の微分 (さらに LPF) ---
-            const float dt = (now - _last_ms) * 0.001f;
+            //  ★ dt は「前回 _height_m を更新した時刻」から測る。
+            //    旧コードは _last_ms を使っていたが、_last_ms は外れ値や
+            //    傾き過大で棄却した回にも now へ進めていたため、
+            //    棄却をはさむと分母だけが短くなり vz が最大で数倍に
+            //    過大評価されていた (その vz が高度PIDの測定値になる)。
+            const float dt = (now - _last_h_ms) * 0.001f;
             if (dt > 0.0f && dt < 0.5f) {
                 const float vz_raw = (_height_m - h_prev) / dt;
                 _vz_mps += Quad::RANGE_VZ_ALPHA * (vz_raw - _vz_mps);
             }
         }
-        _bad_ms  = 0;
-        _last_ms = now;
+        _bad_ms    = 0;
+        _last_h_ms = now;
+        _last_ms   = now;
         _fresh   = true;
         return true;
     }
@@ -184,7 +191,8 @@ private:
     float    _vz_mps   = 0.0f;
     float    _min_m    = 0.03f;
     float    _max_m    = 3.5f;
-    uint32_t _last_ms      = 0;   // 直近「有効サンプル」の時刻 (climb 用 dt)
+    uint32_t _last_ms      = 0;   // 直近「サンプルを見た」時刻 (bad_ms の積算用)
+    uint32_t _last_h_ms    = 0;   // 直近「_height_m を更新した」時刻 (climb 用 dt)
     uint32_t _last_new_ms  = 0;   // 直近「新サンプル到着」の時刻 (stale 判定用)
     uint32_t _bad_ms       = 0;
     uint32_t _sonar_seq    = 0;
