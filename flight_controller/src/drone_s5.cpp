@@ -128,8 +128,8 @@ namespace Gain {
 //       ±0.01 程度 : 正常 / ±0.05 以上 : アーム・モーター取付角を疑う
 //       RATE_I_LIMIT に張り付く : I項では吸収しきれない。機械を直すこと
 //                                kp       ki       kd
-constexpr float RATE_ROLL [3] = { 0.0010f, 0.0005f, 0.00004f };
-constexpr float RATE_PITCH[3] = { 0.0010f, 0.0005f, 0.00004f };
+constexpr float RATE_ROLL [3] = { 0.0010f, 0.0000f, 0.00004f };
+constexpr float RATE_PITCH[3] = { 0.0010f, 0.0000f, 0.00004f };
 
 // ★ ヨーの I項。P制御だけでは定常偏差が残る。
 //   機体には必ず一定のヨートルクが残っている:
@@ -138,7 +138,7 @@ constexpr float RATE_PITCH[3] = { 0.0010f, 0.0005f, 0.00004f };
 //   これらは P では釣り合った角速度で回り続けるだけで、消えない。
 //   ki = kp は積分時定数 1秒に相当する。まずこの値で試し、
 //   戻りが遅ければ 0.005 まで上げてよい (上げすぎると 1Hz 前後で揺れる)。
-constexpr float RATE_YAW  [3] = { 0.0010f, 0.0005f, 0.00004f };
+constexpr float RATE_YAW  [3] = { 0.0010f, 0.0000f, 0.00004f };
 
 constexpr float RATE_D_ALPHA = 0.80f;
 constexpr float RATE_I_LIMIT = 0.15f;
@@ -492,7 +492,7 @@ namespace S5Tel {
 uint8_t  seq           = 0;
 uint32_t last_param_ms = 0;
 bool     tx_drop_flag  = false;  // 直前の送信が捨てられたか (次パケットで通知)
-bool     send_pos_next = false;  // A/B 交互送信のトグル
+uint8_t  slot          = 0;      // A/B/C の送信枠カウンタ (tick 参照)
 
 // A/B 共通のヘッダを埋める。
 inline void fillHeader(S5T::Header& h, uint8_t type) {
@@ -562,6 +562,33 @@ inline void sendPos(int mode) {
     if (!s5tx.send(b)) tx_drop_flag = true;
 }
 
+// C: 姿勢ループの内部 (モーター出力 / 角速度 / ミキサー飽和)
+//  離陸時の転倒や発振の切り分け用。A/B だけでは「どのモーターが飽和したか」
+//  「レートループが指令に追従しているか」が分からない。
+inline void sendAtt(int mode) {
+    S5T::AttFrame c{};
+    fillHeader(c.h, S5T::TYPE_ATT);
+    c.modes = S5T::packModes((uint8_t)mode, (uint8_t)althold.state());
+    c.sat   = g_mix.sat;
+
+    c.m1 = S5T::qu8(g_out[0], 250.0f);
+    c.m2 = S5T::qu8(g_out[1], 250.0f);
+    c.m3 = S5T::qu8(g_out[2], 250.0f);
+    c.m4 = S5T::qu8(g_out[3], 250.0f);
+
+    c.roll_rate_dd      = S5T::q16(roll_axis.rate_meas,  S5T::SC_DDEG);
+    c.pitch_rate_dd     = S5T::q16(pitch_axis.rate_meas, S5T::SC_DDEG);
+    c.yaw_rate_dd       = S5T::q16(yaw_axis.rate_meas,   S5T::SC_DDEG);
+    c.roll_rate_tar_dd  = S5T::q16(roll_axis.rate_tar,   S5T::SC_DDEG);
+    c.pitch_rate_tar_dd = S5T::q16(pitch_axis.rate_tar,  S5T::SC_DDEG);
+
+    c.roll_cmd  = S5T::q16(roll_axis.cmd,  S5T::SC_1E4);
+    c.pitch_cmd = S5T::q16(pitch_axis.cmd, S5T::SC_1E4);
+    c.yaw_cmd   = S5T::q16(yaw_axis.cmd,   S5T::SC_1E4);
+
+    if (!s5tx.send(c)) tx_drop_flag = true;
+}
+
 // P: 今どのゲインで飛んでいるか。数秒に1回。
 inline void sendParam() {
     S5T::ParamFrame p{};
@@ -596,7 +623,13 @@ inline void sendParam() {
 }
 
 // telem_tick から呼ぶ。1回につき1パケットしか送れない (IM920sL は 32B 制限)。
-//  A と B を交互に出し、数秒に1回だけ P を割り込ませる。
+//  何を送るかはモードで変える:
+//    ANGLE / RATE  … A,C の交互 (各 7.5Hz)
+//        B(水平位置) は POSHOLD 以外では中身が全部 0 なので送るだけ無駄。
+//        その枠を C に回して、離陸時の転倒やモーター飽和を追えるようにする。
+//    POSHOLD / AUTO … A,B,A,C の4枠巡回 (A 7.5Hz / B 3.75Hz / C 3.75Hz)
+//        位置ループは 0.3〜1Hz なので B は 3.75Hz で足りる。
+//  P(ゲイン一覧) は数秒に1回、その回の枠を borrow する。
 inline void tick(int mode, float thr_stick) {
     const uint32_t now = millis();
     if (now - last_param_ms >= S5::TELEM_PARAM_MS) {
@@ -604,9 +637,22 @@ inline void tick(int mode, float thr_stick) {
         sendParam();
         return;
     }
-    send_pos_next = !send_pos_next;
-    if (send_pos_next) sendPos(mode);
-    else               sendAlt(mode, thr_stick);
+
+    slot = (uint8_t)((slot + 1) & 0x03);   // 0,1,2,3 の巡回
+
+    if (mode != (int)S5::MODE_POSHOLD && mode != (int)S5::MODE_AUTO) {
+        // ANGLE / RATE: A と C の交互
+        if (slot & 1) sendAtt(mode);
+        else          sendAlt(mode, thr_stick);
+        return;
+    }
+
+    // POSHOLD: A,B,A,C
+    switch (slot) {
+        case 0: case 2: sendAlt(mode, thr_stick); break;
+        case 1:         sendPos(mode);            break;
+        default:        sendAtt(mode);            break;
+    }
 }
 
 } // namespace S5Tel
@@ -803,6 +849,17 @@ static void updateControl(float dt_s) {
         Serial.printf("\n>>> MODE = %s\n", modeName(g_mode));
     }
 
+    // --- 測定値はアーム前から入れておく ---
+    //  ここより下は !armed で return するので、以前はアームするまで
+    //  rate_meas / ang_meas が 0 のままだった。テレメトリの C フレームも
+    //  全部 0 になり、飛行前に「機体を傾けてジャイロの符号を見る」という
+    //  地上確認ができなかった。これは測定値の代入だけで出力には触らない。
+    roll_axis.rate_meas  = g_att.roll_rate;
+    pitch_axis.rate_meas = g_att.pitch_rate;
+    yaw_axis.rate_meas   = g_att.yaw_rate;
+    roll_axis.ang_meas   = g_att.roll;
+    pitch_axis.ang_meas  = g_att.pitch;
+
     if (!armed) { stopAllMotors(); return; }
 
     // s5c: 高度ホールドが active なら、ミキサーへ渡すスロットルを
@@ -812,13 +869,7 @@ static void updateControl(float dt_s) {
     const float thr = althold.active() ? althold.throttle() : thr_stick;
     const bool  integrate = (thr > S5::I_ENABLE_THR);
 
-    // --- 測定値 ---
-    roll_axis.rate_meas  = g_att.roll_rate;
-    pitch_axis.rate_meas = g_att.pitch_rate;
-    yaw_axis.rate_meas   = g_att.yaw_rate;
-
-    roll_axis.ang_meas  = g_att.roll;
-    pitch_axis.ang_meas = g_att.pitch;
+    // --- 測定値は上 (アーム判定の前) で入れてある ---
     // yaw_axis.ang_meas は § 7-2 でヘディングホールドの積分値を入れる。
     // g_att.yaw (Madgwick の6軸ヨー) は絶対方位として意味を持たないので使わない。
 

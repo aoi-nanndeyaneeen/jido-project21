@@ -1,7 +1,10 @@
 """
 s5_logger.py  -  地上局 (xiao_s5_log) が吐く s5 テレメトリを CSV に保存する
 
-    機体 drone_s5.cpp ──IM920SL 15Hz──> XIAO (env:xiao_s5_log) ──USB──> これ
+    機体 drone_s5.cpp ──IM920sL 15Hz──> XIAO (env:xiao_s5_log) ──USB──> これ
+
+    A(高度+姿勢角) / B(水平位置) / C(姿勢ループ内部) / P(ゲイン) の
+    4種のフレームをモードに応じた順で受け、1行にまとめた CSV を保存する。
 
 使い方:
     python tools/s5_logger.py                  # COMポート自動検出、すぐ記録開始
@@ -35,21 +38,31 @@ import serial.tools.list_ports
 LOGS_DIR = Path(__file__).parent.parent / "logs"
 
 
+# RP2040 の USB CDC。Windows では description が
+# 「USB シリアル デバイス」としか出ず名前で判別できないので VID:PID で引く。
+# (Teensy は 16C0:0483。Bluetooth の仮想COM を掴む事故もこれで防げる)
+VID_PID_RP2040 = (0x2E8A, 0x000A)
+VID_PID_TEENSY = (0x16C0, 0x0483)
+
+
 def find_port():
-    """XIAO RP2040 らしいポートを探す。決められなければ一覧を出して選ばせる。"""
+    """XIAO RP2040 を VID:PID で探す。見つからなければ一覧を出して選ばせる。"""
     ports = list(serial.tools.list_ports.comports())
     if not ports:
         return None
+
     for p in ports:
-        desc = (p.description or "").lower()
-        if any(k in desc for k in ("xiao", "rp2040", "pico")):
+        if (p.vid, p.pid) == VID_PID_RP2040:
+            print(f"XIAO RP2040 を検出: {p.device}")
             return p.device
-    for p in ports:
-        if "usb serial" in (p.description or "").lower():
-            return p.device
-    print("自動検出できませんでした。接続中のポート:")
+
+    print("XIAO RP2040 (VID:PID 2E8A:000A) が見つかりません。接続中のポート:")
     for i, p in enumerate(ports):
-        print(f"  [{i}] {p.device}  {p.description}")
+        tag = ""
+        if (p.vid, p.pid) == VID_PID_TEENSY:
+            tag = "  ← Teensy (機体側。地上局ではありません)"
+        vidpid = f"{p.vid:04X}:{p.pid:04X}" if p.vid is not None else "     -   "
+        print(f"  [{i}] {p.device}  {vidpid}  {p.description}{tag}")
     sel = input("番号を選択 (Enter で 0) > ").strip()
     return ports[int(sel) if sel else 0].device
 
@@ -100,10 +113,10 @@ def main():
                 cmd = input().strip().lower()
             except (EOFError, KeyboardInterrupt):
                 return
-            if cmd in ("l", "s", "z", "h"):
+            if cmd in ("l", "s", "z", "h", "d", "1", "0"):
                 send(cmd)
             elif cmd == "q":
-                send("l")
+                send("0")          # 冪等に停止
                 time.sleep(0.3)
                 os._exit(0)
 
@@ -120,10 +133,13 @@ def main():
         state["logging"] = False
 
     if not args.no_autostart:
-        send("l")
-        print("記録開始を要求しました。('l' で開始/停止、'q' で終了、Ctrl+C でも可)\n")
+        # ★ 'l' (トグル) ではなく '1' (ON) を送る。
+        #   受信機が既に CSV 出力中のときにトグルを送ると「開始のつもりが停止」
+        #   になり、0行のログができてしまう (実際に踏んだ)。'1' は冪等。
+        send("1")
+        print("記録開始を要求しました。('1' 開始 / '0' 停止 / 'q' 終了、Ctrl+C でも可)\n")
     else:
-        print("受信待機中。'l' + Enter で記録開始します。\n")
+        print("受信待機中。'1' + Enter で記録開始します。\n")
 
     try:
         while True:
@@ -172,11 +188,11 @@ def main():
                         # (s5_log.cpp の CSV_HEADER と対応。列を足したらここも直す)
                         try:
                             lost, rssi, mode = fields[4], fields[5], fields[7]
-                            h, tgt = fields[25], fields[27]
+                            thr, h, tgt = fields[20], fields[25], fields[27]
                         except IndexError:
-                            lost = rssi = mode = h = tgt = "?"
+                            lost = rssi = mode = thr = h = tgt = "?"
                         print(f"\r  {state['rows']:6d} 行  lost={lost} "
-                              f"rssi={rssi} mode={mode} h={h}/{tgt} m   ",
+                              f"rssi={rssi} mode={mode} thr={thr} h={h}/{tgt} m   ",
                               end="", flush=True)
                 continue
 
@@ -195,7 +211,7 @@ def main():
     except KeyboardInterrupt:
         print("\n終了します...")
         try:
-            send("l")           # 受信機の CSV 出力も止める
+            send("0")           # 受信機の CSV 出力も止める (冪等)
             time.sleep(0.2)
         except Exception:
             pass

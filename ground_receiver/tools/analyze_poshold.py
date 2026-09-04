@@ -8,6 +8,7 @@ analyze_poshold.py  -  s5 (POSHOLD) テレメトリ CSV の解析
 s5_logger.py が保存した CSV (15Hz) を読んで、
   1. リンク品質 (欠落率・実効レート・RSSI)      … 数字を信用してよいかの判定
   2. 高度ホールド (ALT)                          … 誤差 / 上昇速度追従 / 権限飽和
+  2b. 姿勢ループ / モーター (ATT)                … 離陸したか / 飽和 / 転倒 / I項の要否
   3. 水平位置ホールド (POS)                      … 位置ドリフト / 速度追従 / リーン飽和
   4. センサ健全性 (測距失探・フロー失探)
   5. 振動の周期                                  … P が高すぎるかどうか
@@ -244,6 +245,111 @@ def check_alt(d, seg, fs, thr_auth):
                   "ノイズだらけです。RANGE_VZ_ALPHA を強めてください。")
 
 
+
+# ============================================================
+#  2b. 姿勢ループ / モーター (C フレーム)
+# ============================================================
+#  ANGLE のブリングアップで一番知りたいのは「浮いたのか」「どのモーターが
+#  飽和したか」「レートループが指令に追従しているか」。A/B だけでは
+#  接地したまま転がったのか空中で発振したのかを切り分けられない。
+def check_attitude(d, fs, hover_thr):
+    section("2b. 姿勢ループ / モーター (ARMED 区間)")
+    if "m1" not in d.dtype.names:
+        print("  C フレームが入っていない古いログです (機体を焼き直してください)。")
+        return
+
+    armed = d["armed"] > 0.5
+    if armed.sum() < 5:
+        print("  ARMED の区間がありません。")
+        return
+
+    a = {k: d[k][armed] for k in
+         ("thr", "roll", "pitch", "m1", "m2", "m3", "m4", "mixsat",
+          "roll_gyr", "pitch_gyr", "roll_ratetar", "pitch_ratetar",
+          "roll_cmd", "pitch_cmd", "yaw_cmd", "range_raw", "airborne")}
+    t = (d["rx_ms"][armed] - d["rx_ms"][armed][0]) / 1000.0
+
+    # --- 離陸したか ---
+    print(f"  ARMED {armed.sum() / fs:.1f} 秒   "
+          f"スロットル 最大 {a['thr'].max():.3f} / 平均 {a['thr'].mean():.3f}")
+    if a["airborne"].max() < 0.5:
+        print("  ★ 一度も離陸していません (airborne が立っていない)。")
+        if hover_thr > 0 and a["thr"].max() < hover_thr * 0.9:
+            print(f"     スロットル最大 {a['thr'].max():.2f} に対し "
+                  f"ホバー基準 ALT_HOVER_THR = {hover_thr:.2f}。推力が足りません。")
+            print("     地面近くで半端な推力のまま粘ると、片脚だけ荷重が抜けて")
+            print("     支点になり転がります。ホバー付近まで1秒以内で上げること。")
+
+    # --- 転倒の検出 ---
+    tilt = np.hypot(a["roll"], a["pitch"])
+    if tilt.max() > 45:
+        i = int(np.argmax(tilt > 45))
+        print(f"  ★ t={t[i]:.2f}s で傾き {tilt[i]:.0f} 度を超えました (転倒)。")
+        j = max(0, i - int(fs * 2))
+        rate = (tilt[i] - tilt[j]) / max(t[i] - t[j], 1e-3)
+        print(f"     直前2秒の傾き変化 {rate:+.0f} deg/s   "
+              f"そのときのスロットル {a['thr'][i]:.2f}")
+        if a["airborne"][:i + 1].max() < 0.5:
+            print("     接地したまま転がっています。姿勢ゲインではなく")
+            print("     推力不足・重心・脚の引っかかりを先に疑ってください。")
+
+    # --- モーター ---
+    print()
+    for i, k in enumerate(("m1", "m2", "m3", "m4"), 1):
+        v = a[k]
+        hi = np.mean(v >= 0.99) * 100
+        lo = np.mean(v <= 0.01) * 100
+        print(f"  M{i}  平均 {v.mean():.3f}  最大 {v.max():.3f}   "
+              f"上限張り付き {hi:4.1f} %  下限 {lo:4.1f} %")
+    ms = a["mixsat"].astype(int)
+    print(f"  ミキサー飽和 (どれか) {np.mean(ms != 0) * 100:.1f} %   "
+          + "  ".join(f"M{i+1}:{np.mean((ms >> i) & 1) * 100:.1f}%" for i in range(4)))
+    if np.mean(ms != 0) * 100 > 20:
+        print("  → 飽和が多すぎます。姿勢ゲインが高いか、機体が重いか、")
+        print("     ホバースロットルが上限に近すぎます。")
+
+    # --- 左右差 (推力の偏り) ---
+    mm = np.array([a[k].mean() for k in ("m1", "m2", "m3", "m4")])
+    spread = mm.max() - mm.min()
+    print(f"  モーター平均の開き {spread:.3f}")
+    if spread > 0.10:
+        print("  → 特定のモーターだけ働いています。重心のずれ、モーター取付角、")
+        print("     プロペラの CW/CCW 取り違え、ESC の個体差を疑ってください。")
+
+    # --- レートループの追従 ---
+    print()
+    for ax, meas, tar in (("roll", "roll_gyr", "roll_ratetar"),
+                          ("pitch", "pitch_gyr", "pitch_ratetar")):
+        m_, t_ = a[meas], a[tar]
+        err = t_ - m_
+        print(f"  {ax:<6} 角速度 実測 RMS {np.sqrt(np.mean(m_**2)):6.1f} / "
+              f"目標 RMS {np.sqrt(np.mean(t_**2)):6.1f} / "
+              f"追従誤差 RMS {np.sqrt(np.mean(err**2)):6.1f} [deg/s]")
+        if np.std(t_) > 1.0:
+            r = np.corrcoef(t_, m_)[0, 1]
+            if r < 0.2:
+                print(f"    → 目標にまったく追従していません (r={r:+.2f})。"
+                      "レートPIDの符号かゲインを疑ってください。")
+
+    # --- 定常的な傾き (I項の要否はここで判断する) ---
+    air = a["airborne"] > 0.5
+    if air.sum() > fs * 2:
+        print()
+        print(f"  離陸中の平均傾き: roll {a['roll'][air].mean():+.2f} deg  "
+              f"pitch {a['pitch'][air].mean():+.2f} deg")
+        if max(abs(a["roll"][air].mean()), abs(a["pitch"][air].mean())) > 2.0:
+            print("  → 空中で一方向に傾き続けています。ここで初めて")
+            print("     角度ループの I項 (Gain::ANG_ROLL/ANG_PITCH の ki) が効きます。")
+        else:
+            print("  → 定常偏差は小さいので、I項を足す理由はまだありません。")
+    else:
+        print()
+        print("  ★ 離陸している区間がないので、I項の要否はこのログでは判断できません。")
+        print("    接地中は地面が姿勢を拘束していて誤差が消えないため、I を入れると")
+        print("    溜まり続け、浮いた瞬間に一気に出て反対側へ蹴ります。")
+        print("    まず浮かせること。I項の検討はそのあとです。")
+
+
 # ============================================================
 #  3. 水平位置ホールド
 # ============================================================
@@ -434,7 +540,7 @@ def main():
     print(f"ログ: {path}   {len(d)} サンプル")
 
     params = load_params(path)
-    thr_auth, max_lean = 0.40, 8.0     # QuadConfig.h の既定値をフォールバックに
+    thr_auth, max_lean, hover_thr = 0.40, 8.0, 0.0  # QuadConfig.h の既定値
     if params:
         p = params[-1]
         section("0. 飛行時のゲイン (機体から届いた PARAM パケット)")
@@ -447,6 +553,7 @@ def main():
         try:
             thr_auth = float(p["alt_thr_auth"])
             max_lean = float(p["flow_max_lean"])
+            hover_thr = float(p["alt_hover_thr"])
         except (KeyError, ValueError):
             pass
         if len(params) > 1:
@@ -466,27 +573,39 @@ def main():
     #   統計と FFT を正しく出すため、ここで実際に更新された行だけを取る。
     #     frame == 0 -> A が新しい行 / frame == 1 -> B が新しい行
     if "frame" in d.dtype.names:
-        d_alt = d[d["frame"] < 0.5]
-        d_pos = d[d["frame"] > 0.5]
+        d_alt = d[d["frame"] < 0.5]                             # A
+        d_pos = d[(d["frame"] > 0.5) & (d["frame"] < 1.5)]      # B
+        d_att = d[d["frame"] > 1.5]                             # C
     else:                                   # 旧形式 (単一フレーム) の CSV
-        d_alt = d_pos = d
+        d_alt = d_pos = d_att = d
 
     def rate_of(x):
+        # 空 / 1行のときは 0 を返す。fs で埋めると「無いフレーム」が
+        # 全体レートで表示されてしまい、有無の判断を誤る。
         if len(x) < 2:
-            return fs
+            return 0.0
         span = (x["rx_ms"][-1] - x["rx_ms"][0]) / 1000.0
-        return (len(x) - 1) / span if span > 0 else fs
+        return (len(x) - 1) / span if span > 0 else 0.0
 
-    fs_alt, fs_pos = rate_of(d_alt), rate_of(d_pos)
-    print(f"  実効レート: 高度フレーム {fs_alt:.1f} Hz / 水平フレーム {fs_pos:.1f} Hz")
+    fs_alt, fs_pos, fs_att = rate_of(d_alt), rate_of(d_pos), rate_of(d_att)
+    print(f"  実効レート: A(高度) {fs_alt:.1f} Hz / B(水平) {fs_pos:.1f} Hz / "
+          f"C(姿勢) {fs_att:.1f} Hz")
+    # 表示は実測のまま。以降の「秒数 = サンプル数 / fs」でゼロ割しないよう
+    # ここから先だけ全体レートで埋める。
+    fs_alt = fs_alt or fs
+    fs_pos = fs_pos or fs
+    fs_att = fs_att or fs
+    if len(d_att) < 5:
+        print("  ※ C(姿勢) フレームがありません。機体側が古いファームです")
+        print("     (drone_s5 を焼き直すと m1..m4 / 角速度 / ミキサー飽和が入ります)。")
 
     segs_a = poshold_segments(d_alt)
     segs_b = poshold_segments(d_pos)
     if not segs_a and not segs_b:
         section("2/3. POSHOLD 区間")
-        print("  POSHOLD かつ ARMED の区間がありません。")
-        print("  SW_HOVER を上げた状態で記録してください "
+        print("  POSHOLD かつ ARMED の区間がありません "
               "(mode: 1=ANGLE / 3=POSHOLD)。")
+        print("  ANGLE のブリングアップ中ならこれで正常です。下の 2b を見てください。")
     for i, sl in enumerate(segs_a, 1):
         dur = (d_alt["rx_ms"][sl][-1] - d_alt["rx_ms"][sl][0]) / 1000.0
         section(f"2. 高度ホールド  [POSHOLD 区間 {i}/{len(segs_a)}  {dur:.1f} 秒]")
@@ -495,6 +614,9 @@ def main():
         dur = (d_pos["rx_ms"][sl][-1] - d_pos["rx_ms"][sl][0]) / 1000.0
         section(f"3. 水平位置ホールド  [POSHOLD 区間 {i}/{len(segs_b)}  {dur:.1f} 秒]")
         check_pos(d_pos, sl, fs_pos, max_lean)
+
+    if len(d_att) > 5:
+        check_attitude(d_att, fs_att, hover_thr)
 
     check_sensors(d, fs)
 

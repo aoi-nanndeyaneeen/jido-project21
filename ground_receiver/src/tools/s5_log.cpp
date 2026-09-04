@@ -2,25 +2,28 @@
 //  s5_log.cpp  -  s5 (POSHOLD) 解析テレメトリの受信 & CSV化 (地上局)
 // ============================================================
 //  機体側 drone_s5.cpp が 15Hz で投げてくる S5T::AltFrame / PosFrame /
-//  ParamFrame を受け取り、USB シリアルへ CSV として吐き出す。PC 側は
+//  AttFrame / ParamFrame を受け取り、USB シリアルへ CSV として吐き出す。PC 側は
 //    python tools/s5_logger.py
 //  で受けて ground_receiver/logs/ に保存し、
 //    python tools/analyze_poshold.py
 //  で解析する。
 //
 //  ★ IM920sL の実効ペイロードは 32 バイト (実測)。そのため 1 パケットに
-//    全部は載らず、A(高度)/B(水平) を交互に送っている (各 7.5Hz)。
-//    ここでは受け取るたびに「もう片方は前回値」で 1 行を組み立てる
-//    (forward-fill)。列の意味は S5Telem.h を参照。
+//    全部は載らず、A(高度+姿勢角) / B(水平位置) / C(姿勢ループ内部) を
+//    順番に送っている。何をどの順で送るかはモードで変わる (S5Telem.h)。
+//    ここでは受け取るたびに「他のフレームは前回値」で 1 行を組み立てる
+//    (forward-fill)。frame 列が「今回どれが新しいか」= 0:A 1:B 2:C。
+//    列の意味は S5Telem.h を参照。
 //
 //  ビルド / 書き込み (XIAO RP2040 の地上局):
 //      pio run -e xiao_s5_log -t upload
 //      pio device monitor -e xiao_s5_log      (手で見るだけならこれでも可)
 //
 //  USB シリアルから使えるキー (押せば必ず1行返事を出す):
-//      l : CSV 出力の開始 / 停止 (s5_logger.py が起動時に自動で送る)
+//      1 : CSV 出力 ON   /   0 : CSV 出力 OFF   (冪等。s5_logger.py はこれ)
+//      l : CSV 出力のトグル (人間が手で押す用)
 //          ★ これは「画面に CSV を吐く」だけ。ファイルを作るのは PC 側の
-//            s5_logger.py。シリアルモニタで l を押してもファイルはできない。
+//            s5_logger.py。シリアルモニタで押してもファイルはできない。
 //      s : 今の状態を1回表示
 //      d : IM920 の生の行をそのまま表示 (リンクの切り分け用)
 //      z : 統計 (受信数 / 欠落数) をゼロクリア
@@ -56,7 +59,7 @@ constexpr unsigned long IM_BAUD  = 19200;
 constexpr unsigned long USB_BAUD = 115200;
 
 // ------------------------------------------------------------
-//  CSV の列。A/B を forward-fill して 1 行にまとめる。
+//  CSV の列。A/B/C を forward-fill して 1 行にまとめる。
 //  ★ 列を足したら必ず emitData() 側も同じ順で足すこと。
 // ------------------------------------------------------------
 static const char CSV_HEADER[] =
@@ -68,7 +71,10 @@ static const char CSV_HEADER[] =
     "range_h,range_raw,alt_hold,climb,alt_vzt,alt_corr,alt_thr,"
     "fh_vxc,fh_vyc,fh_vxt,fh_vyt,"
     "fh_posn,fh_pose,fh_holdn,fh_holde,"
-    "fh_leanr,fh_leanp";
+    "fh_leanr,fh_leanp,"
+    "m1,m2,m3,m4,mixsat,"
+    "roll_gyr,pitch_gyr,yaw_gyr,roll_ratetar,pitch_ratetar,"
+    "roll_cmd,pitch_cmd,yaw_cmd";
 
 // ------------------------------------------------------------
 //  状態
@@ -77,8 +83,9 @@ static bool csv_on = false;
 
 static S5T::AltFrame   last_alt{};
 static S5T::PosFrame   last_pos{};
+static S5T::AttFrame   last_att{};
 static S5T::ParamFrame last_param{};
-static bool  have_alt = false, have_pos = false, have_param = false;
+static bool  have_alt = false, have_pos = false, have_att = false, have_param = false;
 static int   last_rssi  = -1;
 static uint32_t last_rx_ms = 0;
 
@@ -93,7 +100,7 @@ static bool     t_init = false;
 //   相手が違う / パケット定義がずれている、と原因を分けられる。
 static uint32_t n_rx_bytes = 0, n_rx_lines = 0;
 static bool     raw_dump = false;   // 'd' で IM920 の生の行をそのまま出す
-static uint32_t n_alt = 0, n_pos = 0, n_param = 0;
+static uint32_t n_alt = 0, n_pos = 0, n_att = 0, n_param = 0;
 static uint32_t n_lost  = 0;   // seq の飛びから数えた累積欠落
 static uint32_t n_bad_cs = 0;  // チェックサム不一致
 static uint32_t n_bad_len = 0; // 長さ / type が合わない (構造体バージョン違い?)
@@ -136,17 +143,13 @@ static const char* altStateName(uint8_t s) {
 
 static inline int flg(uint16_t f, uint16_t m) { return (f & m) ? 1 : 0; }
 
-// 直近に届いたフレームのヘッダ (A/B どちらも flags と mode を積んでいる)
-static const S5T::Header& liveHeader() {
-    if (!have_alt) return last_pos.h;
-    if (!have_pos) return last_alt.h;
-    return (last_alt.h.seq >= last_pos.h.seq) ? last_alt.h : last_pos.h;
-}
-static uint8_t liveModes() {
-    if (!have_alt) return last_pos.modes;
-    if (!have_pos) return last_alt.modes;
-    return (last_alt.h.seq >= last_pos.h.seq) ? last_alt.modes : last_pos.modes;
-}
+// 直近に届いたフレームのヘッダ (A/B/C どれも flags と modes を積んでいる)。
+//  最後に受け取ったものを覚えておくだけ。seq の大小比較だと 255->0 の
+//  折り返しで古いほうを選んでしまう。
+static S5T::Header live_h{};
+static uint8_t     live_modes = 0;
+static const S5T::Header& liveHeader() { return live_h; }
+static uint8_t liveModes()             { return live_modes; }
 
 // t_cs (10ms単位 uint16) を単調増加の ms へ展開する
 static uint32_t unwrapTime(uint16_t t_cs) {
@@ -172,8 +175,8 @@ static void startCsv() {
 static void stopCsv() {
     csv_on = false;
     Serial.println("LOG_STOP");
-    Serial.printf("# alt=%lu pos=%lu param=%lu lost=%lu badcs=%lu badlen=%lu\n",
-                  (unsigned long)n_alt, (unsigned long)n_pos,
+    Serial.printf("# A=%lu B=%lu C=%lu param=%lu lost=%lu badcs=%lu badlen=%lu\n",
+                  (unsigned long)n_alt, (unsigned long)n_pos, (unsigned long)n_att,
                   (unsigned long)n_param, (unsigned long)n_lost,
                   (unsigned long)n_bad_cs, (unsigned long)n_bad_len);
 }
@@ -197,10 +200,11 @@ static void emitParam(const S5T::ParamFrame& p) {
 }
 
 // 量子化を物理値へ戻して 1行書く。CSV_HEADER と同じ順であること。
-//  fresh: 0 = 今回 A が届いた / 1 = B が届いた。もう片方は前回値。
+//  fresh: 今回どのフレームが届いたか (0:A 1:B 2:C)。他は前回値。
 static void emitData(uint32_t rx_ms, uint32_t t_ms, uint8_t seq, int fresh) {
     const S5T::AltFrame& a = last_alt;
     const S5T::PosFrame& b = last_pos;
+    const S5T::AttFrame& c = last_att;
     const uint16_t f = liveHeader().flags;
     const uint8_t  m = liveModes();
 
@@ -213,7 +217,10 @@ static void emitData(uint32_t rx_ms, uint32_t t_ms, uint8_t seq, int fresh) {
         "%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,"
         "%.3f,%.3f,%.3f,%.3f,"
         "%.2f,%.2f,%.2f,%.2f,"
-        "%.2f,%.2f\n",
+        "%.2f,%.2f,"
+        "%.3f,%.3f,%.3f,%.3f,%u,"
+        "%.1f,%.1f,%.1f,%.1f,%.1f,"
+        "%.4f,%.4f,%.4f\n",
         (unsigned long)rx_ms, (unsigned long)t_ms, (unsigned)seq,
         (unsigned long)n_lost, last_rssi, fresh,
         (unsigned)S5T::unpackMode(m), (unsigned)S5T::unpackAltState(m),
@@ -233,7 +240,14 @@ static void emitData(uint32_t rx_ms, uint32_t t_ms, uint8_t seq, int fresh) {
         b.vx_tar_mmps / S5T::SC_MM, b.vy_tar_mmps / S5T::SC_MM,
         b.pos_n_cm / S5T::SC_CM, b.pos_e_cm / S5T::SC_CM,
         b.hold_n_cm / S5T::SC_CM, b.hold_e_cm / S5T::SC_CM,
-        b.lean_roll_cd / S5T::SC_CDEG, b.lean_pitch_cd / S5T::SC_CDEG);
+        b.lean_roll_cd / S5T::SC_CDEG, b.lean_pitch_cd / S5T::SC_CDEG,
+        c.m1 / 250.0f, c.m2 / 250.0f, c.m3 / 250.0f, c.m4 / 250.0f,
+        (unsigned)c.sat,
+        c.roll_rate_dd / S5T::SC_DDEG, c.pitch_rate_dd / S5T::SC_DDEG,
+        c.yaw_rate_dd / S5T::SC_DDEG,
+        c.roll_rate_tar_dd / S5T::SC_DDEG, c.pitch_rate_tar_dd / S5T::SC_DDEG,
+        c.roll_cmd / S5T::SC_1E4, c.pitch_cmd / S5T::SC_1E4,
+        c.yaw_cmd / S5T::SC_1E4);
 }
 
 // ------------------------------------------------------------
@@ -246,17 +260,17 @@ static void printStatus() {
     Serial.println();
     Serial.println("---- s5 TELEMETRY RECEIVER  [l]=CSV出力 [d]=生データ [z]=統計クリア [h]=help ----");
     const uint32_t age = millis() - last_rx_ms;
-    const bool live = (have_alt || have_pos);
+    const bool live = (have_alt || have_pos || have_att);
     Serial.printf("link : %s  (最終受信 %lu ms前)  RSSI=%d\n",
                   (live && age < 1000) ? "OK" : "LOST",
                   (unsigned long)(live ? age : 0), last_rssi);
     Serial.printf("IM920 生受信: %lu bytes / %lu 行\n",
                   (unsigned long)n_rx_bytes, (unsigned long)n_rx_lines);
-    Serial.printf("stats: A=%lu B=%lu P=%lu  lost=%lu  badcs=%lu badlen=%lu",
-                  (unsigned long)n_alt, (unsigned long)n_pos,
+    Serial.printf("stats: A=%lu B=%lu C=%lu P=%lu  lost=%lu  badcs=%lu badlen=%lu",
+                  (unsigned long)n_alt, (unsigned long)n_pos, (unsigned long)n_att,
                   (unsigned long)n_param, (unsigned long)n_lost,
                   (unsigned long)n_bad_cs, (unsigned long)n_bad_len);
-    const uint32_t tot = n_alt + n_pos + n_param + n_lost;
+    const uint32_t tot = n_alt + n_pos + n_att + n_param + n_lost;
     if (tot) Serial.printf("   欠落率 %.1f%%", 100.0f * (float)n_lost / (float)tot);
     Serial.println();
 
@@ -321,6 +335,23 @@ static void printStatus() {
                       flg(f, S5T::F_POS_HOLD) ? "HOLDING" : "(スティック操作中)");
     }
 
+    if (have_att) {
+        const S5T::AttFrame& c = last_att;
+        Serial.println("[姿勢ループ]");
+        Serial.printf("  motor: M1=%.3f M2=%.3f M3=%.3f M4=%.3f   飽和=%c%c%c%c\n",
+                      c.m1 / 250.0f, c.m2 / 250.0f, c.m3 / 250.0f, c.m4 / 250.0f,
+                      (c.sat & 1) ? '1' : '-', (c.sat & 2) ? '2' : '-',
+                      (c.sat & 4) ? '3' : '-', (c.sat & 8) ? '4' : '-');
+        Serial.printf("  rate : 実測 r=%+7.1f p=%+7.1f y=%+7.1f / 目標 r=%+7.1f p=%+7.1f [deg/s]\n",
+                      c.roll_rate_dd / S5T::SC_DDEG, c.pitch_rate_dd / S5T::SC_DDEG,
+                      c.yaw_rate_dd / S5T::SC_DDEG,
+                      c.roll_rate_tar_dd / S5T::SC_DDEG,
+                      c.pitch_rate_tar_dd / S5T::SC_DDEG);
+        Serial.printf("  cmd  : roll=%+.4f pitch=%+.4f yaw=%+.4f\n",
+                      c.roll_cmd / S5T::SC_1E4, c.pitch_cmd / S5T::SC_1E4,
+                      c.yaw_cmd / S5T::SC_1E4);
+    }
+
     if (have_param) {
         Serial.println("[ゲイン (機体から受信)]");
         Serial.printf("  flow vel P=%.3f I=%.3f D=%.3f   flow pos P=%.3f\n",
@@ -339,7 +370,8 @@ static void printStatus() {
 
 static void printHelp() {
     Serial.println("# --- s5 telemetry receiver ---");
-    Serial.println("#   l : CSV 出力の開始/停止 (HEADER/LOG_START/DATA/LOG_STOP)");
+    Serial.println("#   1 : CSV 出力 ON    0 : CSV 出力 OFF  (冪等。logger.py はこれを使う)");
+    Serial.println("#   l : CSV 出力のトグル (人間用)");
     Serial.println("#       ★これは「画面に CSV を吐く」だけ。ファイルを作るのは PC 側の");
     Serial.println("#         python tools/s5_logger.py です (起動時に自動で l を送ります)");
     Serial.println("#   s : 状態を1回表示");
@@ -435,6 +467,7 @@ static void handleLine(String& line) {
             memcpy(&last_alt, buf, sizeof(last_alt));
             have_alt = true;
             n_alt++;
+            live_h = last_alt.h;  live_modes = last_alt.modes;
             const uint32_t t = unwrapTime(last_alt.h.t_cs);
             if (csv_on) emitData(last_rx_ms, t, seq, 0);
             break;
@@ -443,8 +476,18 @@ static void handleLine(String& line) {
             memcpy(&last_pos, buf, sizeof(last_pos));
             have_pos = true;
             n_pos++;
+            live_h = last_pos.h;  live_modes = last_pos.modes;
             const uint32_t t = unwrapTime(last_pos.h.t_cs);
             if (csv_on) emitData(last_rx_ms, t, seq, 1);
+            break;
+        }
+        case S5T::TYPE_ATT: {
+            memcpy(&last_att, buf, sizeof(last_att));
+            have_att = true;
+            n_att++;
+            live_h = last_att.h;  live_modes = last_att.modes;
+            const uint32_t t = unwrapTime(last_att.h.t_cs);
+            if (csv_on) emitData(last_rx_ms, t, seq, 2);
             break;
         }
         case S5T::TYPE_PARAM: {
@@ -462,8 +505,9 @@ static void handleLine(String& line) {
         default:
             n_bad_len++;
             if (n_bad_len <= 3)
-                Serial.printf("# 未知の type=0x%02X (期待 A=0x%02X B=0x%02X P=0x%02X)\n",
-                              buf[0], S5T::TYPE_ALT, S5T::TYPE_POS, S5T::TYPE_PARAM);
+                Serial.printf("# 未知の type=0x%02X (期待 A=0x%02X B=0x%02X C=0x%02X P=0x%02X)\n",
+                              buf[0], S5T::TYPE_ALT, S5T::TYPE_POS,
+                              S5T::TYPE_ATT, S5T::TYPE_PARAM);
             break;
     }
 }
@@ -473,21 +517,37 @@ static void handleLine(String& line) {
 // ------------------------------------------------------------
 //  ★ どのキーにも必ず1行返す。無反応だと「キーが届いていない」のか
 //    「届いたが機体からパケットが来ていない」のか区別できないため。
+static void csvOn() {
+    if (csv_on) {
+        // 既に出力中。HEADER を出し直して PC 側と足並みをそろえる。
+        Serial.println("# CSV 出力は既に ON。HEADER を再送します");
+    } else {
+        Serial.println("# CSV 出力 ON。"
+                       "※ファイルを作るのは tools/s5_logger.py です");
+    }
+    startCsv();
+    if (have_param) emitParam(last_param);
+    if (!have_alt && !have_pos && !have_att)
+        Serial.println("# まだテレメトリが来ていないので DATA 行は出ません "
+                       "(2秒ごとに待機中の表示を出します)");
+}
+
+static void csvOff() {
+    if (!csv_on) { Serial.println("# CSV 出力は既に OFF"); return; }
+    stopCsv();
+}
+
 static void handleKey(char c) {
     if (c == '\r' || c == '\n' || c == ' ') return;   // 改行は無視 (返事もしない)
     switch (c) {
+        // ★ '1'/'0' は冪等な ON/OFF。s5_logger.py はこちらを使う。
+        //   'l' のトグルだと、受信機が既に出力中のときに logger を起動した
+        //   場合に「開始のつもりが停止」になり、0行のログができてしまう。
+        case '1': csvOn();  break;
+        case '0': csvOff(); break;
+
         case 'l': case 'L':
-            if (csv_on) {
-                stopCsv();
-            } else {
-                Serial.println("# CSV 出力 ON。"
-                               "※ファイルを作るのは tools/s5_logger.py です");
-                startCsv();
-                if (have_param) emitParam(last_param);
-                if (!have_alt && !have_pos)
-                    Serial.println("# まだテレメトリが来ていないので DATA 行は出ません "
-                                   "(2秒ごとに待機中の表示を出します)");
-            }
+            csv_on ? csvOff() : csvOn();
             break;
         case 's': case 'S':
             printStatus();
@@ -498,7 +558,7 @@ static void handleKey(char c) {
             break;
         case 'z': case 'Z':
             n_rx_bytes = n_rx_lines = 0;
-            n_alt = n_pos = n_param = n_lost = n_bad_cs = n_bad_len = 0;
+            n_alt = n_pos = n_att = n_param = n_lost = n_bad_cs = n_bad_len = 0;
             seq_init = false;
             Serial.println("# 統計をクリアしました");
             break;
@@ -506,7 +566,7 @@ static void handleKey(char c) {
             printHelp();
             break;
         default:
-            Serial.printf("# 未知のキー '%c' (0x%02X)。使えるのは l / s / d / z / h\n",
+            Serial.printf("# 未知のキー '%c' (0x%02X)。使えるのは 1 / 0 / l / s / d / z / h\n",
                           (c >= 0x20 && c < 0x7f) ? c : '?', (uint8_t)c);
             break;
     }
@@ -561,9 +621,10 @@ void loop() {
         if (now - last_rx_ms > 2000 && now - last_beat >= 2000) {
             last_beat = now;
             Serial.printf("# テレメトリ待機中: IM920 %lu bytes / %lu 行, "
-                          "A=%lu B=%lu badcs=%lu badlen=%lu\n",
+                          "A=%lu B=%lu C=%lu badcs=%lu badlen=%lu\n",
                           (unsigned long)n_rx_bytes, (unsigned long)n_rx_lines,
                           (unsigned long)n_alt, (unsigned long)n_pos,
+                          (unsigned long)n_att,
                           (unsigned long)n_bad_cs, (unsigned long)n_bad_len);
         }
     }

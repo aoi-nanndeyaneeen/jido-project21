@@ -33,11 +33,19 @@
 //      15Hz で UART 占有率 55%)
 //     → drone_s5.cpp の TELEM_TX_HZ = 15。
 //
-//  この 2 つから、1 パケットに全部は載らない。そこで A/B の 2 種類を
-//  交互に送る (各 7.5Hz)。0.3〜2Hz のループを見るには十分。
-//    A = 高度ループ + 姿勢
+//  この 2 つから、1 パケットに全部は載らない。そこでフレームを分けて
+//  順番に送る。0.3〜2Hz のループを見るにはこれで十分。
+//    A = 高度ループ + 姿勢角
 //    B = 水平位置ループ
-//    P = ゲイン一覧 (数秒に1回、A/B の枠を1つ borrow する)
+//    C = 姿勢ループの内部 (モーター出力 / 角速度 実測・目標 / ミキサー飽和)
+//    P = ゲイン一覧 (数秒に1回、枠を1つ borrow する)
+//
+//  ★ 送る順番はモードで変える (drone_s5.cpp の S5Tel::tick):
+//      ANGLE / RATE  … A,C の交互          (各 7.5Hz)
+//        B(水平位置) は POSHOLD 以外では全部 0 なので送っても無駄。
+//        代わりに C を厚くして、離陸時の転倒やモーター飽和を追えるようにする。
+//      POSHOLD/AUTO  … A,B,A,C の4枠巡回   (A 7.5Hz / B 3.75Hz / C 3.75Hz)
+//        位置ループは 0.3〜1Hz なので 3.75Hz あれば足りる。
 //
 //  ★ 送信は必ず非同期 (S5T::Tx::service)。HardwareSerial::print を直接
 //    呼ぶと TXバッファ(40B)が溢れた時点でブロックし、1000Hz の制御
@@ -53,7 +61,7 @@
 namespace S5T {
 
 // 構造体を変えたら必ずインクリメントすること (地上局が不一致を検出する)
-constexpr uint8_t VERSION = 2;
+constexpr uint8_t VERSION = 3;
 
 // IM920sL の実効ペイロード上限 [byte]。これを超えると黙って切られる。
 constexpr size_t IM920SL_MAX_PAYLOAD = 32;
@@ -62,6 +70,7 @@ constexpr size_t PACKET_BYTES        = IM920SL_MAX_PAYLOAD - CHECKSUM_BYTES;  //
 
 constexpr uint8_t TYPE_ALT   = 0x41;  // 'A'  高度ループ + 姿勢
 constexpr uint8_t TYPE_POS   = 0x42;  // 'B'  水平位置ループ
+constexpr uint8_t TYPE_ATT   = 0x43;  // 'C'  姿勢ループ内部 (モーター出力/レート)
 constexpr uint8_t TYPE_PARAM = 0x50;  // 'P'  ゲイン一覧
 
 // ---- 量子化スケール (物理値 = 整数値 / SC_xxx) ----
@@ -147,6 +156,31 @@ struct __attribute__((__packed__)) PosFrame {
     int16_t lean_pitch_cd;     // 28
 };
 static_assert(sizeof(PosFrame) == PACKET_BYTES, "PosFrame が 28 byte ではありません");
+
+// ------------------------------------------------------------
+//  C: 姿勢ループの内部  (28 byte)
+// ------------------------------------------------------------
+//  離陸時の転倒や発振の原因を追うためのフレーム。A/B だけでは
+//  「どのモーターが飽和したか」「レートループが指令に追従しているか」が
+//  分からず、接地したまま転がったのか空中で発振したのかを切り分けられない。
+//
+//  ★ 角速度は 0.1 deg/s 刻み (±3276 deg/s)。トルク指令 cmd は [-1,1] を
+//    1e-4 刻みで。モーター出力は 0..250 = 0.000..1.000 (分解能 0.004)。
+struct __attribute__((__packed__)) AttFrame {
+    Header  h;                 //  6
+    uint8_t modes;             //  7
+    uint8_t sat;               //  8  Q::MixInfo::sat  bit0..3 = M1..M4 が張り付いた
+    uint8_t m1, m2, m3, m4;    // 12  各モーター出力 0..250 (= 0.000..1.000)
+    int16_t roll_rate_dd;      // 14  実測角速度 [0.1 deg/s]
+    int16_t pitch_rate_dd;     // 16
+    int16_t yaw_rate_dd;       // 18
+    int16_t roll_rate_tar_dd;  // 20  角度ループが出した目標角速度 [0.1 deg/s]
+    int16_t pitch_rate_tar_dd; // 22
+    int16_t roll_cmd;          // 24  ミキサーへ渡したトルク指令 [1e-4]
+    int16_t pitch_cmd;         // 26
+    int16_t yaw_cmd;           // 28
+};
+static_assert(sizeof(AttFrame) == PACKET_BYTES, "AttFrame が 28 byte ではありません");
 
 // ------------------------------------------------------------
 //  P: ゲイン一覧  (28 byte)
