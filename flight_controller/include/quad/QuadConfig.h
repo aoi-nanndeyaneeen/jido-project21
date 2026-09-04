@@ -93,7 +93,7 @@ constexpr float MIX_YAW  [MOTOR_COUNT] = { -1.0f, +1.0f, -1.0f, +1.0f };
 // アイドル: アーム中でもこの値までは常に回す。0 にすると空中で完全停止して
 // 復帰できなくなるので、実飛行では 0.05〜0.10 程度を入れる。
 // Stage 1/2 (プロペラ無し) の間は 0.0f のままで良い。
-constexpr float THR_IDLE     = 0.00f;
+constexpr float THR_IDLE     = 0.10f;
 // スロットルがこれ以下なら姿勢補正を入れず全モーター停止 (地上での暴れ防止)
 constexpr float THR_MIN_MIX  = 0.05f;
 
@@ -340,7 +340,7 @@ constexpr bool  FLOW_REQUIRE_AIRBORNE = true;
 
 // 使う測距バックエンド。ハードを載せ替えたらここだけ変える。
 enum class RangeBackend { ToF_VL53L1X, Sonar_EZ };
-constexpr RangeBackend RANGE_BACKEND = RangeBackend::Sonar_EZ;
+constexpr RangeBackend RANGE_BACKEND = RangeBackend::ToF_VL53L1X;
 
 // --- Sonar_EZ (MaxBotix LV-MaxSonar-EZ) 専用 ---
 constexpr uint8_t  RANGE_SONAR_PW_PIN   = 23;     // PW 出力 → 空き割り込みピン
@@ -422,7 +422,7 @@ constexpr float ALT_RATE_D_ALPHA = 0.60f;
 
 // PID がホバースロットルから動かしてよい最大量 [割合]。
 //  ブリングアップ中は余裕を持って 0.30。挙動が信用できたら 0.20 に絞る。
-constexpr float ALT_THR_AUTH = 0.30f;
+constexpr float ALT_THR_AUTH = 0.40f;
 
 // ホバースロットルの基準 [割合]。★実飛行前に ANGLE ホバリングで実測して入れる。
 //  0 のままだと高度ホールドは engage しない (SW_AUTO を上げても効かない)。
