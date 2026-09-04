@@ -346,7 +346,7 @@ def check_attitude(d, fs, hover_thr):
 
     cols = ["thr", "roll", "pitch", "m1", "m2", "m3", "m4", "mixsat",
             "roll_gyr", "pitch_gyr", "roll_ratetar", "pitch_ratetar",
-            "roll_cmd", "pitch_cmd", "range_raw", "airborne"]
+            "roll_cmd", "pitch_cmd", "range_raw", "range_valid", "airborne"]
     cols += [c for c in ("roll_stick", "pitch_stick") if c in d.dtype.names]
     a = {k: d[k][armed] for k in cols}
     t = (d["rx_ms"][armed] - d["rx_ms"][armed][0]) / 1000.0
@@ -372,15 +372,42 @@ def check_attitude(d, fs, hover_thr):
         print()
 
     # --- 離陸したか ---
+    #  ★ airborne フラグは使わない。AltHold::update() は !poshold で早期
+    #    return するので、ANGLE モードでは絶対に立たない。測距の生値で見る。
     print(f"  ARMED {armed.sum() / fs:.1f} 秒   "
           f"スロットル 最大 {a['thr'].max():.3f} / 平均 {a['thr'].mean():.3f}")
-    if a["airborne"].max() < 0.5:
-        print("  ★ 一度も離陸していません (airborne が立っていない)。")
-        if hover_thr > 0 and a["thr"].max() < hover_thr * 0.9:
-            print(f"     スロットル最大 {a['thr'].max():.2f} に対し "
-                  f"ホバー基準 ALT_HOVER_THR = {hover_thr:.2f}。推力が足りません。")
-            print("     地面近くで半端な推力のまま粘ると、片脚だけ荷重が抜けて")
-            print("     支点になり転がります。ホバー付近まで1秒以内で上げること。")
+    flew = (a["range_valid"] > 0.5) & (a["range_raw"] > 0.15)
+    if flew.sum() >= 3:
+        print(f"  離陸: 測距が {flew.sum()/fs:.1f} 秒間 0.15m 超   "
+              f"最高 {a['range_raw'][flew].max():.2f} m")
+    elif (a["range_valid"] > 0.5).sum() < 5:
+        print("  ★ 測距がほとんど有効でないので、離陸したかどうか判定できません。")
+        print("     (傾きが RANGE_TILT_LIMIT_DEG=25度 を超えると測距は無効になります)")
+    else:
+        print("  ★ 測距上、0.15m を超えて浮いた区間がありません。")
+
+    # --- ホバースロットルの実測 ---
+    #  ALT_HOVER_THR は「実飛行前に ANGLE ホバリングで実測して入れる」値。
+    #  未実測のまま POSHOLD に入ると、engage した瞬間にその値が出る。
+    #  2026-09-04 は 0.60 が入っていたが実測は 0.30 で、倍の指令になっていた。
+    if "range_raw" in a:
+        rv = (a["range_valid"] > 0.5) & (a["range_raw"] > 0.15)
+        lv = np.hypot(a["roll"], a["pitch"]) < 20.0
+        fly = rv & lv
+        if fly.sum() >= 4:
+            tt = (d["rx_ms"][armed] - d["rx_ms"][armed][0]) / 1000.0
+            dh = np.gradient(a["range_raw"], np.maximum(tt, 1e-6))
+            hov = fly & (np.abs(dh) < 0.3)        # 高度ほぼ一定
+            if hov.sum() >= 3:
+                thr_h = a["thr"][hov]
+                print(f"  ★ ホバースロットルの実測 ≒ {thr_h.mean():.3f} "
+                      f"(中央値 {np.median(thr_h):.3f}, {hov.sum()} サンプル)")
+                if hover_thr > 0 and abs(thr_h.mean() - hover_thr) > 0.08:
+                    print(f"     QuadConfig.h の ALT_HOVER_THR = {hover_thr:.2f} "
+                          f"とずれています。")
+                    print(f"     ★ POSHOLD に入った瞬間にこの値がそのまま出ます。")
+                    print(f"       実測値 ({thr_h.mean():.2f}) に直してから POSHOLD を試すこと。")
+                print()
 
     # --- 推力の問題か制御の問題かの切り分け ---
     #  「4発とも高い出力が出ていて、機体はほぼ水平で、それでも浮かない」
@@ -388,7 +415,8 @@ def check_attitude(d, fs, hover_thr):
     mavg = (a["m1"] + a["m2"] + a["m3"] + a["m4"]) / 4.0
     level = np.hypot(a["roll"], a["pitch"]) < 15.0
     hot = level & (mavg > 0.6)
-    if hot.sum() >= 2 and a["airborne"].max() < 0.5:
+    ever_flew = (((a["range_valid"] > 0.5) & (a["range_raw"] > 0.15)).sum() >= 3)
+    if hot.sum() >= 2 and not ever_flew:
         print(f"  ★ ほぼ水平 (傾き<15度) で 4発平均 {mavg[hot].mean():.2f} "
               f"(最大 {mavg[hot].max():.2f}) 出しているのに離陸していません。")
         print("     これは姿勢ゲインの問題ではありません。次を疑ってください:")
