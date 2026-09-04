@@ -136,8 +136,16 @@ namespace Gain {
 //   0.0020 なら上限に張り付き、フル権限で止めにかかる。
 //   「s5 に入ってすぐの頃のほうがよく飛んだ」という体感とも一致する
 //   (その頃の値が 0.0020)。
-constexpr float RATE_ROLL [3] = { 0.0020f, 0.0000f, 0.00004f };
-constexpr float RATE_PITCH[3] = { 0.0020f, 0.0000f, 0.00004f };
+// ★ 2026-09-04: ki を 0 -> 0.0020 に。
+//   重心のずれ・モーター取付角・プロペラの個体差は「一定のトルク外乱」。
+//   P だけのループは一定外乱を定常偏差でしか釣り合わせられない
+//   (角度ループも ki=0 なので、系全体に積分器が1つも無かった)。
+//   つまり「後ろに流れる」のを制御で消す手段が存在しなかった。
+//   それを消すのが I 項。ki = kp は積分時定数 1秒に相当する。
+//   ワインドアップ対策は既にある: integrate = (thr > I_ENABLE_THR) と
+//   RATE_I_LIMIT = 0.15 (出力の 15% で頭打ち)。
+constexpr float RATE_ROLL [3] = { 0.0020f, 0.0020f, 0.00004f };
+constexpr float RATE_PITCH[3] = { 0.0020f, 0.0020f, 0.00004f };
 
 // ★ ヨーの I項。P制御だけでは定常偏差が残る。
 //   機体には必ず一定のヨートルクが残っている:
@@ -1207,8 +1215,19 @@ static void handleSerial() {
         case 'k':
             stopAllMotors();
             Serial.println("CALIBRATE: 機体を水平に置いて動かさないでください");
+            // 成功したら EEPROM に保存され、次回起動時に自動で読み込まれる。
+            // 姿勢がおかしい / 動いている場合は採用せず理由を出す。
             if (S5::USE_MPU) mpu.recalibrate();
             resetControllers();
+            break;
+        case 'x':
+            // EEPROM の保存値を捨てて Config.h のハードコード値に戻す。
+            // ★ handleSerial は tolower() しているので大文字キーは使えない。
+            // ★ EEPROM はファーム書き込みでは消えないので、変な値を保存して
+            //   しまったときの唯一の逃げ道がこれ。
+            stopAllMotors();
+            if (S5::USE_MPU) mpu.clearCalibration();
+            Serial.println("INFO: 再起動すると Config.h の値に戻ります");
             break;
         case 'r':
             resetControllers();
@@ -1397,7 +1416,8 @@ static void printStatus(uint32_t dt_us) {
                       g_flow_acc_m_x,   g_flow_acc_m_y);
     }
 
-    Serial.println("\n[p]ゲイン [k]IMUキャリブ [r]PIDリセット [l]ログ [z]フロー積算ゼロ "
+    Serial.println("\n[p]ゲイン [k]IMUキャリブ(EEPROM保存) [x]キャリブ消去 [r]PIDリセット "
+                   "[l]ログ [z]フロー積算ゼロ "
                    "[h]フロー高度(手動) [g]高度ホールド切替 [i]I2Cスキャン [m]ドライラン切替");
 }
 

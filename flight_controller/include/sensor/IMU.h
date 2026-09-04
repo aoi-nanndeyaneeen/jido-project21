@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <Wire.h>
+#include <EEPROM.h>
 #include <MPU6050.h>
 #include <MadgwickAHRS.h>
 #include "Config.h"
@@ -11,6 +12,12 @@ private:
     //  傾き: 水平な床に置いたつもりでも脚の高さで数度は出るので 5度まで許す。
     //        それを超えたら「水平ではない」と見なして採用しない。
     //  ジャイロ振れ幅: 手で持っているとすぐ数 deg/s 動く。静止なら 1 未満。
+    //
+    //  ★ この機体は配線の都合で加速度センサを上下逆に載せている。水平時の
+    //    az は -1g になるのが正常。したがって「az が負なら裏返し」という
+    //    判定はできない。|az| が 1g 付近にあるか、で見る。
+    //    (2026-09-04 に az<0 を却下条件にしてしまい、正常な姿勢での 'k' が
+    //     通らなくなった。その修正)
     static constexpr float MAX_CAL_TILT_DEG  = 5.0f;
     static constexpr float MAX_CAL_GYRO_SPAN = 3.0f;
 
@@ -22,6 +29,60 @@ private:
 
 public:
     IMU(TwoWire *wire_i = &Wire) : mpu(0x68), wire(wire_i) {};
+
+    // ------------------------------------------------------------
+    //  キャリブレーション値の EEPROM 保存 / 読み出し
+    //
+    //  Config.h の s_*_bias は inline 変数 = RAM なので、これまで 'k' の
+    //  結果は電源を切ると消え、毎回ハードコード値に戻っていた。飛ばす直前に
+    //  必ず 'k' を押す運用が要るうえ、押し忘れても何も言われない。
+    //  ★ Teensy の EEPROM は flash エミュレーションなので書き換え回数に
+    //    限りがある。保存するのは 'k' が成功したときだけ。
+    // ------------------------------------------------------------
+    struct CalStore {
+        uint32_t magic;
+        float ax, ay, az, gx, gy, gz;
+        uint32_t sum;      // 単純なチェックサム (化けた値を読まないため)
+    };
+    static constexpr uint32_t CAL_MAGIC = 0x43414C32;  // "CAL2"
+    static constexpr int      CAL_ADDR  = 0;
+
+    static uint32_t calSum(const CalStore& c) {
+        const uint8_t* p = (const uint8_t*)&c;
+        uint32_t s = 0;
+        for (size_t i = 0; i < offsetof(CalStore, sum); ++i) s += p[i];
+        return s;
+    }
+
+    void saveCalibration() {
+        CalStore c{};
+        c.magic = CAL_MAGIC;
+        c.ax = Config::sensor::s_ax_bias;  c.ay = Config::sensor::s_ay_bias;
+        c.az = Config::sensor::s_az_bias;  c.gx = Config::sensor::s_gx_bias;
+        c.gy = Config::sensor::s_gy_bias;  c.gz = Config::sensor::s_gz_bias;
+        c.sum = calSum(c);
+        EEPROM.put(CAL_ADDR, c);
+        Serial.println("INFO: キャリブレーション値を EEPROM に保存しました (次回起動時に読み込みます)");
+    }
+
+    // 戻り値: 読み込めたら true
+    bool loadCalibration() {
+        CalStore c{};
+        EEPROM.get(CAL_ADDR, c);
+        if (c.magic != CAL_MAGIC || c.sum != calSum(c)) return false;
+        Config::sensor::s_ax_bias = c.ax;  Config::sensor::s_ay_bias = c.ay;
+        Config::sensor::s_az_bias = c.az;  Config::sensor::s_gx_bias = c.gx;
+        Config::sensor::s_gy_bias = c.gy;  Config::sensor::s_gz_bias = c.gz;
+        return true;
+    }
+
+    // EEPROM の保存値を捨てて Config.h のハードコード値へ戻す
+    void clearCalibration() {
+        CalStore c{};
+        EEPROM.put(CAL_ADDR, c);   // magic が壊れるので次回は読まれない
+        Serial.println("INFO: EEPROM のキャリブレーション値を消しました "
+                       "(次回起動から Config.h の値に戻ります)");
+    }
 
     void begin() {
         wire->begin();
@@ -36,6 +97,17 @@ public:
         wire->beginTransmission(0x68); wire->write(0x1A); wire->write(0x03); wire->endTransmission();
         
         filter.begin(Config::Timing::MAIN_Hz);
+
+        if (loadCalibration()) {
+            Serial.println("INFO: EEPROM のキャリブレーション値を読み込みました");
+        } else {
+            Serial.println("INFO: EEPROM に有効なキャリブレーション値がありません "
+                           "→ Config.h の値を使います ('k' で取り直してください)");
+        }
+        Serial.printf("INFO: Biases ax=%.4f ay=%.4f az=%.4f gx=%.4f gy=%.4f gz=%.4f\n",
+                      Config::sensor::s_ax_bias, Config::sensor::s_ay_bias,
+                      Config::sensor::s_az_bias, Config::sensor::s_gx_bias,
+                      Config::sensor::s_gy_bias, Config::sensor::s_gz_bias);
     }
 
     void update() {
@@ -137,6 +209,8 @@ public:
         //  水平に静止していれば必ず ax≈0, ay≈0, az≈+1, ジャイロの振れ幅も
         //  小さい。そうでなければ採用せず、元の値を残す。
         // ------------------------------------------------------------
+        // 重力ベクトルが Z 軸からどれだけ離れているか。センサの上下向きに
+        // 依存しないよう |az| で測る (上下逆マウントでも同じ式が使える)。
         const float tilt_deg = atan2f(sqrtf(m_ax * m_ax + m_ay * m_ay),
                                       fabsf(m_az)) * 57.2957795f;
         const float g_norm   = sqrtf(m_ax * m_ax + m_ay * m_ay + m_az * m_az);
@@ -144,8 +218,7 @@ public:
                                      max_gz - min_gz);
 
         const char* reason = nullptr;
-        if (m_az < 0.0f)                       reason = "機体が裏返っています (az が負)";
-        else if (g_norm < 0.85f || g_norm > 1.15f)
+        if (g_norm < 0.85f || g_norm > 1.15f)
                                                reason = "加速度の大きさが 1g から外れています (動いている / センサ異常)";
         else if (tilt_deg > MAX_CAL_TILT_DEG)  reason = "機体が傾いています";
         else if (g_span > MAX_CAL_GYRO_SPAN)   reason = "機体が動いています";
@@ -177,6 +250,8 @@ public:
         Config::sensor::s_gx_bias = m_gx;
         Config::sensor::s_gy_bias = m_gy;
         Config::sensor::s_gz_bias = m_gz;
+
+        saveCalibration();   // 電源を切っても残るように EEPROM へ
 
         filter.reset();
         filter.begin(Config::Timing::MAIN_Hz);
