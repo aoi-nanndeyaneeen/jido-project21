@@ -875,7 +875,29 @@ static void updateControl(float dt_s) {
     //  ホバースロットル±PID補正 (althold.throttle()) に差し替える。
     //  それ以外は従来どおり物理プロポのスロットルをそのまま使う。
     const float thr_stick = constrain(sbus.des[Ch::THR], 0.0f, 1.0f);
-    const float thr = althold.active() ? althold.throttle() : thr_stick;
+
+    // ★ POSHOLD で高度ホールドが engage していないときのスロットル上限。
+    //
+    //  2026-09-04 に見つかった穴: 地面に置いた状態では測距が RANGE_MIN_M
+    //  (0.03m) を割って 1秒で失探するため、POSHOLD に入れて離陸させようと
+    //  しても AltHold は NoRange のまま engage しない。その間 active() が
+    //  false なので、以前はスロットルがプロポの値のまま素通しだった。
+    //  POSHOLD ではスティックで姿勢を直せない (ang_tar は位置ループが出す)
+    //  ので、「姿勢を当てられないのに全開で上がれる」状態になっていた。
+    //  さらに測距が有効になった瞬間に ALT_HOVER_THR へ跳ぶ。
+    //
+    //  そこで、engage 前は「engage 後に自動制御が出せる上限」と同じところで
+    //  頭打ちにする。パイロットが自動制御より大きなスロットルを出せない。
+    //   ・地上から: 0.45 まで出せるので離陸はできる。5cm ほど浮けば測距が
+    //     有効になり、そこから通常の高度ホールドへ引き継がれる。
+    //   ・空中で ANGLE から切り替えた場合: ホバー付近なので頭打ちに当たらず、
+    //     測距を失っていても落ちない。
+    constexpr float POSHOLD_THR_CAP = Q::ALT_HOVER_THR + Q::ALT_THR_AUTH;
+
+    float thr;
+    if (althold.active())               thr = althold.throttle();
+    else if (g_mode == S5::MODE_POSHOLD) thr = constrain(thr_stick, 0.0f, POSHOLD_THR_CAP);
+    else                                 thr = thr_stick;
     const bool  integrate = (thr > S5::I_ENABLE_THR);
 
     // --- 測定値は上 (アーム判定の前) で入れてある ---
