@@ -72,7 +72,7 @@ constexpr int MOTOR_PWM_HZ = 400;   // (同上)
 //   出力[i] = throttle + roll*MIX_ROLL[i] + pitch*MIX_PITCH[i] + yaw*MIX_YAW[i]
 //
 //   roll +  (右バンク)  → 左側 (M1,M4) を上げ、右側 (M2,M3) を下げる
-//   pitch + (機首上げ)  → 後側 (M3,M4) を上げ、前側 (M1,M2) を下げる
+//   pitch + (機首上げ)  → 後側 (M3,M4) を下げ、前側 (M1,M2) を上げる
 //   yaw +   (右旋回)    → CCW 側 (M2,M4) を上げ、CW 側 (M1,M3) を下げる
 //
 //   ★ yaw の符号は「プロペラの回転方向」で決まります。
@@ -81,7 +81,7 @@ constexpr int MOTOR_PWM_HZ = 400;   // (同上)
 //
 //                                       M1     M2     M3     M4
 constexpr float MIX_ROLL [MOTOR_COUNT] = { +1.0f, -1.0f, -1.0f, +1.0f };
-constexpr float MIX_PITCH[MOTOR_COUNT] = { -1.0f, -1.0f, +1.0f, +1.0f };
+constexpr float MIX_PITCH[MOTOR_COUNT] = { +1.0f, +1.0f, -1.0f, -1.0f };
 constexpr float MIX_YAW  [MOTOR_COUNT] = { -1.0f, +1.0f, -1.0f, +1.0f };
 
 // + 配置に載せ替える場合はこちら (M1=前, M2=右, M3=後, M4=左) :
@@ -135,11 +135,11 @@ constexpr bool ATTITUDE_PRIORITY = true;
 constexpr bool  SWAP_XY    = false;  // IMU が機体に対して90度回って付いている場合 true
 
 constexpr float GYRO_SIGN_ROLL  = -1.0f;  // X軸まわり
-constexpr float GYRO_SIGN_PITCH = +1.0f;  // Y軸まわり (FLU の左 → FRD の右で反転)
+constexpr float GYRO_SIGN_PITCH = -1.0f;  // Y軸まわり (FLU の左 → FRD の右で反転)
 constexpr float GYRO_SIGN_YAW   = +1.0f;  // Z軸まわり (FLU の上 → FRD の下で反転)
 
 constexpr float ANG_SIGN_ROLL   = -1.0f;  // Madgwick の出力 [deg]
-constexpr float ANG_SIGN_PITCH  = +1.0f;
+constexpr float ANG_SIGN_PITCH  = -1.0f;
 constexpr float ANG_SIGN_YAW    = +1.0f;
 
 // ============================================================
@@ -270,6 +270,14 @@ constexpr float FLOW_VEL_D_ALPHA = 0.6f;
 constexpr float FLOW_POS_KP      = 1.0f;
 constexpr float FLOW_POS_VEL_LIM = 0.8f;    // 位置ループが出す目標速度の上限 [m/s]
 
+// 保持基準 (g_pos_hold) を「今の推定位置」へゆっくり緩和する時定数 [s]。
+//  これが無いと、フローのノイズや残留誤差が積分されて位置推定がズレたとき、
+//  ズレがどれだけ経っても消えず (積分にリークが無い)、静止していても
+//  目標リーン角が0に戻らなくなる。この時定数で「一度ズレた分は数秒で
+//  忘れる」ようにし、短時間のホバリングで実用になる範囲に収める。
+//  0 にするとリーク無し (旧挙動)。
+constexpr float FLOW_POS_HOLD_TAU_S = 6.0f;
+
 // スティック → 目標速度 [m/s] (全開で)
 constexpr float FLOW_STICK_VEL  = 1.0f;
 constexpr float FLOW_STICK_DEAD = 0.05f;    // これ以下は「手を離した」と判定
@@ -279,12 +287,12 @@ constexpr float FLOW_MAX_LEAN   = 8.0f;
 
 // 目標リーン角の符号。手で押して「押し返す」向きにならなければ反転する。
 //  vx(前進ドリフト) を止めるには機首上げ(pitch +)、vy(右ドリフト) を止めるには左バンク(roll -)。
-constexpr float FLOW_LEAN_SIGN_ROLL  = +1.0f;
-constexpr float FLOW_LEAN_SIGN_PITCH = -1.0f;
+constexpr float FLOW_LEAN_SIGN_ROLL  = -1.0f;
+constexpr float FLOW_LEAN_SIGN_PITCH = +1.0f;
 
 // スティックの符号 (プロポに合わせる)。ピッチを引いて機体が「後退」する向きが正。
 constexpr float FLOW_STICK_SIGN_X = -1.0f;  // pitch stick → 前後 目標速度
-constexpr float FLOW_STICK_SIGN_Y = +1.0f;  // roll  stick → 左右 目標速度
+constexpr float FLOW_STICK_SIGN_Y = -1.0f;  // roll  stick → 左右 目標速度
 
 // 制御に使う速度の LPF (0=なし, 1に近いほど強い)
 constexpr float FLOW_VEL_MEAS_ALPHA = 0.4f;
@@ -294,5 +302,133 @@ constexpr float FLOW_VEL_SANE = 3.0f;
 
 // このスロットル以上で「浮いている」とみなしフロー制御を有効化
 constexpr float FLOW_ENABLE_THR = 0.15f;
+
+// ============================================================
+//  § 7-3  距離センサ   ※ Stage 5 s5c で使用
+// ============================================================
+//  バックエンドを2種類から選べる (RANGE_BACKEND):
+//
+//   A) ToF_VL53L1X : I2C(Wire) ToF。IMU(MPU6050 @0x68) と同じバス共有。
+//        Teensy 4.0 の Wire ピン SDA=18 / SCL=19。アドレス 0x29 固定で
+//        MPU6050 と重ならないので XSHUT 不要。配線 4本:
+//          VIN→3V3   GND→GND   SDA→18   SCL→19
+//        (Teensy 4.0 は 5V 非対応。ブレークアウトのレギュレータ経由で 3V3)
+//
+//   B) Sonar_EZ    : MaxBotix LV-MaxSonar-EZ 超音波。PW(パルス幅)出力を
+//        割り込みで測る。I2C を使わないので ToF のバス問題を回避できる。
+//        配線 3本:
+//          +5 → 3V3   (LV版は 2.5〜5.5V 可。3V3 給電なら PW も 0〜3V3 で
+//                      Teensy に直結して安全。★5V 給電時は PW に分圧必須)
+//          GND → GND
+//          PW  → RANGE_SONAR_PW_PIN (下)   ※ TX/RX/AN/BW は未接続でよい
+//        注意: 最短 ~0.16m 以下は測れない / ~20Hz / ビーム広め /
+//              プロペラ後流・モーター音に弱い。真下向き・後流回避・防振。
+//
+//  【s5c でやること】プロペラを外し、drone_s5 を書き込んでシリアル表示を見る:
+//   1. 機体を手で持ち上げ下げ → [距離] の h[m] が実測とほぼ一致するか
+//      (定規で 0.3 / 0.5 / 1.0 m を実測して突き合わせる)
+//   2. ずれる場合は RANGE_OFFSET_M で平行移動を合わせる
+//      (センサレンズと機体最下端/フローレンズの高さ違いを吸収)
+//   3. 機体をゆっくり上下 → climb[m/s] の符号が「上昇で +」か確認
+//   4. その場で傾ける → RANGE_TILT_LIMIT_DEG を超えると h が凍結するのを確認
+
+// 使う測距バックエンド。ハードを載せ替えたらここだけ変える。
+enum class RangeBackend { ToF_VL53L1X, Sonar_EZ };
+constexpr RangeBackend RANGE_BACKEND = RangeBackend::Sonar_EZ;
+
+// --- Sonar_EZ (MaxBotix LV-MaxSonar-EZ) 専用 ---
+constexpr uint8_t  RANGE_SONAR_PW_PIN   = 23;     // PW 出力 → 空き割り込みピン
+constexpr float    RANGE_SONAR_ALPHA    = 0.35f;  // 生距離(EZ2側)の軽い1次LPF
+constexpr float    RANGE_SONAR_MIN_M    = 0.16f;  // これ以下は測れない(仕様)
+constexpr float    RANGE_SONAR_MAX_M    = 4.00f;  // LV-EZ の実用上限あたり
+constexpr uint32_t RANGE_SONAR_STALE_MS = 300;    // 新パルスがこの時間来なければ失探
+
+// 測距の1回あたり積分時間 [us]。長いほど精度↑/レート↓。
+//  Medium モードは 33ms 前後が下限。
+constexpr uint32_t RANGE_TIMING_BUDGET_US = 33000;
+// 連続測距の周期 [ms] (timing budget 以上にする)
+constexpr uint16_t RANGE_CONTINUOUS_MS    = 33;
+
+// 読み出しポーリングレート [Hz]。1000Hz メインから間引く。
+//  センサ側が ~30Hz なので、それより速く回して dataReady() で拾えばよい。
+constexpr int RANGE_LOOP_HZ = 50;
+static_assert(RATE_LOOP_HZ % RANGE_LOOP_HZ == 0,
+              "RANGE_LOOP_HZ は RATE_LOOP_HZ の約数にしてください");
+
+// 有効とみなす斜め距離のレンジ [m] (これ外は外れ値として捨てる)
+constexpr float RANGE_MIN_M = 0.03f;
+constexpr float RANGE_MAX_M = 3.5f;
+
+// 高度に足す平行移動オフセット [m] (センサレンズ → 基準高さ の差。上に付いていれば +)
+constexpr float RANGE_OFFSET_M = 0.00f;
+
+// この傾きを超えている間は測距点が横にずれるので高度を凍結する [deg]
+constexpr float RANGE_TILT_LIMIT_DEG = 25.0f;
+
+// 高度 LPF (0=なし, 1に近いほど強い) と、上昇速度(高度の微分)の LPF
+constexpr float RANGE_H_ALPHA  = 0.30f;
+constexpr float RANGE_VZ_ALPHA = 0.20f;
+
+// 外れ値がこの時間続いたら「失探」= valid() を false に落とす [ms]
+//  失探中は OpticalFlow は FLOW_ASSUMED_HEIGHT_M に自動フォールバック。
+constexpr uint32_t RANGE_FAULT_MS = 1000;
+
+// ============================================================
+//  § 7-4  s5c : 高度ホールド (スロットルPID)
+// ============================================================
+//  構造 (カスケード。位置ホールドと同じ考え方):
+//    高度誤差[m] ──[ALT_POS_KP]──► 目標上昇速度[m/s] ──[ALT_RATE PID]──►
+//        スロットル補正[割合] ──► (係留時に掴んだホバースロットル) + 補正
+//
+//  ★★ これまで「スロットルは全モード手動」が安全上の不変条件だった。
+//     s5c ではこのループを足す。実飛行では PC を繋げないので、ON/OFF は
+//     シリアル 'g' ではなく SW_AUTO スイッチで行う
+//     (drone_s5.cpp の S5::ALT_HOLD_ON_SW_AUTO = true)。
+//       SW_HOVER=up  → POSHOLD (水平ホールド)。ここまではスロットル手動。
+//       + SW_AUTO=up → 高度ホールドも ON。
+//       SW_AUTO=down → 高度だけ手動に戻る (水平ホールドは維持)。
+//       SW_HOVER=down→ ANGLE + 完全手動 (最終 bail-out)。
+//
+//  ★ ホバースロットルの基準:
+//     ALT_HOVER_THR (>0) にあらかじめ実測値を入れておく。これが
+//     基準スロットルになり、PID はそこから ±ALT_THR_AUTH だけ動かす。
+//     ALT_HOVER_THR = 0 のままだと高度ホールドは engage しない (安全)。
+//     ※ 実測方法: ANGLE で安定ホバリングさせ、そのときのスロットル
+//        スティック位置 (プロポの%) を読む。0.45〜0.55 が一般的。
+//
+//  ★ 保持高度: ALT_TARGET_M。0 なら「engage した瞬間の実測高度」。
+//     飛行中はスロットルスティックを基準から動かすと上昇/下降速度指令、
+//     戻すとその高度を保持する。
+
+// 外側 (位置): 高度誤差[m] → 目標上昇速度[m/s]。kp=1 なら 1m ずれで 1m/s。
+constexpr float ALT_POS_KP     = 2.0f;
+constexpr float ALT_POS_VZ_LIM = 0.4f;     // 位置ループが出す上昇速度の上限 [m/s]
+
+// 内側 (速度): (目標 - 実測 上昇速度[m/s]) → スロットル補正[割合]
+//  kp=0.25 なら「0.4 m/s ずれていたら +0.10 スロットル」
+constexpr float ALT_RATE_KP      = 0.25f;
+constexpr float ALT_RATE_KI      = 0.15f;   // ホバースロットルの誤差を吸収
+constexpr float ALT_RATE_KD      = 0.02f;
+constexpr float ALT_RATE_I_LIMIT = 0.15f;   // I項の上限 [割合]
+constexpr float ALT_RATE_D_ALPHA = 0.60f;
+
+// PID がホバースロットルから動かしてよい最大量 [割合]。
+//  ブリングアップ中は余裕を持って 0.30。挙動が信用できたら 0.20 に絞る。
+constexpr float ALT_THR_AUTH = 0.30f;
+
+// ホバースロットルの基準 [割合]。★実飛行前に ANGLE ホバリングで実測して入れる。
+//  0 のままだと高度ホールドは engage しない (SW_AUTO を上げても効かない)。
+constexpr float ALT_HOVER_THR = 0.0f;
+
+// 保持したい対地高度 [m]。0 = engage した瞬間の実測高度をそのまま目標にする。
+constexpr float ALT_TARGET_M  = 0.5f;
+
+// スロットルスティックを基準 (ALT_HOVER_THR) からこれだけ動かしたら「上昇/下降指令」 [割合]
+constexpr float ALT_STICK_DEAD = 0.08f;
+// スティック偏差 1.0 あたりの上昇速度指令 [m/s]
+constexpr float ALT_STICK_VZ   = 0.8f;
+
+// このスロットル以上で高度ホールドを有効化 (地上での暴走防止)
+constexpr float ALT_ENABLE_THR = 0.15f;
 
 } // namespace Quad

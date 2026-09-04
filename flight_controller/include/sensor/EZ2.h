@@ -8,6 +8,7 @@ private:
     uint8_t pin;
     volatile uint32_t pulse_start_us;
     volatile uint32_t last_pulse_duration_us;
+    volatile uint32_t pulse_seq;   // パルスが1個完了するたびに +1 (新サンプル検出用)
     float alpha;
     float smoothed_distance_cm;
     
@@ -22,6 +23,7 @@ private:
             uint32_t now = micros();
             if (now > instance->pulse_start_us) {
                 instance->last_pulse_duration_us = now - instance->pulse_start_us;
+                instance->pulse_seq++;
             }
         }
     }
@@ -30,6 +32,7 @@ public:
     EZ2Sensor(uint8_t pw_pin, float filter_alpha = 0.1) : pin(pw_pin), alpha(filter_alpha) {
         pulse_start_us = 0;
         last_pulse_duration_us = 0;
+        pulse_seq = 0;
         smoothed_distance_cm = 0.0;
         instance = this;
     }
@@ -62,6 +65,11 @@ public:
 
     float get_distance_cm() { return smoothed_distance_cm; }
     float get_distance_m() { return smoothed_distance_cm / 100.0f; }
+
+    // パルス完了ごとに増えるカウンタ。前回値と比べて新サンプル到着を判定する。
+    uint32_t seq() const { return pulse_seq; }
+    // 直近パルス幅 [us] (147us/inch)。0 = まだ1度も測っていない。
+    uint32_t raw_pulse_us() const { return last_pulse_duration_us; }
 };
 
 // 静的メンバの初期化
