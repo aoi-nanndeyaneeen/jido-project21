@@ -33,19 +33,30 @@ RE_MPU = re.compile(
 )
 RE_ALT = re.compile(r"Alt:\s*([+-]?\d+\.\d+)\s*m")
 
+VID_RP2040 = 0x2E8A
+
 def find_port():
     """RP2040らしいポートを自動検出"""
-    ports = serial.tools.list_ports.comports()
+    ports = list(serial.tools.list_ports.comports())
+
+    # 1. VID で判定する。説明文は Windows の表示言語で変わる (日本語だと
+    #    「USB シリアル デバイス」) ので、当てにしない。
+    for p in ports:
+        if p.vid == VID_RP2040:
+            return p.device
+
+    # 2. 説明文でのフォールバック (英語/日本語の両方を見る)
     for p in ports:
         desc = (p.description or "").lower()
-        if any(k in desc for k in ["xiao", "rp2040", "pico", "usb serial"]):
+        if any(k in desc for k in ["xiao", "rp2040", "pico", "usb serial", "usb シリアル"]):
             return p.device
-    # 見つからなければ一覧を出して最初を返す
-    if ports:
-        print("自動検出できませんでした。利用可能なポート:")
-        for p in ports:
-            print(f"  {p.device}  {p.description}")
-        return ports[0].device
+
+    # 3. 見つからないときに先頭を掴むと、Bluetooth の仮想COMを開いて
+    #    "semaphore timeout" でハングする。勝手に選ばず --port を促す。
+    print("自動検出できませんでした。--port COMx で指定してください。利用可能なポート:")
+    for p in ports:
+        vidpid = f"{p.vid:04X}:{p.pid:04X}" if p.vid is not None else "    -    "
+        print(f"  {p.device}  {vidpid}  {p.description}")
     return None
 
 def main():

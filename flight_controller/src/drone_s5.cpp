@@ -154,7 +154,11 @@ constexpr float RATE_PITCH[3] = { 0.0020f, 0.0020f, 0.00004f };
 //   これらは P では釣り合った角速度で回り続けるだけで、消えない。
 //   ki = kp は積分時定数 1秒に相当する。まずこの値で試し、
 //   戻りが遅ければ 0.005 まで上げてよい (上げすぎると 1Hz 前後で揺れる)。
-constexpr float RATE_YAW  [3] = { 0.0010f, 0.0000f, 0.00004f };
+// ★ 2026-09-05: kp を 0.0010 -> 0.0015 に。s5 立ち上げ時のコミット(s5d追加)で
+//   s4 の 0.0020 から無言で半分に落とされていた (理由の記載なし)。s4/s5 で
+//   ANGLE モードの挙動が違って感じるという指摘を受けて洗い出した差分の一つ。
+//   s4 と揃えて 0.0020 に戻す案もあったが、まずは中間の 0.0015 で様子を見る。
+constexpr float RATE_YAW  [3] = { 0.0015f, 0.0000f, 0.00004f };
 
 constexpr float RATE_D_ALPHA = 0.80f;
 constexpr float RATE_I_LIMIT = 0.15f;
@@ -187,8 +191,8 @@ constexpr float YAW_STICK_DEAD    = 0.03f;
 //  ★ 積分はレートループ (RATE_*) 側だけで持たせています。ここに ki を
 //    入れるとレートループの I項と干渉して低周波の揺れが出ます。0 のままに。
 //                               kp     ki    kd
-constexpr float ANG_ROLL [3] = { 4.0f, 0.0f, 0.0f };
-constexpr float ANG_PITCH[3] = { 4.0f, 0.0f, 0.0f };
+constexpr float ANG_ROLL [3] = { 20.0f, 0.0f, 0.0f };
+constexpr float ANG_PITCH[3] = { 20.0f, 0.0f, 0.0f };
 
 constexpr float ANG_D_ALPHA = 0.70f;
 // 角度ループの積分項の上限 [deg/s]
@@ -1256,7 +1260,7 @@ static void updateControl(float dt_s) {
         g_mode == S5::MODE_POSHOLD) {
 
         if (g_mode == S5::MODE_POSHOLD) {
-            // 目標角は updateFlowHold() が 50Hz で計算済み (すでにクランプ済み)。
+            // 目標角は updateFlowHold() が FLOW_LOOP_HZ で計算済み (すでにクランプ済み)。
             // スティックはそこで「目標速度」として使っている。
             roll_axis.ang_tar  = poshold.leanRoll();
             pitch_axis.ang_tar = poshold.leanPitch();

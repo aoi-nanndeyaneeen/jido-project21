@@ -239,7 +239,16 @@ constexpr float FLOW_ASSUMED_HEIGHT_M = 1.0f;
 //  カウントが増えて SNR が上がる (代わりに遅延が増える)。50Hz で 20ms 遅延。
 //  ※ Bitcraze ライブラリの readMotionCount は内部 delayMicroseconds で
 //    1回あたり ~1ms ブロックする。レートを下げるとその取りこぼしも減る。
-constexpr int FLOW_LOOP_HZ = 50;
+// ★ 2026-09-05: 50 -> 20 に下げた。実機ログ(log_006〜008)で実効ループレートが
+//   1000Hz 想定に対して 500〜634Hz まで落ちていた。原因は readMotionCount() が
+//   5回の registerRead (1回 ~200us の delayMicroseconds 込み) をメインループの
+//   中から同期的に呼んでおり、flow_tick が立つたびに ~1〜1.9ms 丸ごとブロック
+//   していたため (range_tick と重なると二重に詰まって最大6ms超も観測)。
+//   PID (特にレートループの D項/積分) は 1ms 周期を前提にチューニングされて
+//   いるため、この乱れは発振・飽和の原因にもなり得る。20Hz (50ms周期) にして
+//   ブロック頻度を1/2.5に減らす。位置ホールドは0.3〜2Hz帯の応答なので実用上は
+//   問題ない見込み。根本対応 (ライブラリの delayMicroseconds を削る) は別途検討。
+constexpr int FLOW_LOOP_HZ = 20;
 static_assert(RATE_LOOP_HZ % FLOW_LOOP_HZ == 0,
               "FLOW_LOOP_HZ は RATE_LOOP_HZ の約数にしてください");
 constexpr int FLOW_LOOP_DIV = RATE_LOOP_HZ / FLOW_LOOP_HZ;

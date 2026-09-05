@@ -77,13 +77,14 @@ def main():
     line_count = 0
 
     print("Teensy出力を受信中... (Ctrl+C で終了)")
-    print("コマンド: L=ログ開始/停止  R=キャリブ  P=スナップショット  Q=終了\n")
+    print("コマンド: L=ログ開始/停止  R=キャリブ  P=スナップショット")
+    print("         V=RamLogダンプ  Y=RamLog状態確認  Q=終了\n")
 
     # キーボード入力を別スレッドで受け付ける
     def keyboard_input():
         while True:
             cmd = input().strip().upper()
-            if cmd in ("L","R","P"):
+            if cmd in ("L","R","P","V","Y"):
                 ser.write((cmd+"\n").encode())
             elif cmd == "Q":
                 ser.write(b"L\n")  # ログ停止してから終了
