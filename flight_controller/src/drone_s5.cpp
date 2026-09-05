@@ -104,8 +104,8 @@ namespace Gain {
 
 // ---- レート (内側ループ) ----  Stage 3 で決めた値をここに写す
 //                        kp      ki      kd
-constexpr float RATE_ROLL [3] = { 0.0010f, 0.0f, 0.00004f };
-constexpr float RATE_PITCH[3] = { 0.0010f, 0.0f, 0.00004f };
+constexpr float RATE_ROLL [3] = { 0.0015f, 0.0f, 0.00004f };
+constexpr float RATE_PITCH[3] = { 0.0015f, 0.0f, 0.00004f };
 
 // ★ ヨーの I項。P制御だけでは定常偏差が残る。
 //   機体には必ず一定のヨートルクが残っている:
@@ -114,9 +114,9 @@ constexpr float RATE_PITCH[3] = { 0.0010f, 0.0f, 0.00004f };
 //   これらは P では釣り合った角速度で回り続けるだけで、消えない。
 //   ki = kp は積分時定数 1秒に相当する。まずこの値で試し、
 //   戻りが遅ければ 0.005 まで上げてよい (上げすぎると 1Hz 前後で揺れる)。
-constexpr float RATE_YAW  [3] = { 0.0010f, 0.0000f, 0.00004f     };
+constexpr float RATE_YAW  [3] = { 0.0015f, 0.0000f, 0.00004f     };
 
-constexpr float RATE_D_ALPHA = 0.80f;
+constexpr float RATE_D_ALPHA = 0.70f;
 constexpr float RATE_I_LIMIT = 0.15f;
 
 // ---- ヘディングホールド (ヨー) ----
@@ -145,8 +145,8 @@ constexpr float YAW_STICK_DEAD    = 0.03f;
 //  出力の単位は [deg/s] です。kp = 4.0 なら「10度傾いていたら 40deg/s で戻す」。
 //  まず kp だけで調整し、ki / kd は基本 0 のままで構いません。
 //                         kp     ki    kd
-constexpr float ANG_ROLL [3] = { 4.0f, 0.0f, 0.0f };
-constexpr float ANG_PITCH[3] = { 4.0f, 0.0f, 0.0f };
+constexpr float ANG_ROLL [3] = { 6.0f, 0.0f, 0.0f };
+constexpr float ANG_PITCH[3] = { 6.0f, 0.0f, 0.0f };
 
 constexpr float ANG_D_ALPHA = 0.70f;
 // 角度ループの積分項の上限 [deg/s]
