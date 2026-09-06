@@ -22,6 +22,9 @@ PROJECT_DIR = SRC_DIR.parent.parent
 # ラズパイの mjpg-streamer などのネットワークストリームURLを指定します。
 # ローカルのUSBカメラIDを直接指定することも可能です（例: 0, 1）。
 CAMERA_1_URL = 1                    # ラップトップUSBカメラ
+# Camera2の接続先。通常はRPI、LaptopへUSB直結する一時運用ではUSBにする。
+CAMERA2_SOURCE = "USB"             # "USB" または "RPI"
+CAMERA_2_URL = 2                    # USB時のCamera2デバイス番号
 RPI_HOST     = "192.168.11.13"      # ラズパイIP
 RPI_PORT     = 5555  # カメラ2 (ラズパイ接続)
 
@@ -63,8 +66,12 @@ SERIAL_BAUD    = 115200
 #   y = 奥行方向 (-FIELD_D/2 〜 +FIELD_D/2)
 #   z = 高さ（上が正）
 # カメラ2台は手前側 (y = -FIELD_D/2 の辺) の2隅に設置する。
-FIELD_W = 26.0   # 幅   [m]
-FIELD_D = 42.0   # 奥行 [m]
+FIELD_PROFILE = "small"            # "small" または "large"
+FIELD_PROFILES = {
+    "small": (1.4, 1.4),           # 一時運用: 1.4m x 1.4m
+    "large": (26.0, 42.0),         # 通常運用: 26m x 42m
+}
+FIELD_W, FIELD_D = FIELD_PROFILES[FIELD_PROFILE]
 
 _HW = FIELD_W / 2.0   # 13.0
 _HD = FIELD_D / 2.0   # 21.0
@@ -84,10 +91,10 @@ _HD = FIELD_D / 2.0   # 21.0
 #   ・目印になる垂直構造物（ネット支柱・ゴールポスト・壁のライン）に合わせるか、
 #     既知の長さの棒を立てること。空中の何もない点をクリックしてはいけない。
 #   ・棒は「遠い隅」より「近い隅」に立てた方が精度が出る。
-#     2mの棒は45m先だと画面上わずか46px、15m先なら138px。3倍の分解能差。
+#     高さ点は実際に測れる高さの棒を使うこと。
 #     近い隅が画角に入るなら CALIB_POLE_AT_NEAR = True にする。
 
-CALIB_POLE_H       = 2.0     # 5点目の高さ [m]（持ち込む棒の長さに合わせる）
+CALIB_POLE_H       = 0.2     # 参考値。実際の5点目のz座標に合わせる。
 CALIB_POLE_AT_NEAR = False   # True: 手前左(1番)の真上 / False: 奥左(4番)の真上
 
 
@@ -123,14 +130,32 @@ CALIB_PRESETS = {
         [ 13.0, -21.0, 0.0],
         [ 13.0,  21.0, 0.0],
         [-13.0,  21.0, 0.0],
-        [-13.0,  21.0, 2.0],
+        [-13.0,  21.0, 0.2],
     ], dtype=np.float32),
 }
 
-# ★ 当日はここだけ書き換える
-CALIB_PRESET = "corners"
+# ★ 5点の座標は、使用するプロファイルのリストを直接編集する。
+#    順序: 手前左, 手前右, 奥右, 奥左, 高さ点
+FIELD_POINT_COORDS = {
+    "small": [
+        [-0.7, -0.7, 0.0],
+        [ 0.7, -0.7, 0.0],
+        [ 0.7,  0.7, 0.0],
+        [-0.7,  0.7, 0.0],
+        [-0.7,  0.7, 0.2],
+    ],
+    "large": [
+        [-13.0, -21.0, 0.0],
+        [ 13.0, -21.0, 0.0],
+        [ 13.0,  21.0, 0.0],
+        [-13.0,  21.0, 0.0],
+        [-13.0,  21.0, 2.0],
+    ],
+}
 
-FIELD_POINTS = CALIB_PRESETS[CALIB_PRESET]
+CALIB_PRESET = f"{FIELD_PROFILE}_coordinates"
+
+FIELD_POINTS = np.array(FIELD_POINT_COORDS[FIELD_PROFILE], dtype=np.float32)
 
 # クリック時に画面へ表示するラベル（順序ミスを防ぐ）
 CALIB_POINT_LABELS = [
@@ -313,8 +338,9 @@ DUMMY_ORBIT_PERIOD    = 10.0  # 1周の時間 [s]
 # ==========================================
 # 3D表示の固定範囲（フィールド寸法に追従）
 # ==========================================
-VIEW_X = (-_HW - 2.0, _HW + 2.0)
-VIEW_Y = (-_HD - 2.0, _HD + 2.0)
+VIEW_MARGIN_M = max(0.2, min(FIELD_W, FIELD_D) * 0.08)
+VIEW_X = (-_HW - VIEW_MARGIN_M, _HW + VIEW_MARGIN_M)
+VIEW_Y = (-_HD - VIEW_MARGIN_M, _HD + VIEW_MARGIN_M)
 VIEW_Z = (  0.0, 12.0)
 
 # ==========================================

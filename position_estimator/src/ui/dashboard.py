@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 from ui.view_graph import ViewGraph
-from utils.config import DISP_W, DISP_H, VELOCITY_W, VELOCITY_H
 
 
 class Dashboard:
@@ -9,8 +8,7 @@ class Dashboard:
         self.view_graph = ViewGraph()
         cv2.namedWindow("Graph", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Graph", 600, 600)
-        # Velocityウィンドウの右隣、カメラウィンドウの下段に配置
-        cv2.moveWindow("Graph", VELOCITY_W + 20, DISP_H + 40)
+        cv2.moveWindow("Graph", 0, 0)
         # 初回imshowで即座に応答可能にする
         cv2.imshow("Graph", np.zeros((600, 600, 3), dtype=np.uint8))
 

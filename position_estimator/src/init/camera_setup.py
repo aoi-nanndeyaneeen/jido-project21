@@ -8,7 +8,8 @@ Camera2の本接続はキャリブレーション完了後に calibration_flow.p
 import socket
 from core.camera import CameraTracker
 from core.geometry import approx_camera_matrix
-from utils.config import (CAMERA_1_URL, CAMERA_W, CAMERA_H, RPI_HOST, RPI_PORT,
+from utils.config import (CAMERA_1_URL, CAMERA_2_URL, CAMERA2_SOURCE,
+                          CAMERA_W, CAMERA_H, RPI_HOST, RPI_PORT,
                           FALLBACK_HFOV_DEFAULT)
 
 
@@ -55,6 +56,16 @@ def init_cameras():
     ret, test_frame = cam1.cap.read()
     if not ret or test_frame is None:
         print("  [WARN] Camera1 映像取得失敗。ダミーモードで続行します。")
+
+    if CAMERA2_SOURCE == "USB":
+        print(f"  [INFO] Camera2 (USB): デバイス番号 {CAMERA_2_URL}")
+        cam2 = CameraTracker(CAMERA_2_URL, width=CAMERA_W, height=CAMERA_H,
+                             label="Camera2")
+        ret, test_frame = cam2.cap.read()
+        cam2_ok_rpi = bool(ret and test_frame is not None)
+        if not cam2_ok_rpi:
+            print("  [WARN] Camera2 USB映像取得失敗。ダミーモードで続行します。")
+        return cam1, cam2_ok_rpi, cam2
 
     cam2_ok_rpi = True
     print("  [INFO] Camera2 (RPi): キャリブレーション時に接続確認します")

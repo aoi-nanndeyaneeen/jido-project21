@@ -18,7 +18,7 @@ from pathlib import Path
 
 from core.geometry     import intersect_rays
 from core.dummy_flight import DummyFlight
-from utils.logger      import FlightLogger
+from utils.logger      import FlightLogger, PerformanceLogger
 from utils.config      import (MAX_RESIDUAL_M,
                                 DUMMY_FALLBACK_FRAMES,
                                 DUMMY_ORBIT_RADIUS,
@@ -87,6 +87,7 @@ def camera_thread_func(cam1, cam2,
     O2_fixed = calib2.origin
 
     log   = FlightLogger(log_path)
+    perf_log = PerformanceLogger(log_path.with_name(log_path.stem + "_perf.csv"))
     dummy = DummyFlight(DUMMY_ORBIT_RADIUS, DUMMY_ORBIT_ALT, DUMMY_ORBIT_PERIOD)
 
     jf1 = PixelJumpFilter(PIXEL_SPEED_LIMIT_PX_S, JUMP_RECOVERY_FRAMES)
@@ -95,15 +96,25 @@ def camera_thread_func(cam1, cam2,
     no_detect_count = 0
     in_dummy_mode   = False
     frame_count     = 0
+    perf_print_time = time.time()
 
     print(f"[Tracker] 開始 - ログ: {log_path}")
+    for camera in (cam1, cam2):
+        start_reader = getattr(camera, "start_latest_reader", None)
+        if start_reader is not None:
+            start_reader()
 
     try:
         while not shared.get("quit", False):
             try:
+                loop_start = time.perf_counter()
                 # ── 両カメラからフレームを取得 ──────────────────
+                cam1_start = time.perf_counter()
                 frame1, uv1_raw = cam1.read_and_track()
+                cam1_ms = (time.perf_counter() - cam1_start) * 1000.0
+                cam2_start = time.perf_counter()
                 frame2, uv2_raw = cam2.read_and_track()
+                cam2_ms = (time.perf_counter() - cam2_start) * 1000.0
 
                 if frame1 is None:
                     frame1 = np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -240,6 +251,32 @@ def camera_thread_func(cam1, cam2,
                     plot_data["frame2"]    = frame2.copy() if frame2 is not None else None
                     plot_data["updated"]   = True
 
+                stats1 = getattr(cam1, "get_performance_stats", lambda: {})()
+                stats2 = getattr(cam2, "get_performance_stats", lambda: {})()
+                perf_values = {
+                    "Loop_ms": (time.perf_counter() - loop_start) * 1000.0,
+                    "Cam1_ms": cam1_ms,
+                    "Cam2_ms": cam2_ms,
+                    "FrameAge1_ms": stats1.get("process_last_age_ms", 0.0),
+                    "FrameAge2_ms": stats2.get("process_last_age_ms", 0.0),
+                    "ReaderFPS1": stats1.get("reader_fps", 0.0),
+                    "ReaderFPS2": stats2.get("reader_fps", 0.0),
+                    "ReaderMs1": stats1.get("reader_avg_ms", 0.0),
+                    "ReaderMs2": stats2.get("reader_avg_ms", 0.0),
+                    "ReadErrors1": stats1.get("reader_errors", 0.0),
+                    "ReadErrors2": stats2.get("reader_errors", 0.0),
+                }
+                perf_log.write("tracker", perf_values)
+                if time.time() - perf_print_time >= 2.0:
+                    print("[PERF] tracker "
+                          f"loop={perf_values['Loop_ms']:.1f}ms "
+                          f"cam1={cam1_ms:.1f}ms cam2={cam2_ms:.1f}ms "
+                          f"age=({perf_values['FrameAge1_ms']:.1f},"
+                          f"{perf_values['FrameAge2_ms']:.1f})ms "
+                          f"reader=({perf_values['ReaderFPS1']:.1f},"
+                          f"{perf_values['ReaderFPS2']:.1f})fps")
+                    perf_print_time = time.time()
+
             except Exception:
                 # 1フレームの例外でスレッド全体を落とさない
                 print("[Tracker] フレーム処理中に例外発生（継続します）:")
@@ -249,5 +286,6 @@ def camera_thread_func(cam1, cam2,
     finally:
         print(f"[Tracker] 終了 - 合計{frame_count}フレーム処理")
         log.close()
+        perf_log.close()
         cam1.release()
         cam2.release()

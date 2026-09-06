@@ -20,7 +20,7 @@ from utils.config import (FIELD_POINTS, CALIB_POINT_LABELS, CALIB_PRESET,
                           DISP_W, DISP_H, RPI_HOST, RPI_PORT,
                           REPROJ_WARN_PX, REPROJ_FAIL_PX,
                           TRIANG_WARN_M, TRIANG_FAIL_M,
-                          LOCK_EXPOSURE_AFTER_CALIB)
+                          LOCK_EXPOSURE_AFTER_CALIB, CAMERA2_SOURCE)
 from core.remote_camera import RemoteCamera
 from core.geometry import (CameraCalib, solve_extrinsics, reprojection_error,
                            get_ray, intersect_rays)
@@ -178,6 +178,7 @@ def run_calibration_single(cam, cam_label: str):
     window_name = f"Calibration: {cam_label}"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, DISP_W, DISP_H)
+    cv2.moveWindow(window_name, 0, 0)
 
     def on_mouse(event, x, y, flags, param):
         state["mouse"] = (x, y)
@@ -387,7 +388,12 @@ def run_calibration_phase(cam1, cam1_ok: bool, cam2_ok_rpi: bool, cam2_stub):
 
     # ── Camera2 ──────────────────────────────────────────────
     cam2 = cam2_stub
-    if cam2_ok_rpi and ask_use_saved("Camera2"):
+    if CAMERA2_SOURCE == "USB" and cam2_ok_rpi:
+        print("\n  ─── Camera2 (USB) キャリブレーション ───")
+        K2, dist2, R2, tvec2, pts2, reproj2 = run_calibration_single(cam2, "Camera2")
+    elif CAMERA2_SOURCE == "USB":
+        K2, dist2, R2, tvec2 = _dummy_calib("Camera2", [8, -8, 2])
+    elif cam2_ok_rpi and ask_use_saved("Camera2"):
         saved = load_calibration("Camera2")
         K2, dist2, R2, tvec2 = saved["K"], saved["dist"], saved["R"], saved["tvec"]
         pts2 = saved.get("points")

@@ -20,6 +20,7 @@ from core.controller import AltitudeController
 from core.geometry import accel_to_angles
 from core.yaw_estimator import YawEstimator
 from core.autopilot import SquarePatrol, HoverHold, WaypointMission, RCCommand
+from utils.logger import PerformanceLogger
 from ui.dashboard import Dashboard
 from ui.view_velocity import ViewVelocity
 from ui.view_rc import ViewRC
@@ -72,7 +73,7 @@ def run_main_loop(cam1, cam2,
 
     cv2.namedWindow("Camera 2", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Camera 2", DISP_W, DISP_H)
-    cv2.moveWindow("Camera 2", DISP_W + 10, 0)
+    cv2.moveWindow("Camera 2", 0, 0)
 
     # ── ターミナルフォーカス時のキー入力スレッド ────────────
     def keyboard_thread():
@@ -105,6 +106,9 @@ def run_main_loop(cam1, cam2,
               log_path, shared, plot_lock, plot_data),
         daemon=True)
     cam_thread.start()
+    display_perf_log = PerformanceLogger(
+        log_path.with_name(log_path.stem + "_display_perf.csv")
+    )
 
     # ── 各ビュー初期化 ──────────────────────────────────────
     dashboard      = Dashboard(field_points)
@@ -118,12 +122,12 @@ def run_main_loop(cam1, cam2,
     cv2.imshow("RC Command", np.zeros((ViewRC.H, ViewRC.W, 3), dtype=np.uint8))
     cv2.waitKey(1)
     cv2.resizeWindow("RC Command", ViewRC.W, ViewRC.H)
-    cv2.moveWindow("RC Command", VELOCITY_W + 640, DISP_H + 40)
+    cv2.moveWindow("RC Command", 0, 0)
     cv2.waitKey(1)
 
     cv2.namedWindow("Velocity", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Velocity", VELOCITY_W, VELOCITY_H)
-    cv2.moveWindow("Velocity", 0, DISP_H + 40)
+    cv2.moveWindow("Velocity", 0, 0)
 
     _pos_hist = deque(maxlen=6)
     _last_cmd = RCCommand()
@@ -131,6 +135,7 @@ def run_main_loop(cam1, cam2,
 
     last_mpl_render = 0.0
     MPL_RENDER_HZ   = 5
+    display_perf_time = time.time()
 
     # ── メインループ ──────────────────────────────────────
     while not shared.get("quit", False):
@@ -157,6 +162,7 @@ def run_main_loop(cam1, cam2,
                     yaw_est.add_body_dv(t_ms, dvx, dvy, t_recv, body_yaw)
 
         if updated:
+            display_loop_start = time.perf_counter()
             with plot_lock:
                 f1 = plot_data.get("frame1")
                 f2 = plot_data.get("frame2")
@@ -231,11 +237,15 @@ def run_main_loop(cam1, cam2,
                         # 機体側は valid=0 を完全に無視すること
                         alt_sensor.send_yaw(YAW_INITIAL_ALIGN_DEG, False)
 
+            rc_start = time.perf_counter()
             rc_img = view_rc.get_image(_last_cmd)
             cv2.imshow("RC Command", rc_img)
+            rc_ms = (time.perf_counter() - rc_start) * 1000.0
 
             # ── matplotlib系（レート制限） ──────────────────
             now = time.time()
+            velocity_ms = 0.0
+            graph_ms = 0.0
             if now - last_mpl_render > 1.0 / MPL_RENDER_HZ:
                 last_mpl_render = now
 
@@ -244,12 +254,30 @@ def run_main_loop(cam1, cam2,
                 if imu_available:
                     roll_deg, pitch_deg = accel_to_angles(alt_sensor.get_accel())
 
+                velocity_start = time.perf_counter()
                 vel_img = velocity_view.get_image(P, roll_deg, pitch_deg, imu_available)
                 cv2.imshow("Velocity", vel_img)
+                velocity_ms = (time.perf_counter() - velocity_start) * 1000.0
 
                 if O1 is not None:
                     target_alt = controller.get_target()
+                    graph_start = time.perf_counter()
                     dashboard.render_and_show(P, current_z, target_alt)
+                    graph_ms = (time.perf_counter() - graph_start) * 1000.0
+
+            display_values = {
+                "Display_ms": (time.perf_counter() - display_loop_start) * 1000.0,
+                "RC_ms": rc_ms,
+                "Velocity_ms": velocity_ms,
+                "Graph_ms": graph_ms,
+            }
+            display_perf_log.write("display", display_values)
+            if time.time() - display_perf_time >= 2.0:
+                print("[PERF] display "
+                      f"total={display_values['Display_ms']:.1f}ms "
+                      f"rc={rc_ms:.1f}ms velocity={velocity_ms:.1f}ms "
+                      f"graph={graph_ms:.1f}ms")
+                display_perf_time = time.time()
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -272,6 +300,7 @@ def run_main_loop(cam1, cam2,
         alt_sensor.stop()
     dashboard.close()
     velocity_view.close()
+    display_perf_log.close()
     cv2.destroyAllWindows()
     for _ in range(10):
         cv2.waitKey(1)

@@ -1,82 +1,99 @@
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import numpy as np
 import cv2
+import numpy as np
 import time
 from collections import deque
 
+from utils.config import VIEW_X, VIEW_Y, VIEW_Z
+
+
 class ViewGraph:
+    W, H = 600, 600
+
     def __init__(self):
-        self.fig, (self.ax_z, self.ax_xy) = plt.subplots(2, 1, figsize=(6, 6), dpi=100)
-        
-        # ★ ZとXYの履歴を別々に管理する
-        self.history_z = deque()  # (time, z, target_z) を保存
-        self.history_xy = deque() # (time, x, y) を保存
-        
+        self.history_z = deque()
+        self.history_xy = deque()
         self.window_sec = 10.0
-        self.fig.tight_layout(pad=2.0)
 
     def get_image(self, P, current_z, target_alt):
         now = time.time()
-        
-        # ★ Z と Target_Z は【常に】記録する
         self.history_z.append((now, current_z, target_alt))
-        
-        # ★ X, Y は【検知した時だけ】記録する
         if P is not None:
-            self.history_xy.append((now, P[0], P[1]))
-        
-        # 10秒以上古いデータを削除
+            self.history_xy.append((now, float(P[0]), float(P[1])))
         while self.history_z and now - self.history_z[0][0] > self.window_sec:
             self.history_z.popleft()
         while self.history_xy and now - self.history_xy[0][0] > self.window_sec:
             self.history_xy.popleft()
 
-        self.ax_z.cla()
-        self.ax_xy.cla()
+        image = np.full((self.H, self.W, 3), 255, dtype=np.uint8)
+        # 水平位置は X/Y を同じスケールで見たいので、フィールド全体が入る対称レンジにする
+        xy_limit = max(abs(VIEW_X[0]), abs(VIEW_X[1]), abs(VIEW_Y[0]), abs(VIEW_Y[1]))
+        self._draw_plot(
+            image, (58, 40, 572, 270), list(self.history_z), now,
+            VIEW_Z[0], VIEW_Z[1], "m",
+            [(1, "Altitude", (220, 70, 40)), (2, "Target", (40, 40, 210))],
+            "Altitude Z",
+        )
+        self._draw_plot(
+            image, (58, 328, 572, 558), list(self.history_xy), now,
+            -xy_limit, xy_limit, "m",
+            [(1, "X", (40, 70, 220)), (2, "Y", (40, 160, 70))],
+            "Horizontal Position X / Y",
+        )
+        return image
 
-        # --- 上段: 高度(Z)グラフの描画 ---
-        if self.history_z:
-            times_z = [d[0] - now for d in self.history_z]
-            zs = [d[1] for d in self.history_z]
-            targets = [d[2] for d in self.history_z]
+    def _draw_plot(self, image, rect, values, now, y_min, y_max, unit, series, title):
+        left, top, right, bottom = rect
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.rectangle(image, (left, top), (right, bottom), (250, 250, 250), -1)
+        cv2.rectangle(image, (left, top), (right, bottom), (100, 100, 100), 1)
 
-            self.ax_z.set_ylim(0, 15)
-            self.ax_z.set_xlim(-self.window_sec, 0)
-            self.ax_z.plot(times_z, zs, color='blue', label='Current Alt(m)')
-            self.ax_z.plot(times_z, targets, color='red', linestyle='--', label='Target Alt(m)')
-            self.ax_z.set_title("Altitude (Z)", fontsize=10)
-            self.ax_z.legend(loc='upper right', fontsize=8)
-            self.ax_z.grid(True)
-        else:
-            self.ax_z.set_xlim(-self.window_sec, 0)
-            self.ax_z.grid(True)
+        # 横グリッド + Y軸目盛り（値）
+        rows = 5
+        for i in range(rows + 1):
+            y = int(top + i * (bottom - top) / rows)
+            if 0 < i < rows:
+                cv2.line(image, (left, y), (right, y), (225, 225, 225), 1)
+            val = y_max - i * (y_max - y_min) / rows
+            cv2.putText(image, f"{val:.1f}", (4, y + 4), font, 0.38, (90, 90, 90), 1)
 
-        # --- 下段: 水平(X, Y)グラフの描画 ---
-        if self.history_xy:
-            times_xy = [d[0] - now for d in self.history_xy]
-            xs = [d[1] for d in self.history_xy]
-            ys = [d[2] for d in self.history_xy]
+        # 縦グリッド + X軸目盛り（時間 [s]、右端が現在）
+        cols = 5
+        for i in range(cols + 1):
+            x = int(left + i * (right - left) / cols)
+            if 0 < i < cols:
+                cv2.line(image, (x, top), (x, bottom), (235, 235, 235), 1)
+            t_label = -self.window_sec + i * self.window_sec / cols
+            cv2.putText(image, f"{t_label:+.0f}", (x - 10, bottom + 15), font, 0.38, (90, 90, 90), 1)
+        cv2.putText(image, "time [s]", (int((left + right) / 2) - 28, bottom + 28), font, 0.4, (90, 90, 90), 1)
 
-            self.ax_xy.set_ylim(-10, 10)
-            self.ax_xy.set_xlim(-self.window_sec, 0)
-            self.ax_xy.plot(times_xy, xs, color='tab:red', label='X (m)')
-            self.ax_xy.plot(times_xy, ys, color='tab:green', label='Y (m)')
-            self.ax_xy.set_title("Horizontal Position (X, Y)", fontsize=10)
-            self.ax_xy.legend(loc='upper right', fontsize=8)
-            self.ax_xy.grid(True)
-        else:
-            self.ax_xy.set_xlim(-self.window_sec, 0)
-            self.ax_xy.grid(True)
+        # タイトル（単位つき）
+        cv2.putText(image, f"{title} [{unit}]", (left, top - 12), font, 0.55, (35, 35, 35), 1)
 
-        return self._to_opencv_image()
+        # 凡例 + 現在値
+        legend_y = top + 16
+        for value_index, name, color in series:
+            cv2.line(image, (left + 8, legend_y - 4), (left + 30, legend_y - 4), color, 2, cv2.LINE_AA)
+            latest = values[-1][value_index] if values else None
+            text = name if latest is None else f"{name}: {latest:+.2f} {unit}"
+            cv2.putText(image, text, (left + 38, legend_y), font, 0.42, (60, 60, 60), 1)
+            legend_y += 18
 
-    def _to_opencv_image(self):
-        self.fig.tight_layout()
-        self.fig.canvas.draw()
-        img = np.asarray(self.fig.canvas.buffer_rgba())
-        return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        if not values:
+            cv2.putText(image, "no data", (int((left + right) / 2) - 28, int((top + bottom) / 2)),
+                        font, 0.5, (150, 150, 150), 1)
+            return
+
+        def point(timestamp, value):
+            age = max(0.0, min(self.window_sec, now - timestamp))
+            x = right - int(age / self.window_sec * (right - left))
+            ratio = (value - y_min) / max(y_max - y_min, 1e-6)
+            y = bottom - int(np.clip(ratio, 0.0, 1.0) * (bottom - top))
+            return x, y
+
+        for value_index, _name, color in series:
+            points = [point(row[0], row[value_index]) for row in values]
+            if len(points) > 1:
+                cv2.polylines(image, [np.array(points, dtype=np.int32)], False, color, 2, cv2.LINE_AA)
 
     def close(self):
-        plt.close(self.fig)
+        pass

@@ -40,3 +40,19 @@ class FlightLogger(CsvLogger):
             self._writer.writerow([t, 0, "", "", round(current_z, 3),
                 round(residual, 3), int(cam1_detected), int(cam2_detected), int(jump_rejected)])
         self._fh.flush()
+
+
+class PerformanceLogger(CsvLogger):
+    HEADER = ["Time", "Kind", "Loop_ms", "Cam1_ms", "Cam2_ms",
+              "FrameAge1_ms", "FrameAge2_ms", "ReaderFPS1", "ReaderFPS2",
+              "ReaderMs1", "ReaderMs2", "ReadErrors1", "ReadErrors2",
+              "Display_ms", "RC_ms", "Velocity_ms", "Graph_ms"]
+
+    def __init__(self, log_path: Path):
+        super().__init__(log_path, self.HEADER, mode="w")
+
+    def write(self, kind, values):
+        row = [datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3], kind]
+        row.extend(round(values.get(name, 0.0), 3) for name in self.HEADER[2:])
+        self._writer.writerow(row)
+        self._fh.flush()

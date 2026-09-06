@@ -8,6 +8,7 @@ core/camera.py
 """
 
 import time
+import threading
 from typing import NamedTuple
 
 import cv2
@@ -45,7 +46,7 @@ class CameraTracker:
         self.camera_url = camera_url
 
         if isinstance(camera_url, int):
-            self.cap = cv2.VideoCapture(camera_url, cv2.CAP_DSHOW)
+            self.cap = self._open_local_camera(camera_url)
             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
@@ -84,6 +85,47 @@ class CameraTracker:
         self.last_frame_time = 0.0
         self.last_candidates = []
         self.vibration_rejected = False
+        self._latest_lock = threading.Lock()
+        self._latest_frame = None
+        self._latest_frame_time = 0.0
+        self._reader_stop = threading.Event()
+        self._reader_thread = None
+        self._latest_reader_started = False
+        self._perf = {
+            "reader_reads": 0,
+            "reader_errors": 0,
+            "reader_read_ms_total": 0.0,
+            "reader_last_ms": 0.0,
+            "reader_start_time": 0.0,
+            "reader_last_frame_time": 0.0,
+            "reader_seq": 0,
+            "process_count": 0,
+            "process_ms_total": 0.0,
+            "process_last_ms": 0.0,
+            "process_last_copy_ms": 0.0,
+            "process_last_age_ms": 0.0,
+            "process_seq": 0,
+        }
+
+    def _open_local_camera(self, requested_index):
+        """Open a Windows camera, tolerating backend and index differences."""
+        attempts = []
+        for index in [requested_index, 0, 1, 2, 3]:
+            if index not in [item[0] for item in attempts]:
+                attempts.append((index, cv2.CAP_DSHOW))
+                attempts.append((index, cv2.CAP_MSMF))
+
+        for index, backend in attempts:
+            cap = cv2.VideoCapture(index, backend)
+            if cap.isOpened():
+                backend_name = "DSHOW" if backend == cv2.CAP_DSHOW else "MSMF"
+                if index != requested_index or backend != cv2.CAP_DSHOW:
+                    print(f"  [{self.label}] 接続方法をフォールバック: "
+                          f"カメラ{index} / {backend_name}")
+                return cap
+            cap.release()
+
+        return cv2.VideoCapture(requested_index, cv2.CAP_ANY)
 
     # ------------------------------------------------------------------
     # カメラ設定
@@ -274,12 +316,33 @@ class CameraTracker:
         Returns:
             (frame, candidates, timestamp) — 取得失敗時は (None, [], 0.0)
         """
-        ret, frame = self.cap.read()
-        ts = time.time()
-        if not ret or frame is None:
-            return None, [], 0.0
+        process_start = time.perf_counter()
+        if self._latest_reader_started:
+            copy_start = time.perf_counter()
+            with self._latest_lock:
+                frame = None if self._latest_frame is None else self._latest_frame.copy()
+                ts = self._latest_frame_time
+                seq = self._perf["reader_seq"]
+            copy_ms = (time.perf_counter() - copy_start) * 1000.0
+            if frame is None:
+                return None, [], 0.0
+        else:
+            ret, frame = self.cap.read()
+            ts = time.time()
+            seq = 0
+            copy_ms = 0.0
+            if not ret or frame is None:
+                return None, [], 0.0
 
         candidates = self.detect(frame)
+        process_ms = (time.perf_counter() - process_start) * 1000.0
+        with self._latest_lock:
+            self._perf["process_count"] += 1
+            self._perf["process_ms_total"] += process_ms
+            self._perf["process_last_ms"] = process_ms
+            self._perf["process_last_copy_ms"] = copy_ms
+            self._perf["process_last_age_ms"] = max(0.0, (time.time() - ts) * 1000.0)
+            self._perf["process_seq"] = seq
         self.last_frame_time = ts
         self.last_candidates = candidates
         return frame, candidates, ts
@@ -304,5 +367,53 @@ class CameraTracker:
         if self._bg is not None:
             self._bg = self._make_bg_subtractor()
 
+    def start_latest_reader(self):
+        """Continuously capture frames so processing always uses the newest one."""
+        if self._latest_reader_started or not isinstance(self.camera_url, int):
+            return
+        self._reader_stop.clear()
+        self._reader_thread = threading.Thread(
+            target=self._latest_reader_loop,
+            name=f"{self.label}-capture",
+            daemon=True,
+        )
+        self._latest_reader_started = True
+        self._reader_thread.start()
+
+    def _latest_reader_loop(self):
+        with self._latest_lock:
+            self._perf["reader_start_time"] = time.time()
+        while not self._reader_stop.is_set():
+            read_start = time.perf_counter()
+            ret, frame = self.cap.read()
+            read_ms = (time.perf_counter() - read_start) * 1000.0
+            if not ret or frame is None:
+                with self._latest_lock:
+                    self._perf["reader_errors"] += 1
+                time.sleep(0.005)
+                continue
+            with self._latest_lock:
+                self._latest_frame = frame
+                self._latest_frame_time = time.time()
+                self._perf["reader_reads"] += 1
+                self._perf["reader_read_ms_total"] += read_ms
+                self._perf["reader_last_ms"] = read_ms
+                self._perf["reader_last_frame_time"] = self._latest_frame_time
+                self._perf["reader_seq"] += 1
+
+    def get_performance_stats(self):
+        with self._latest_lock:
+            stats = dict(self._perf)
+        elapsed = max(time.time() - stats["reader_start_time"], 1e-6)
+        stats["reader_fps"] = stats["reader_reads"] / elapsed
+        stats["reader_avg_ms"] = (
+            stats["reader_read_ms_total"] / stats["reader_reads"]
+            if stats["reader_reads"] else 0.0
+        )
+        return stats
+
     def release(self):
+        self._reader_stop.set()
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=1.0)
         self.cap.release()
