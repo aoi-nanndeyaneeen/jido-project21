@@ -97,7 +97,8 @@
 #include "quad/Mixer.h"
 #include "quad/BodyFrame.h"
 #include "quad/PosHold.h"
-#include "quad/AltHold.h"   // s5b/s5d: フロー水平ホールド (地面固定フレーム)
+#include "quad/AltHold.h"        // s5c: 高度ホールド (カスケード + engage 状態遷移)
+#include "quad/AltEstimator.h"   // s5c: 加速度Z×測距の相補フィルタ (高度・上昇速度の推定)
 
 namespace Q = Quad;
 
@@ -321,6 +322,9 @@ Q::PositionHold poshold;
 //  (quad/AltHold.h)。出力は active() / throttle()。
 Q::AltitudeHold althold;
 
+//  s5c: 高度推定 (加速度Z × 測距)。ALT_USE_ACC_FUSION=false の間はログ専用。
+Q::AltEstimator altest;
+
 Q::Axis roll_axis, pitch_axis, yaw_axis;
 
 // ============================================================
@@ -444,7 +448,11 @@ constexpr char HEADER[] =
     // --- 2026-09-06: 加速度Z相補フィルタの検討用。制御には未使用、記録のみ。
     //     g_att.acc_* (FRD系, g単位) をそのまま出す。回転・積分・フィルタは
     //     全部 Python 側でオフライン検証する (analyze_alt_pid.py 系のツール)。
-    "accx,accy,accz";
+    "accx,accy,accz,"
+    // --- 2026-09-07: 加速度Z×測距の相補フィルタ (quad/AltEstimator.h)。
+    //     ALT_USE_ACC_FUSION=false の間は制御に未使用、記録のみ。
+    //     est_vz が climb より何ms 速いかを analyze_alt_pid.py が判定する。
+    "acc_up,est_h,est_vz,est_bias";
 
 bool     active  = false;
 uint32_t dropped = 0;   // USBが詰まって捨てたサンプル数
@@ -496,7 +504,8 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
         "%.3f,%.3f,%d,"
         "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f,"
         "%.3f,"
-        "%.4f,%.4f,%.4f\n",
+        "%.4f,%.4f,%.4f,"
+        "%.3f,%.3f,%.3f,%.3f\n",
         (unsigned long)millis(), (unsigned long)dt_us, mode, armed ? 1 : 0, thr,
         roll_axis.stick,     pitch_axis.stick,     yaw_axis.stick,
         roll_axis.ang_meas,  pitch_axis.ang_meas,  g_yaw_est,
@@ -518,7 +527,8 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
         althold.holdM(), althold.vzTar(), althold.thrBase(),
         althold.thrCorr(), althold.thrOut(),
         g_mix.thr_used,
-        g_att.acc_x, g_att.acc_y, g_att.acc_z);
+        g_att.acc_x, g_att.acc_y, g_att.acc_z,
+        altest.accUp(), altest.heightM(), altest.climbMps(), altest.biasMps2());
     written++;
 }
 
@@ -614,6 +624,11 @@ struct __attribute__((packed)) Rec {
     uint8_t  alt_used;                              // /250
     // 2026-09-06: 加速度Z相補フィルタ検討用。制御には未使用、記録のみ。
     int16_t  accx, accy, accz;                      // g x1e4 (FRD, g_att.acc_*)
+    // 2026-09-07: AltEstimator (加速度Z×測距の相補フィルタ) の出力。
+    int16_t  acc_up;                                // m/s^2 x1e3
+    int16_t  est_h;                                 // mm
+    int16_t  est_vz;                                // mm/s
+    int16_t  est_bias;                              // m/s^2 x1e3
 };
 
 // OCRAM2 (DMAMEM) に置く。RAM1 (スタック/大半の変数) と競合しない。
@@ -786,6 +801,11 @@ inline void update(uint32_t dt_us, int mode, bool armed, float thr) {
     r.accx = S5T::q16(g_att.acc_x, S5T::SC_1E4);
     r.accy = S5T::q16(g_att.acc_y, S5T::SC_1E4);
     r.accz = S5T::q16(g_att.acc_z, S5T::SC_1E4);
+    //  acc_up / est_bias は m/s^2。1e3 倍で ±32 m/s^2 まで入る。
+    r.acc_up   = S5T::q16(altest.accUp(),    1000.0f);
+    r.est_h    = S5T::q16(altest.heightM(),  S5T::SC_MM);
+    r.est_vz   = S5T::q16(altest.climbMps(), S5T::SC_MM);
+    r.est_bias = S5T::q16(altest.biasMps2(), 1000.0f);
 
     head = (head + 1) % CAPACITY;
     if (count < CAPACITY) ++count;
@@ -863,7 +883,8 @@ inline void dump() {
             "%.3f,%.3f,%d,"
             "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f,"
             "%.3f,"
-            "%.4f,%.4f,%.4f\n",
+            "%.4f,%.4f,%.4f,"
+            "%.3f,%.3f,%.3f,%.3f\n",
             (unsigned long)r.t_ms, (unsigned long)r.dt_us, (int)r.mode,
             (r.flags & RF_ARMED) ? 1 : 0, r.thr / 250.0f,
             r.roll_stick / 100.0f, r.pitch_stick / 100.0f, r.yaw_stick / 100.0f,
@@ -889,7 +910,9 @@ inline void dump() {
             r.alt_holdm / S5T::SC_MM, r.alt_vzt / S5T::SC_MM, thrBase,
             r.alt_corr / S5T::SC_1E4, r.alt_thr_out / 250.0f,
             r.alt_used / 250.0f,
-            r.accx / S5T::SC_1E4, r.accy / S5T::SC_1E4, r.accz / S5T::SC_1E4);
+            r.accx / S5T::SC_1E4, r.accy / S5T::SC_1E4, r.accz / S5T::SC_1E4,
+            r.acc_up / 1000.0f, r.est_h / S5T::SC_MM,
+            r.est_vz / S5T::SC_MM, r.est_bias / 1000.0f);
     }
 
     Serial.println("LOG_STOP");
@@ -1252,6 +1275,7 @@ static void resetControllers() {
 
     // s5c: 高度ホールドも「今ここ」を基準に取り直す。
     althold.reset(g_range_valid ? g_range_h_m : 0.0f);
+    altest.reset(g_range_valid ? g_range_h_m : 0.0f);
 }
 
 static const char* modeName(S5::Mode m) {
@@ -1353,6 +1377,12 @@ static void updateAltHold(float dt_s) {
     g_thr_used_sum = 0.0f;
     g_thr_used_n   = 0;
 
+    //  上昇速度をどこから取るか。
+    //  ALT_USE_ACC_FUSION=true なら加速度融合の推定値 (遅れがほぼ無い)、
+    //  false なら従来どおり測距の微分。切り替えても他は一切変えない。
+    const bool  use_est = Q::ALT_USE_ACC_FUSION && altest.valid();
+    const float climb   = use_est ? altest.climbMps() : g_climb_mps;
+
     althold.update(dt_s,
                    g_alt_hold_enable && S5::USE_RANGE,
                    isArmed(),
@@ -1360,7 +1390,7 @@ static void updateAltHold(float dt_s) {
                    g_range_valid,
                    g_range_fresh,
                    g_range_h_m,
-                   g_climb_mps,
+                   climb,
                    thr,
                    thr_applied);
 }
@@ -2065,6 +2095,12 @@ void loop() {
     if (S5::USE_MPU) {
         mpu.update();
         g_att = Q::readAttitude(mpu);
+
+        // s5c: 高度推定の predict。加速度は 1000Hz・遅れほぼゼロなので、
+        //  測距 (33Hz・遅れ大) より先にここで積分を進めておく。
+        //  ALT_USE_ACC_FUSION=false の間は結果をログに出すだけ。
+        altest.predict(dt_s, g_att.roll, g_att.pitch,
+                       g_att.acc_x, g_att.acc_y, g_att.acc_z);
     }
     const uint32_t _t1 = micros();
 
@@ -2114,6 +2150,18 @@ void loop() {
         g_climb_mps   = rangefinder.climbMps();
 
         if (S5::USE_FLOW && g_range_valid) flow.setHeight(g_range_h_m);
+
+        // s5c: 高度推定の correct。新しい測距が来た回だけ、そのサンプルで
+        //  推定を引き戻す。dt は「前回 correct からの経過」でなければ
+        //  ならない (呼び出し周期ではない) ので、ここで測る。
+        if (g_range_fresh && g_range_valid) {
+            static uint32_t est_last_us = 0;
+            const uint32_t now_us = micros();
+            const float    est_dt = (est_last_us == 0)
+                                  ? 0.0f : (float)(now_us - est_last_us) * 1e-6f;
+            est_last_us = now_us;
+            altest.correct(g_range_h_m, est_dt);
+        }
 
         // s5c: 高度ホールド (スロットルPID)
         updateAltHold(range_dt_s);

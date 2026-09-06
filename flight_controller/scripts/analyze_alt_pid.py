@@ -141,6 +141,10 @@ FULL_GROUPS = [
                            ("alt_thr", "out thr")], "m / (m/s) / 割合"),
     ("高度ホールド 指令 vs 実効", [("alt_thr", "alt_thr 高度ループの指令"),
                            ("alt_used", "alt_used ミキサーが実際に使った値")], "割合"),
+    ("高度推定 相補フィルタ", [("range_h", "range_h 測距(LPF後)"), ("est_h", "est_h 推定高度"),
+                           ("climb", "climb 測距の微分"), ("est_vz", "est_vz 推定上昇速度"),
+                           ("est_bias", "est_bias 加速度バイアス")], "m / (m/s) / (m/s^2)"),
+    ("鉛直加速度",        [("acc_up", "acc_up 重力除去後 [m/s^2]")], "m/s^2"),
 ]
 
 
@@ -299,6 +303,104 @@ def diagnose(d, t, m):
                   f"  |cmd| 平均 {np.abs(cmd).mean():.3f} 最大 {np.abs(cmd).max():.3f}")
         print("     ※ 目安: |cmd| 平均が 0.05 を超え、5〜30Hz に鋭いピークがあれば")
         print("       レートループのD項由来の振動を疑う (ミキサー権限を食い潰す)。")
+
+    # --- 6) 高度推定 (相補フィルタ) の素性 --------------------------
+    print("\n [6] 高度推定 (加速度Z × 測距の相補フィルタ)")
+    if "acc_up" not in d:
+        print("     このログに推定チャンネルが無い (ファームが古い)。")
+        print("     ALT_USE_ACC_FUSION=false のまま1本飛ばせば出る。")
+    elif m.sum() < 200:
+        print("     高度ホールドが効いている区間が短すぎる。")
+    else:
+        acc_up = d["acc_up"]; est_vz = d["est_vz"]; est_h = d["est_h"]
+        bias = d["est_bias"]; climb = d["climb"]; range_h = d["range_h"]
+        dt_med = np.median(np.diff(t))
+
+        # (a) 符号チェック: 上昇中に acc_up は正か
+        #  高度の2階微分と acc_up が同符号でなければ ALT_ACC_Z_SIGN が逆。
+        dh = np.gradient(range_h, t)
+        ddh = np.gradient(np.convolve(dh, np.ones(51)/51, mode="same"), t)
+        au_s = np.convolve(acc_up, np.ones(51)/51, mode="same")
+        good = m & np.isfinite(ddh) & np.isfinite(au_s)
+        r_sign = np.corrcoef(au_s[good], ddh[good])[0, 1] if good.sum() > 100 else 0.0
+        print(f"     [符号] acc_up と d2(range_h)/dt2 の相関: {r_sign:+.2f}")
+        if r_sign < -0.15:
+            print("     !! 符号が逆。QuadConfig.h の ALT_ACC_Z_SIGN を -1.0 にすること。")
+        elif r_sign > 0.15:
+            print("        -> ALT_ACC_Z_SIGN は現在の値で正しい。")
+        else:
+            print("        -> 相関が弱く判定できない。上下に動かす飛行を録ること。")
+
+        # (b) バイアス収束
+        print(f"     [バイアス] est_bias: 最終 {bias[m][-1]:+.3f} m/s2"
+              f"  範囲 [{bias[m].min():+.3f}, {bias[m].max():+.3f}]")
+        if np.abs(bias[m]).max() > 2.5:
+            print("     !! バイアスが上限近くまで振れている。IMU キャリブを取り直すこと。")
+
+        # (c) 遅れの比較。
+        #  ★ 参照は「生の測距に cos補正だけ掛けたもの」を零位相平滑して微分する。
+        #    range_h から作ってはいけない。range_h はファーム内で既に H-LPF を
+        #    通っているので、そこから作った参照は climb と同じ遅れを共有してしまい、
+        #    climb の遅れが 0ms に見えてしまう (実際そうなった)。
+        #  零位相平滑 = 前向き移動平均 → 反転 → もう一度 → 反転。位相が打ち消える。
+        def zero_phase(y, w=41):
+            kk = np.ones(w) / w
+            return np.convolve(np.convolve(y, kk, mode="same")[::-1], kk,
+                               mode="same")[::-1]
+        h_raw = (d["range_raw"] * np.cos(d["roll_ang"] * DEG2RAD)
+                                * np.cos(d["pitch_ang"] * DEG2RAD)) + RANGE_OFFSET_M
+        ref = np.gradient(zero_phase(h_raw), t)
+
+        def lag_ms(sig):
+            """正 = sig が参照より遅れている / 負 = 先行している。
+            戻り値 (遅れ[ms], そのときの相関, 参照との rms差)。"""
+            a = sig[m] - sig[m].mean(); b = ref[m] - ref[m].mean()
+            n = len(a)
+            sa, sb = np.std(a), np.std(b)
+            if sa < 1e-9 or sb < 1e-9:
+                return float("nan"), 0.0, float("nan")
+            best = (0, -1e18)
+            span = int(0.6 / dt_med)
+            for kk in range(-span, span + 1):     # 先行もありうるので負まで探す
+                if kk >= 0:
+                    c = np.dot(a[kk:], b[:n - kk]) / max(n - kk, 1)
+                else:
+                    c = np.dot(a[:n + kk], b[-kk:]) / max(n + kk, 1)
+                c /= (sa * sb)
+                if c > best[1]: best = (kk, c)
+            return best[0] * dt_med * 1000, best[1], np.sqrt(np.mean((a - b) ** 2))
+
+        l_climb, c_climb, e_climb = lag_ms(climb)
+        l_est, c_est, e_est = lag_ms(est_vz)
+        print("     [遅れ] 位相ゼロ参照 (生測距のcos補正) に対する遅れ:")
+        print(f"        従来 climb  (測距の微分) : {l_climb:6.0f} ms"
+              f"  相関 {c_climb:.2f}  参照とのrms差 {e_climb:.3f} m/s")
+        print(f"        新   est_vz (加速度融合) : {l_est:6.0f} ms"
+              f"  相関 {c_est:.2f}  参照とのrms差 {e_est:.3f} m/s")
+        lag_ok = (c_climb > 0.7 and c_est > 0.7)
+        if not lag_ok:
+            print("     !! 相関が低く、この飛行では遅れを測れない。")
+            print("        高度が一方向にゆっくり動くだけの記録だと、位相差が")
+            print("        小さすぎて相互相関に出ない (log_037 がまさにこれ)。")
+            print("        1〜2Hz で上下に振る飛行を5秒ほど録ると測れる。")
+            print("        ※ 参照とのrms差なら短い記録でも比較できる。小さいほど良い。")
+        else:
+            print(f"        -> 短縮 {l_climb - l_est:.0f} ms")
+        print(f"     [一致] est_vz vs climb: 相関 {np.corrcoef(est_vz[m], climb[m])[0,1]:+.2f}"
+              f"  rms差 {np.sqrt(np.mean((est_vz[m]-climb[m])**2)):.3f} m/s")
+        print(f"     [高度] est_h vs range_h: rms差"
+              f" {np.sqrt(np.mean((est_h[m]-range_h[m])**2)):.3f} m"
+              f"  (0.1m 以内なら追従できている)")
+        ok_sign = (r_sign > 0.15)
+        ok_bias = (np.abs(bias[m]).max() < 2.5)
+        ok_h    = (np.sqrt(np.mean((est_h[m] - range_h[m]) ** 2)) < 0.10)
+        ok_lag  = (e_est < e_climb) if not lag_ok else (l_est < l_climb - 30)
+        if ok_sign and ok_bias and ok_h and ok_lag:
+            print("     ==> 素性は良好。ALT_USE_ACC_FUSION = true にしてよい。")
+        else:
+            ng = [n for n, o in [("符号", ok_sign), ("バイアス", ok_bias),
+                                 ("高度追従", ok_h), ("速さ", ok_lag)] if not o]
+            print(f"     ==> まだ有効化しないこと。未達: {' / '.join(ng)}")
     print()
 
 

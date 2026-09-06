@@ -525,6 +525,42 @@ constexpr float ALT_RATE_KD      = 0.03f;
 //   (自分の権限飽和 + ミキサーに奪われた分の検出) でやる。
 constexpr float ALT_RATE_I_LIMIT = 0.12f;   // I項の上限 [割合]。windup 防止
 
+// ------------------------------------------------------------
+//  § 7-3b  高度推定 (加速度Z × 測距の相補フィルタ)   -> quad/AltEstimator.h
+// ------------------------------------------------------------
+//  測距だけで作った climb は log_037 実測で 420ms 遅れていた。そのうち
+//  約100ms は H/VZ の二重ソフトLPF。加速度計 (1000Hz・遅れほぼゼロ) で
+//  速い成分を作れば、この 100ms はまるごと消せる。
+//
+//  ★ 有効化の手順 (いきなり true にしないこと):
+//    1. ALT_USE_ACC_FUSION = false のまま1本飛ばす。
+//       ログに est_h / est_vz / est_bias / acc_up が出る。
+//    2. python scripts/analyze_alt_pid.py を実行。
+//       「[6] 高度推定 (相補フィルタ)」が
+//         ・ALT_ACC_Z_SIGN の符号が合っているか
+//         ・est_vz が climb より何ms 速いか
+//         ・est_bias が収束しているか
+//       を判定して出す。
+//    3. 符号が合っていて est_vz がまともなら true にする。
+constexpr bool ALT_USE_ACC_FUSION = false;
+
+// 相補フィルタの帯域 [rad/s]。三重極をここに置く。
+//  小さい = 測距を信用しドリフトに強いが遅い / 大きい = 加速度寄りで速いが荒れる
+//  2.0 rad/s ≒ 0.32Hz。これより速い成分は加速度が担当する。
+constexpr float ALT_EST_W = 2.0f;
+
+// 加速度Zの符号。IMU が上下逆マウントだと反転する。
+//  ★ 判定方法: ログで機体が上昇している区間 (range_h が増える) で
+//    acc_up が正になっていれば +1 で正しい。逆なら -1。
+//    analyze_alt_pid.py が自動で判定して教えてくれる。
+constexpr float ALT_ACC_Z_SIGN = +1.0f;
+
+// 推定と測距がこれ以上食い違ったら推定を捨てて測距に合わせ直す [m]
+constexpr float ALT_EST_RESET_ERR_M = 0.8f;
+
+// 学習する加速度バイアスの上限 [m/s^2]。これを超えるならキャリブが壊れている
+constexpr float ALT_EST_BIAS_LIM = 3.0f;
+
 // ミキサーに奪われたスロットルを「飽和」とみなす閾値 [割合]。
 //  Mixer::mix() は ATTITUDE_PRIORITY のときスロットルをずらす。ずれが
 //  これを超えたら、高度ループはその向きへの積分を止める (AltHold.h)。
