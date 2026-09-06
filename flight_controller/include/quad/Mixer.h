@@ -24,9 +24,13 @@ namespace Quad {
 //
 //  sat が立ちっぱなしなら「ゲインが高すぎて常に飽和している」証拠です。
 // ------------------------------------------------------------
+//  ・thr_used   : 実際に合成に使ったスロットル。ATTITUDE_PRIORITY で
+//                 姿勢補正を通すために引数の thr からずらした「後」の値。
+//                 ★ 高度ホールドはこれを見ないと制御が閉じない (下記)。
 struct MixInfo {
     float   span_limit = 0.0f;
     float   scale      = 1.0f;
+    float   thr_used   = 0.0f;
     uint8_t sat        = 0;
 };
 
@@ -55,6 +59,7 @@ inline void mix(float thr, float roll, float pitch, float yaw,
         for (int i = 0; i < MOTOR_COUNT; ++i) out[i] = 0.0f;
         return;
     }
+    if (info) info->thr_used = thr;   // 以降ずらされなければこの値のまま
 
     // --- 0) 姿勢補正の権限を、下限のすぐ上からなめらかに立ち上げる ---
     //     ここが無いと thr が THR_MIN_MIX をまたいだ瞬間に補正が全開になり、
@@ -93,8 +98,20 @@ inline void mix(float thr, float roll, float pitch, float yaw,
     const float thr_hi = 1.0f     - hi;   // 最大モーターが 1.0 を超えない上限
 
     if (ATTITUDE_PRIORITY) {
-        // 姿勢優先: 補正が全部入るようにスロットルをずらす
+        // 姿勢優先: 補正が全部入るようにスロットルをずらす。
+        //
+        // ★ 2026-09-07: ここは「アクチュエータ飽和」そのもの。
+        //   thr_lo = THR_IDLE - lo なので、姿勢補正が大きいほどスロットルの
+        //   下限が押し上がる。log_037 では姿勢が 14Hz で振動していたせいで
+        //   lo が深くなり、高度ホールドが出した thr=0.152 が実際には 0.56 に
+        //   書き換わっていた (押し上げ量: 平均 +0.127 / 最大 +0.51 /
+        //   時間の 63% で +0.02 以上)。
+        //   高度ループは自分の指令が無視されたことを知らないまま
+        //   「まだ降りない」と誤差を積み続けるので、制御が閉じていなかった。
+        //   ずらした結果を thr_used で必ず外へ返し、呼び出し側 (AltHold) の
+        //   アンチワインドアップに使わせる。
         thr = constrain(thr, thr_lo, thr_hi);
+        if (info) info->thr_used = thr;
     } else {
         // スロットル優先: スロットルは動かさず、はみ出した分は最後の
         // constrain で切り捨てられる (姿勢は崩れやすくなる)

@@ -12,9 +12,12 @@
 //        傾き cos 補正した鉛直高度を毎ループ flow.setHeight() へも渡す
 //        (失探したら FLOW_ASSUMED_HEIGHT_M へ自動フォールバック)。
 //    ・s5d で足したもの:
-//        1. 運用を 2モードに固定。SW_HOVER 1本だけで決める:
+//        1. 運用を SW_HOVER 1本だけで決める。
+//           ★ 2026-09-05: down/cen 兼用の2段階から3段階に変更。
 //             down → ANGLE   完全手動 (スロットルも手動)。これが bail-out。
+//             cen  → ALTHOLD 姿勢は手動、高度だけ自動保持 (水平位置はまだ手動)。
 //             up   → POSHOLD 完全自動 (水平位置 + 高度 + ヘディングを同時)。
+//                    フロー喪失時は ALTHOLD へ自動フォールバック。
 //           SW_AUTO / 地上局AUTO / RATE は封印。実飛行では PC を繋げないので
 //           シリアル 'g' 等に依存しない運用にしてある。
 //        2. 位置積分を「地面固定フレーム (N/E)」化。s5c までは機体座標のまま
@@ -144,8 +147,8 @@ namespace Gain {
 //   それを消すのが I 項。ki = kp は積分時定数 1秒に相当する。
 //   ワインドアップ対策は既にある: integrate = (thr > I_ENABLE_THR) と
 //   RATE_I_LIMIT = 0.15 (出力の 15% で頭打ち)。
-constexpr float RATE_ROLL [3] = { 0.0020f, 0.0020f, 0.00004f };
-constexpr float RATE_PITCH[3] = { 0.0020f, 0.0020f, 0.00004f };
+constexpr float RATE_ROLL [3] = { 0.0015f, 0.0000f, 0.00004f };
+constexpr float RATE_PITCH[3] = { 0.0015f, 0.0000f, 0.00004f };
 
 // ★ ヨーの I項。P制御だけでは定常偏差が残る。
 //   機体には必ず一定のヨートルクが残っている:
@@ -158,7 +161,7 @@ constexpr float RATE_PITCH[3] = { 0.0020f, 0.0020f, 0.00004f };
 //   s4 の 0.0020 から無言で半分に落とされていた (理由の記載なし)。s4/s5 で
 //   ANGLE モードの挙動が違って感じるという指摘を受けて洗い出した差分の一つ。
 //   s4 と揃えて 0.0020 に戻す案もあったが、まずは中間の 0.0015 で様子を見る。
-constexpr float RATE_YAW  [3] = { 0.0015f, 0.0000f, 0.00004f };
+constexpr float RATE_YAW  [3] = { 0.0015f, 0.0020f, 0.00004f };
 
 constexpr float RATE_D_ALPHA = 0.80f;
 constexpr float RATE_I_LIMIT = 0.15f;
@@ -191,8 +194,8 @@ constexpr float YAW_STICK_DEAD    = 0.03f;
 //  ★ 積分はレートループ (RATE_*) 側だけで持たせています。ここに ki を
 //    入れるとレートループの I項と干渉して低周波の揺れが出ます。0 のままに。
 //                               kp     ki    kd
-constexpr float ANG_ROLL [3] = { 20.0f, 0.0f, 0.0f };
-constexpr float ANG_PITCH[3] = { 20.0f, 0.0f, 0.0f };
+constexpr float ANG_ROLL [3] = { 30.0f, 0.04f, 0.0f };
+constexpr float ANG_PITCH[3] = { 30.0f, 0.04f, 0.0f };
 
 constexpr float ANG_D_ALPHA = 0.70f;
 // 角度ループの積分項の上限 [deg/s]
@@ -273,11 +276,16 @@ constexpr float ANGLE_OUT_LIMIT = 300.0f;
 constexpr int MAIN_HZ  = Q::RATE_LOOP_HZ;
 constexpr int DEBUG_HZ = Q::DEBUG_HZ;
 
-//  MODE_ANGLE    : 完全手動 (自己水平のみ)。SW_HOVER=down。bail-out。
+//  ★ 2026-09-05: SW_HOVER を3段階で使うように変更 (旧: down/cen どちらも
+//    ANGLE 扱いで実質2段階だった)。
+//  MODE_ANGLE    : 完全手動 (自己水平のみ、高度もスティック直結)。SW_HOVER=down。bail-out。
+//  MODE_ALTHOLD  : 姿勢は手動 (ANGLEと同じ) + 高度だけ自動保持。SW_HOVER=cen(中央)。
+//    水平位置(フロー)ホールドはまだ効かない。ALTHOLDとPOSHOLDの中間の練習用。
 //  MODE_POSHOLD  : 完全自動。フローで水平位置保持 + 測距で高度保持。SW_HOVER=up。
 //    センサ喪失の瞬間に ANGLE へ自動フォールバック。
 //  MODE_RATE / MODE_AUTO : 封印 (enum は互換のため残置。selectMode は返さない)。
-enum Mode : uint8_t { MODE_RATE = 0, MODE_ANGLE = 1, MODE_AUTO = 2, MODE_POSHOLD = 3 };
+enum Mode : uint8_t { MODE_RATE = 0, MODE_ANGLE = 1, MODE_AUTO = 2, MODE_POSHOLD = 3,
+                       MODE_ALTHOLD = 4 };
 
 } // namespace S5
 
@@ -379,6 +387,15 @@ float g_climb_mps   = 0.0f;    // 上昇速度 [m/s] (上 +)
 bool  g_alt_hold_enable = S5::USE_ALT_HOLD;  // シリアル 'g' でトグル
 bool  g_range_fresh     = false;             // 今回 新しい測距が入ったか
 
+//  ミキサーが実際に使ったスロットルの積算。1000Hz のミキサーと 100Hz の
+//  高度ループをつなぐ。
+//  ★ なぜ平均か: 機体の高度は「モーター出力の平均」に応答する。姿勢優先の
+//    押し上げは姿勢の振動と同じ周波数 (log_037 では 14Hz) で出入りするので、
+//    高度ループの周期で瞬時値を1点だけ拾うとエイリアシングする。
+//    区間平均なら、機体が実際に受け取った推力と同じものを見られる。
+float    g_thr_used_sum = 0.0f;
+uint32_t g_thr_used_n   = 0;
+
 // ドライラン: true の間は ESC へ 0 しか送らない (g_out は計算・記録する)
 bool  g_dry_run = S5::DRY_RUN;
 
@@ -419,7 +436,15 @@ constexpr char HEADER[] =
     "fh_vxc,fh_vyc,fh_vxt,fh_vyt,fh_leanr,fh_leanp,fh_posn,fh_pose,"
     "fh_holdn,fh_holde,fh_hold,"
     // --- s5c: 距離センサ + 高度ホールド ---
-    "range_ok,range_raw,range_h,climb,alt_en,alt_act,alt_hold,alt_vzt,alt_base,alt_corr,alt_thr";
+    "range_ok,range_raw,range_h,climb,alt_en,alt_act,alt_hold,alt_vzt,alt_base,alt_corr,alt_thr,"
+    // --- 2026-09-07: alt_used = ミキサーが実際に使ったスロットル。
+    //     alt_thr との差が「姿勢優先に奪われた量」。ここが常時 0 でなければ
+    //     高度制御は自分の指令どおりに飛べていない (log_037 では平均 +0.127)。
+    "alt_used,"
+    // --- 2026-09-06: 加速度Z相補フィルタの検討用。制御には未使用、記録のみ。
+    //     g_att.acc_* (FRD系, g単位) をそのまま出す。回転・積分・フィルタは
+    //     全部 Python 側でオフライン検証する (analyze_alt_pid.py 系のツール)。
+    "accx,accy,accz";
 
 bool     active  = false;
 uint32_t dropped = 0;   // USBが詰まって捨てたサンプル数
@@ -469,7 +494,9 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
         "%.4f,%.4f,"
         "%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,"
         "%.3f,%.3f,%d,"
-        "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f\n",
+        "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f,"
+        "%.3f,"
+        "%.4f,%.4f,%.4f\n",
         (unsigned long)millis(), (unsigned long)dt_us, mode, armed ? 1 : 0, thr,
         roll_axis.stick,     pitch_axis.stick,     yaw_axis.stick,
         roll_axis.ang_meas,  pitch_axis.ang_meas,  g_yaw_est,
@@ -489,7 +516,9 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
         g_range_ok ? 1 : 0, g_range_raw_m, g_range_h_m, g_climb_mps,
         g_alt_hold_enable ? 1 : 0, althold.active() ? 1 : 0,
         althold.holdM(), althold.vzTar(), althold.thrBase(),
-        althold.thrCorr(), althold.thrOut());
+        althold.thrCorr(), althold.thrOut(),
+        g_mix.thr_used,
+        g_att.acc_x, g_att.acc_y, g_att.acc_z);
     written++;
 }
 
@@ -509,7 +538,9 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
 //  うち、これは DMAMEM 領域 (OCRAM2, 512KB) に確保するので、通常の変数や
 //  スタックとは競合しない。
 //
-//  ★ 記録レコードは Log::HEADER と同じ 57 列の値を持つが、RAM を食わない
+//  ★ 記録レコードは Log::HEADER と同じ 58 列の値を持つが、RAM を食わない
+//    (dump() が Log::HEADER をそのまま出すので、列を足したら Rec と
+//     printf の両方に足すこと)
 //    よう int16/uint8 に量子化して積む (S5Telem.h の q16/qu8/qu16 を流用)。
 //    ダンプ時に Log::sample() と "同じ printf フォーマット" で書き戻すので、
 //    scripts/logger.py と scripts/analyze_log.py は無改造でそのまま使える。
@@ -517,11 +548,14 @@ inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
 //  ★ RAM は揮発性。着陸後、バッテリーを抜く前に USB を挿して 'v' で
 //    ダンプすること。ここで作った内容は電源を切ると消える。
 //
-//  運用:
-//    thr が RAMLOG_THR_GATE (既定 0.20) を超えている間、アーム中だけ記録。
-//    リングバッファ (古い方から上書き) なので、記録が長引いても直近
-//    RAMLOG_SECONDS 秒ぶんが必ず残る。ディスアームで記録を止めて凍結する
-//    (次にスロットルを上げた瞬間、また 0 から録り直す)。
+//  運用 (2026-09-05 にトリガ方式へ変更。詳細は RamLog::update() のコメント参照):
+//    アーム中に thr が RAMLOG_THR_GATE (既定 0.20) を「上に横切った瞬間」を
+//    トリガとし、そこから RAMLOG_SECONDS 秒間 (既定8秒) は thr の増減を
+//    無視して録り続ける。止まるのはディスアーム or 8秒経過のどちらか。
+//    (旧方式は thr が一瞬でも 0.20 を割ると記録を止めて凍結し、次に
+//     0.20 を超えた瞬間に録り直していたため、ホバリング中の一瞬の
+//     スロットル低下だけで、それより前の穏やかな区間が消えてしまっていた)
+//    ディスアームで記録を止めて凍結する (次にトリガがかかったら0から録り直す)。
 //    'v' キーで USB へダンプ (HEADER/LOG_START/DATA.../LOG_STOP)。
 // ------------------------------------------------------------
 namespace RamLog {
@@ -529,7 +563,9 @@ namespace RamLog {
 // スロットルがこれを超えている間だけ記録する。地面で粘っている待機時間や
 // 着陸後の惰性回転を録っても仕方が無いので、飛行に関係する区間だけに絞る。
 constexpr float    RAMLOG_THR_GATE = 0.20f;
-// 何秒ぶん持つか。500Hz x 8秒 x 約100B/行 ≒ 400KB (OCRAM2 512KBに収まる)。
+// 何秒ぶん持つか。500Hz x 8秒 x 約107B/行 (accx/y/z 追加後) ≒ 418KB
+// (OCRAM2 512KBに収まる。余裕 ~94KB)。列を足しても RAMLOG_SECONDS は
+// 変えなくて良い。
 constexpr uint32_t RAMLOG_SECONDS  = 8;
 constexpr uint32_t RAMLOG_HZ       = 500;
 constexpr uint32_t CAPACITY        = RAMLOG_SECONDS * RAMLOG_HZ;   // 4000
@@ -573,34 +609,97 @@ struct __attribute__((packed)) Rec {
     int16_t  alt_vzt;                               // mm/s
     int16_t  alt_corr;                              // 1e4
     uint8_t  alt_thr_out;                           // /250
+    // 2026-09-07: ミキサーが実際に使ったスロットル (MixInfo::thr_used)。
+    //   alt_thr_out との差 = 姿勢優先に奪われた量。
+    uint8_t  alt_used;                              // /250
+    // 2026-09-06: 加速度Z相補フィルタ検討用。制御には未使用、記録のみ。
+    int16_t  accx, accy, accz;                      // g x1e4 (FRD, g_att.acc_*)
 };
 
 // OCRAM2 (DMAMEM) に置く。RAM1 (スタック/大半の変数) と競合しない。
 DMAMEM Rec buf[CAPACITY];
 
-uint32_t head     = 0;      // 次に書く位置
-uint32_t count    = 0;      // 埋まっている行数 (CAPACITY で頭打ち)
-bool     wrapped  = false;  // CAPACITY を超えて上書きが始まったか
-bool     recording = false;
-int      div_cnt  = 0;
+uint32_t head          = 0;      // 次に書く位置
+uint32_t count         = 0;      // 埋まっている行数 (CAPACITY で頭打ち)
+bool     wrapped       = false;  // CAPACITY を超えて上書きが始まったか
+bool     recording     = false;
+bool     armed_and_triggered = false;  // このアームセッションで既にトリガ済みか
+uint32_t session_start_ms = 0;   // トリガがかかった瞬間の millis()
+int      div_cnt       = 0;
+bool     last_armed    = false;  // 直近 update() が見た値 (status 表示用)
+float    last_thr      = 0.0f;
+bool     manual_trigger = false;  // ベンチ検証用の手動トリガ中か (armed 不問)
 
 inline void resetBuffer() {
     head = 0; count = 0; wrapped = false; div_cnt = 0;
 }
 
-// 呼び出しは Log::sample() と同じ場所・同じ引数。
-inline void update(uint32_t dt_us, int mode, bool armed, float thr) {
-    const bool want = armed && (thr > RAMLOG_THR_GATE);
+// ★ 2026-09-06: ベンチ検証用の手動トリガ。
+//   通常のトリガは armed && thr>0.20 が条件だが、加速度Z相補フィルタの
+//   検証(機体を手で動かして accx/y/z + roll/pitch を見る)はモーターを
+//   回さない・アームもしない状態でやりたい。'n' キーでこれを呼ぶと、
+//   armed/thr に関係なく即座に8秒間の記録を開始する。
+//   manual_trigger 中は「ディスアームで止める」判定を無視し、8秒経過
+//   だけで止める (ここでは armed=false のままなので、通常の停止条件だと
+//   1tickも録れずに終わってしまう)。
+inline void forceTrigger() {
+    resetBuffer();
+    recording      = true;
+    manual_trigger = true;
+    session_start_ms = millis();
+    Serial.println("RamLog: 手動トリガ。8秒間記録します (armed/スロットル不問)");
+}
 
-    if (want && !recording) {
-        // 新しい記録セッションの開始。前回ぶんは上書きされて消える。
+// ★ 2026-09-05: トリガ方式に変更。
+//
+//   旧: armed && thr>0.20 の間だけ記録し、thr が一瞬でも 0.20 を割ると
+//       即座に記録を止めて凍結していた。次にまた 0.20 を超えた瞬間に
+//       resetBuffer() が走るため、「ホバリング中に一瞬スロットルが
+//       0.20 を割った」だけで、それより前の (穏やかに飛べていた) 区間が
+//       丸ごと消えてしまっていた。3秒以上の穏やかなホバリングを録った
+//       つもりが 1 秒程度しか残っていなかったのはこれが原因。
+//
+//   新: armed かつ thr が 0.20 を「上に横切った瞬間」だけをトリガとし、
+//       そこから RAMLOG_SECONDS 秒間は thr の増減を無視して録り続ける
+//       (止まるのはディスアームしたときだけ)。オシロのトリガと同じ考え方。
+//       8秒経過 or ディスアームで記録を止めて凍結する。
+//       トリガ後に再度 thr が 0.20 を超えても、このセッション中は
+//       resetBuffer() を呼ばない (録り直しは次にディスアームしてから)。
+inline void update(uint32_t dt_us, int mode, bool armed, float thr) {
+    // ★ 2026-09-06 バグ修正: 旧コードは「8秒経過で recording=false」の直後、
+    //   まだ armed && thr>0.20 (= ホバリング中) だと次の tick で
+    //   trigger && !recording が再び真になり resetBuffer() が走って
+    //   バッファを 0 に消していた。8秒より長くホバリングして着陸すると
+    //   'v' で "記録がありません" になるのはこれが原因。
+    //   armed_and_triggered ラッチを追加し、ディスアームするまで
+    //   1アームセッションにつき 1 回しかトリガしないようにする
+    //   (= トリガから 8 秒ぶんを確実に残す。オシロのシングルショット)。
+    last_armed = armed; last_thr = thr;        // status() 表示用
+
+    if (!armed) armed_and_triggered = false;   // ディスアームでラッチ解除
+
+    const bool trigger = armed && (thr > RAMLOG_THR_GATE) && !armed_and_triggered;
+
+    if (trigger && !recording) {
+        // 新しい記録セッションのトリガ。前回ぶんは上書きされて消える。
         resetBuffer();
-        recording = true;
-    } else if (!want && recording) {
-        // スロットルが下がった/ディスアームされた → 記録を止めて凍結する。
-        // (再度上げたら resetBuffer() から録り直す。ここではバッファは
-        //  そのまま残すので、直後に 'v' でダンプできる)
-        recording = false;
+        recording           = true;
+        armed_and_triggered = true;
+        manual_trigger       = false;   // 通常トリガなので手動フラグは下ろす
+        session_start_ms    = millis();
+    }
+
+    if (recording) {
+        const bool elapsed = (millis() - session_start_ms) >=
+                              (RAMLOG_SECONDS * 1000UL);
+        // 手動トリガ中は armed を無視 (ベンチ検証はそもそも disarm のまま)。
+        const bool stop_by_disarm = !manual_trigger && !armed;
+        if (stop_by_disarm || elapsed) {
+            // ディスアーム、または8秒経過 → 記録を止めて凍結する。
+            // 再トリガはディスアーム後の次のスロットル投入まで起きない
+            // (armed_and_triggered ラッチ)。バッファは残すので 'v' でダンプ可。
+            recording = false;
+        }
     }
     if (!recording) return;
 
@@ -681,6 +780,12 @@ inline void update(uint32_t dt_us, int mode, bool armed, float thr) {
     r.alt_vzt       = S5T::q16(althold.vzTar(),  S5T::SC_MM);
     r.alt_corr      = S5T::q16(althold.thrCorr(), S5T::SC_1E4);
     r.alt_thr_out   = S5T::qu8(althold.thrOut(), 250.0f);
+    r.alt_used      = S5T::qu8(g_mix.thr_used,   250.0f);
+
+    // 2026-09-06: 加速度Z相補フィルタ検討用 (制御には未使用)。
+    r.accx = S5T::q16(g_att.acc_x, S5T::SC_1E4);
+    r.accy = S5T::q16(g_att.acc_y, S5T::SC_1E4);
+    r.accz = S5T::q16(g_att.acc_z, S5T::SC_1E4);
 
     head = (head + 1) % CAPACITY;
     if (count < CAPACITY) ++count;
@@ -693,6 +798,12 @@ inline void status() {
                   recording ? "記録中" : (count ? "停止(ダンプ待ち)" : "空"),
                   (unsigned long)count, secs, wrapped ? " [満杯/上書き済]" : "",
                   (unsigned long)CAPACITY, (unsigned long)RAMLOG_SECONDS);
+    // 空のときに「なぜ録れていないか」を切り分けられるよう、トリガ条件の
+    // 現在値を出す。armed=1 かつ thr>0.20 なのに count=0 なら別の問題。
+    Serial.printf("        [trig条件] armed=%d  thr=%.2f (gate %.2f)  "
+                  "既トリガ=%d  recording=%d\n",
+                  last_armed ? 1 : 0, last_thr, RAMLOG_THR_GATE,
+                  armed_and_triggered ? 1 : 0, recording ? 1 : 0);
 }
 
 // ダンプ中は制御ループが数十ms〜数百ms止まる。着陸後にしか呼ばないこと
@@ -716,6 +827,24 @@ inline void dump() {
 
     const uint32_t start = wrapped ? head : 0;   // 最古の位置
     for (uint32_t i = 0; i < count; ++i) {
+        // ★ 2026-09-06: ダンプのペーシング (弱め)。
+        //   dump() は約4000行(≈1.3MB)をフロー制御なしで一気に吐いていた。
+        //   PC (logger.py) が追いつかず Windows/pyserial の受信バッファが
+        //   溢れて「行が丸ごと消える」現象が出ていた (log_028/030 の "欠損"
+        //   は全てこれ。ループ停止ではない)。
+        //   ★ Serial.flush() を毎回入れると、PC 側が読んでいない状態で
+        //     無限に固まる (= 状態表示が止まる "取れなくなった")。なので
+        //     ブロックしない availableForWrite() の様子見だけにする。
+        //     根本の受信取りこぼし対策は PC 側 (logger.py の一括読み) で行う。
+        if ((i & 31) == 0) {
+            uint32_t guard = 0;
+            // 空きが戻るまで様子見。ただし最大 ~15ms で必ず抜ける
+            // (PC が全く読んでいなくても固まらない)。通常は 1ms 未満で復帰。
+            while (Serial.availableForWrite() < 400 && guard++ < 300) {
+                delayMicroseconds(50);
+            }
+        }
+
         const Rec& r = buf[(start + i) % CAPACITY];
 
         const float thrBase = (r.flags & RF_ALT_ACT) ? Q::ALT_HOVER_THR : 0.0f;
@@ -732,7 +861,9 @@ inline void dump() {
             "%.4f,%.4f,"
             "%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,"
             "%.3f,%.3f,%d,"
-            "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f\n",
+            "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f,"
+            "%.3f,"
+            "%.4f,%.4f,%.4f\n",
             (unsigned long)r.t_ms, (unsigned long)r.dt_us, (int)r.mode,
             (r.flags & RF_ARMED) ? 1 : 0, r.thr / 250.0f,
             r.roll_stick / 100.0f, r.pitch_stick / 100.0f, r.yaw_stick / 100.0f,
@@ -756,7 +887,9 @@ inline void dump() {
             r.climb / S5T::SC_MM,
             (r.flags & RF_ALT_EN) ? 1 : 0, (r.flags & RF_ALT_ACT) ? 1 : 0,
             r.alt_holdm / S5T::SC_MM, r.alt_vzt / S5T::SC_MM, thrBase,
-            r.alt_corr / S5T::SC_1E4, r.alt_thr_out / 250.0f);
+            r.alt_corr / S5T::SC_1E4, r.alt_thr_out / 250.0f,
+            r.alt_used / 250.0f,
+            r.accx / S5T::SC_1E4, r.accy / S5T::SC_1E4, r.accz / S5T::SC_1E4);
     }
 
     Serial.println("LOG_STOP");
@@ -764,6 +897,58 @@ inline void dump() {
 }
 
 } // namespace RamLog
+
+// ============================================================
+//  StallLog  -  ループが異常に長くかかった回だけ、どの処理が原因かを
+//               区間ごとの所要時間で記録する (原因調査用)
+// ============================================================
+//  I2Cバスの瞬断とみられる長時間停止 (実測 818ms〜4.3秒) が発生している。
+//  I2Cdev::readTimeout短縮 (IMU.h) だけでは直らなかった。VL53L1Xは
+//  I2Cdevを経由せず生のWire呼び出しを使っているため対象外だった可能性が
+//  高いが、確証が無いので実際にどの区間で止まっているかを記録する。
+//  'w' キーで USB へダンプ。
+namespace StallLog {
+
+constexpr uint32_t THRESHOLD_US = 5000;  // これを超えた回だけ記録
+constexpr int       CAPACITY    = 32;    // 最初の32件だけ残す (以後は無視)
+
+struct Rec {
+    uint32_t t_ms;
+    uint32_t total_us;
+    uint32_t imu_us, sbus_us, flow_us, range_us, rx_us, ctrl_us;
+};
+
+DMAMEM Rec buf[CAPACITY];
+int count = 0;
+
+inline void maybeLog(uint32_t total_us, uint32_t imu_us, uint32_t sbus_us,
+                      uint32_t flow_us, uint32_t range_us, uint32_t rx_us,
+                      uint32_t ctrl_us) {
+    if (total_us < THRESHOLD_US) return;
+    if (count >= CAPACITY) return;   // 最初の数件が分かれば十分
+    Rec& r = buf[count++];
+    r.t_ms = millis();
+    r.total_us = total_us;
+    r.imu_us = imu_us; r.sbus_us = sbus_us; r.flow_us = flow_us;
+    r.range_us = range_us; r.rx_us = rx_us; r.ctrl_us = ctrl_us;
+}
+
+inline void dump() {
+    Serial.printf("StallLog: %d 件 (閾値 %lu us)\n", count,
+                  (unsigned long)THRESHOLD_US);
+    for (int i = 0; i < count; ++i) {
+        Rec& r = buf[i];
+        Serial.printf(" [%2d] t=%lums total=%luus  imu=%lu sbus=%lu flow=%lu"
+                      " range=%lu rx=%lu ctrl=%lu (us)\n",
+                      i, (unsigned long)r.t_ms, (unsigned long)r.total_us,
+                      (unsigned long)r.imu_us, (unsigned long)r.sbus_us,
+                      (unsigned long)r.flow_us, (unsigned long)r.range_us,
+                      (unsigned long)r.rx_us, (unsigned long)r.ctrl_us);
+    }
+    if (count == 0) Serial.println("  (異常な停止は記録されていません)");
+}
+
+} // namespace StallLog
 
 // ============================================================
 //  § 4-3  s5 解析テレメトリ (IM920SL -> 地上局CSV)
@@ -1071,28 +1256,35 @@ static void resetControllers() {
 
 static const char* modeName(S5::Mode m) {
     switch (m) {
-        case S5::MODE_AUTO:    return "AUTO   (地上局)";
-        case S5::MODE_POSHOLD: return "POSHOLD(フロー位置保持)";
-        case S5::MODE_ANGLE:   return "ANGLE  (水平維持)";
-        default:               return "RATE   (アクロ)";
+        case S5::MODE_AUTO:     return "AUTO   (地上局)";
+        case S5::MODE_POSHOLD:  return "POSHOLD(フロー位置保持)";
+        case S5::MODE_ALTHOLD:  return "ALTHOLD(高度保持のみ)";
+        case S5::MODE_ANGLE:    return "ANGLE  (水平維持)";
+        default:                return "RATE   (アクロ)";
     }
 }
 
 // ------------------------------------------------------------
-//  モード判定  — 2モードのみ。SW_HOVER の1本だけで決める。
+//  モード判定  — 3段階。SW_HOVER の1本だけで決める。
 //
-//    SW_HOVER=up かつ フロー生存 → POSHOLD (完全自動: 水平位置 + 高度)
-//    それ以外                    → ANGLE   (完全手動。これが bail-out)
+//    SW_HOVER=down(手前) → ANGLE   (完全手動。これが bail-out)
+//    SW_HOVER=cen (中央) → ALTHOLD (姿勢は手動、高度だけ自動保持)
+//    SW_HOVER=up  (奥)   → POSHOLD (完全自動: 水平位置 + 高度)。
+//                          フローが死んでいるときは ALTHOLD に自動フォールバック
+//                          (ALTHOLDにも高度手段が無ければ ANGLE 相当の動作になる)
 //
 //  ・SW_AUTO / 地上局AUTO / RATE(アクロ) は使わない (封印)。
-//  ・フローが死んでいるときは SW_HOVER=up でも ANGLE に落とす (安全側)。
 //  ・スロットルカット (THR_CUT) は selectMode より上位で、常にモーターを止める。
 // ------------------------------------------------------------
 static S5::Mode selectMode() {
     if (!S5::USE_SBUS) return S5::MODE_ANGLE;
 
-    if (sbus.Ch_state(Ch::SW_HOVER) == up && S5::USE_FLOW && g_flow_ok)
-        return S5::MODE_POSHOLD;
+    const Sw sw = sbus.Ch_state(Ch::SW_HOVER);
+    if (sw == up) {
+        if (S5::USE_FLOW && g_flow_ok) return S5::MODE_POSHOLD;
+        return S5::MODE_ALTHOLD;   // フロー喪失時のフォールバック
+    }
+    if (sw == cen) return S5::MODE_ALTHOLD;
     return S5::MODE_ANGLE;
 }
 
@@ -1153,15 +1345,24 @@ static void updateFlowHold(float dt_s) {
 static void updateAltHold(float dt_s) {
     const float thr = S5::USE_SBUS ? constrain(sbus.des[Ch::THR], 0.0f, 1.0f) : 0.0f;
 
+    // 前回の呼び出し以降にミキサーが実際に使ったスロットルの平均。
+    // まだ1回も回っていなければ -1 (= 情報なし) を渡す。
+    const float thr_applied = (g_thr_used_n > 0)
+                            ? (g_thr_used_sum / (float)g_thr_used_n)
+                            : -1.0f;
+    g_thr_used_sum = 0.0f;
+    g_thr_used_n   = 0;
+
     althold.update(dt_s,
                    g_alt_hold_enable && S5::USE_RANGE,
                    isArmed(),
-                   g_mode == S5::MODE_POSHOLD,
+                   g_mode == S5::MODE_POSHOLD || g_mode == S5::MODE_ALTHOLD,
                    g_range_valid,
                    g_range_fresh,
                    g_range_h_m,
                    g_climb_mps,
-                   thr);
+                   thr,
+                   thr_applied);
 }
 
 // ============================================================
@@ -1219,7 +1420,15 @@ static void updateControl(float dt_s) {
     //     有効になり、そこから通常の高度ホールドへ引き継がれる。
     //   ・空中で ANGLE から切り替えた場合: ホバー付近なので頭打ちに当たらず、
     //     測距を失っていても落ちない。
-    constexpr float POSHOLD_THR_CAP = Q::ALT_HOVER_THR + Q::ALT_THR_AUTH;
+    //  ★ 2026-09-07: 定義を ALT_HOVER_THR + ALT_THR_AUTH からベタ値に変えた。
+    //    ALT_THR_AUTH を 0.20 -> 0.55 に広げた時 (log_034 の転倒対策) に、この
+    //    上限も 0.80 -> 1.15 へ道連れで動いてしまい、「頭打ち」が実質無効化
+    //    されていた (上のコメントが書いている保護が消えていた)。
+    //    実測ホバーは 0.42 なので、0.55 なら離陸には十分な余裕があり、
+    //    かつ「姿勢を当てられないまま全開で上がる」は防げる。
+    constexpr float POSHOLD_THR_CAP = 0.55f;
+    static_assert(POSHOLD_THR_CAP > Q::ALT_HOVER_THR,
+                  "POSHOLD_THR_CAP がホバースロットル以下だと離陸できません");
 
     float thr;
     if (althold.active())               thr = althold.throttle();
@@ -1254,10 +1463,10 @@ static void updateControl(float dt_s) {
     }
 
     // ------------------------------------------------------------
-    //  外側ループ: 角度 → 目標角速度   (ANGLE / AUTO / POSHOLD, 200Hz)
+    //  外側ループ: 角度 → 目標角速度   (ANGLE / AUTO / ALTHOLD / POSHOLD, 200Hz)
     // ------------------------------------------------------------
     if (g_mode == S5::MODE_ANGLE || g_mode == S5::MODE_AUTO ||
-        g_mode == S5::MODE_POSHOLD) {
+        g_mode == S5::MODE_ALTHOLD || g_mode == S5::MODE_POSHOLD) {
 
         if (g_mode == S5::MODE_POSHOLD) {
             // 目標角は updateFlowHold() が FLOW_LOOP_HZ で計算済み (すでにクランプ済み)。
@@ -1265,8 +1474,10 @@ static void updateControl(float dt_s) {
             roll_axis.ang_tar  = poshold.leanRoll();
             pitch_axis.ang_tar = poshold.leanPitch();
         } else {
-            roll_axis.ang_tar  = roll_axis.stick  * Q::MAX_ANGLE_ROLL;
-            pitch_axis.ang_tar = pitch_axis.stick * Q::MAX_ANGLE_PITCH;
+            // ★ 2026-09-05: エクスポを追加。センター付近の細かい操作をしやすくする。
+            //   フルスティックでの最大角度・追従速度(角度ループのkp)は変えない。
+            roll_axis.ang_tar  = Q::stickExpo(roll_axis.stick,  Q::STICK_EXPO_ANGLE) * Q::MAX_ANGLE_ROLL;
+            pitch_axis.ang_tar = Q::stickExpo(pitch_axis.stick, Q::STICK_EXPO_ANGLE) * Q::MAX_ANGLE_PITCH;
         }
 
         if (++g_angle_div_count >= Q::ANGLE_LOOP_DIV) {
@@ -1345,6 +1556,11 @@ static void updateControl(float dt_s) {
 
     // --- ミキサー ---
     Q::mix(thr, roll_axis.cmd, pitch_axis.cmd, yaw_axis.cmd, g_out, &g_mix);
+
+    // 高度ホールドへ返すぶんを積算 (次の updateAltHold() で平均を取る)。
+    g_thr_used_sum += g_mix.thr_used;
+    g_thr_used_n   += 1;
+
     writeMotors();
 }
 
@@ -1429,13 +1645,11 @@ static void tuningMenu() {
     // s5c 高度ホールドのゲイン
     if (sel[0] == 's' || sel[0] == 't' || sel[0] == 'u' || sel[0] == 'v') {
         Q::Pid& arp = althold.ratePid();
-        if (sel[0] == 's') althold.setPosKp(constrain(v, 0.0f, 5.0f));
-        if (sel[0] == 't') arp.set_gains(constrain(v, 0.0f, 2.0f),
-                                                  arp.ki(), arp.kd());
-        if (sel[0] == 'u') arp.set_gains(arp.kp(),
-                                                  constrain(v, 0.0f, 2.0f), arp.kd());
-        if (sel[0] == 'v') arp.set_gains(arp.kp(), arp.ki(),
-                                                  constrain(v, 0.0f, 1.0f));
+        if (sel[0] == 's') althold.setPosKp(constrain(v, 0.0f, 100.0f));
+        // rate ゲインは上限クランプなし (負値だけ弾く。負だと正帰還で即発散)
+        if (sel[0] == 't') arp.set_gains(max(v, 0.0f), arp.ki(), arp.kd());
+        if (sel[0] == 'u') arp.set_gains(arp.kp(), max(v, 0.0f), arp.kd());
+        if (sel[0] == 'v') arp.set_gains(arp.kp(), arp.ki(), max(v, 0.0f));
         Serial.printf("更新: Alt pos P=%.3f  rate P=%.3f I=%.3f D=%.5f\n",
                       althold.posKp(), arp.kp(), arp.ki(), arp.kd());
         resetControllers();
@@ -1510,7 +1724,17 @@ static void handleSerial() {
 
     switch (c) {
         case 'p':
-            tuningMenu();
+            // ★ 2026-09-05: アーム中に誤って 'p' を押すと、tuningMenu() が
+            //   stopAllMotors() した直後、次のキー入力が来るまで制御ループを
+            //   丸ごと止めてしまう (実測5.86秒停止した例あり)。飛行中は推力
+            //   ゼロのままただ落ちるだけなので、アーム中は入れないようにする。
+            if (isArmed()) {
+                Serial.println("\n!! アーム中は 'p' メニューに入れません "
+                               "(モーター停止 + 制御ループ停止で落下するため)。"
+                               "ディスアームしてから押してください。");
+            } else {
+                tuningMenu();
+            }
             break;
         case 'i':
             i2cScan();
@@ -1557,6 +1781,10 @@ static void handleSerial() {
         case 'y':
             // RamLog の状態だけ見る (何行溜まっているか)。ダンプはしない。
             RamLog::status();
+            break;
+        case 'w':
+            // 原因調査用: ループが異常に長くかかった回の内訳をダンプする。
+            StallLog::dump();
             break;
         case 'g': {
             // s5c: 高度ホールド (スロットルPID) の ON/OFF トグル。
@@ -1612,7 +1840,7 @@ static void printStatus(uint32_t dt_us) {
                   (unsigned long)dt_us, 1000000.0f / (float)dt_us,
                   isArmed() ? "ARMED" : "DISARMED",
                   sbus.isSafe() ? "OK" : "LOST");
-    Serial.printf("MODE = %s   (SW_HOVER UP=POSHOLD[完全自動] / それ以外=ANGLE[手動])\n",
+    Serial.printf("MODE = %s   (SW_HOVER: down=ANGLE / cen=ALTHOLD / up=POSHOLD)\n",
                   modeName(g_mode));
 
     if (S5::USE_IM920) {
@@ -1628,7 +1856,7 @@ static void printStatus(uint32_t dt_us) {
     }
 
     if (g_mode == S5::MODE_ANGLE || g_mode == S5::MODE_AUTO ||
-        g_mode == S5::MODE_POSHOLD) {
+        g_mode == S5::MODE_ALTHOLD || g_mode == S5::MODE_POSHOLD) {
         Serial.println("\n[角度ループ]  目標[deg]  実測[deg]  → 角速度目標[deg/s]");
         Serial.printf("  roll  %10.1f %10.1f %18.1f\n",
                       roll_axis.ang_tar, roll_axis.ang_meas, roll_axis.rate_tar);
@@ -1738,7 +1966,8 @@ static void printStatus(uint32_t dt_us) {
     }
 
     Serial.println("\n[p]ゲイン [k]IMUキャリブ(EEPROM保存) [x]キャリブ消去 [r]PIDリセット "
-                   "[l]ログ(USB直結時) [v]RAMログdump [y]RAMログ状態 [z]フロー積算ゼロ "
+                   "[l]ログ(USB直結時) [v]RAMログdump [y]RAMログ状態 [w]停止調査ログdump "
+                   "[z]フロー積算ゼロ "
                    "[h]フロー高度(手動) [g]高度ホールド切替 [i]I2Cスキャン [m]ドライラン切替");
 }
 
@@ -1829,6 +2058,7 @@ void setup() {
 
 void loop() {
     if (!main_tick.ready()) return;
+    const uint32_t _t0 = micros();
 
     const float dt_s = (float)main_tick.dt_us * 1e-6f;
 
@@ -1836,7 +2066,10 @@ void loop() {
         mpu.update();
         g_att = Q::readAttitude(mpu);
     }
+    const uint32_t _t1 = micros();
+
     if (S5::USE_SBUS) sbus.update();
+    const uint32_t _t2 = micros();
 
     // --- オプティカルフロー (FLOW_LOOP_HZ) ---
     //  読んで機体座標化 + de-rotation + 対地速度換算 → updateFlowHold() で
@@ -1862,6 +2095,7 @@ void loop() {
         // s5b: 速度・位置ホールド
         updateFlowHold(flow_dt_s);
     }
+    const uint32_t _t3 = micros();
 
     // --- s5c: 距離センサ (RANGE_LOOP_HZ) ---
     //  測距を非ブロッキングで読み、傾き補正した鉛直高度を flow へ渡す。
@@ -1884,14 +2118,21 @@ void loop() {
         // s5c: 高度ホールド (スロットルPID)
         updateAltHold(range_dt_s);
     }
+    const uint32_t _t4 = micros();
 
     // 地上局からの受信。groundLinkFresh() の判定に使うので制御より前に読む。
     // (PIDゲインのリモート調整やリモートリセットは行わない。receive() は
     //  GroundData を取り込んで鮮度を更新するだけ)
     if (S5::USE_IM920 && telem_rx_tick.ready()) telemetry.receive();
+    const uint32_t _t5 = micros();
 
     updateControl(dt_s);
+    const uint32_t _t6 = micros();
     handleSerial();
+    const uint32_t _t7 = micros();
+
+    StallLog::maybeLog(_t7 - _t0, _t1 - _t0, _t2 - _t1, _t3 - _t2,
+                       _t4 - _t3, _t5 - _t4, _t6 - _t5);
 
     // 500Hz ログ (制御の直後。この周期の指令と出力が揃った状態で落とす)
     Log::sample(main_tick.dt_us, (int)g_mode, isArmed(),
