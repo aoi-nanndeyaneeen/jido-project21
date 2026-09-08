@@ -58,7 +58,16 @@ public:
         _min_m = Quad::RANGE_MIN_M;
         _max_m = Quad::RANGE_MAX_M;
         // IMU::begin() が先に Wire.begin() 済みのはずだが、単体でも動くよう保険。
-        Wire.begin();
+        // ★ 2026-09-05: Teensy の TwoWire::begin(void) は内部で無条件に
+        //   setClock(100000) する (WireIMXRT.cpp)。IMU::begin() が先に
+        //   400kHz にセットしていても、ここで Wire.begin() を呼ぶと
+        //   サイレントに100kHzへ巻き戻ってしまい、以後の全I2C通信
+        //   (IMUの毎ループ読み取りも含む) が4倍遅くなっていた
+        //   (実測: getMotion6() が理論値約400usに対して実測1566us)。
+        //   Wire.begin() を消しても単体動作は壊さない (setBus/setTimeout/
+        //   init は Wire オブジェクトの既存状態を使うだけ) ので、ここでは
+        //   呼ばずに setClock() だけ再アサートする。
+        Wire.setClock(400000);
         _sensor.setBus(&Wire);
         _sensor.setTimeout(500);
         if (!_sensor.init()) { _ok_init = false; return false; }

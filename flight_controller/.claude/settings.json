@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($env:PATH += \";$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\"; pio run -e drone_s5 2>&1 | Select-Object -Last 6)"
+    ]
+  }
+}
