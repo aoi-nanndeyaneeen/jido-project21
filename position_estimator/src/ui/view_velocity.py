@@ -1,22 +1,10 @@
 import cv2
 import numpy as np
-import math
 import time
 from collections import deque
 
 from utils.config import VELOCITY_SMOOTH_FRAMES, VIEW_X, VIEW_Y
-
-
-def _nice_step(span, target_ticks=6):
-    """目盛り間隔を 1/2/2.5/5 × 10^n に丸める。"""
-    if span <= 0:
-        return 1.0
-    raw = span / target_ticks
-    mag = 10 ** math.floor(math.log10(raw))
-    for mult in (1, 2, 2.5, 5, 10):
-        if raw <= mult * mag:
-            return mult * mag
-    return 10 * mag
+from ui._scale import nice_step, tick_decimals, format_tick, ticks
 
 
 class ViewVelocity:
@@ -76,23 +64,23 @@ class ViewVelocity:
         cv2.rectangle(image, (left, top), (right, bottom), (255, 255, 255), -1)
 
         # データ座標に沿ったグリッド + 目盛り値
-        step_x = _nice_step(self._vx[1] - self._vx[0])
-        tick = math.ceil(self._vx[0] / step_x) * step_x
-        while tick <= self._vx[1] + 1e-6:
+        step_x = nice_step(self._vx[1] - self._vx[0])
+        step_y = nice_step(self._vy[1] - self._vy[0])
+        decimals = tick_decimals(min(step_x, step_y))
+
+        for tick in ticks(self._vx[0], self._vx[1], step_x):
             px, _ = self._top_point(tick, self._vy[0])
             if left <= px <= right:
                 cv2.line(image, (px, top), (px, bottom), (228, 228, 228), 1)
-                cv2.putText(image, f"{tick:.0f}", (px - 8, bottom + 15), font, 0.4, (110, 110, 110), 1)
-            tick += step_x
+                cv2.putText(image, format_tick(tick, decimals), (px - 10, bottom + 15),
+                            font, 0.4, (110, 110, 110), 1)
 
-        step_y = _nice_step(self._vy[1] - self._vy[0])
-        tick = math.ceil(self._vy[0] / step_y) * step_y
-        while tick <= self._vy[1] + 1e-6:
+        for tick in ticks(self._vy[0], self._vy[1], step_y):
             _, py = self._top_point(self._vx[0], tick)
             if top <= py <= bottom:
                 cv2.line(image, (left, py), (right, py), (228, 228, 228), 1)
-                cv2.putText(image, f"{tick:.0f}", (left - 28, py + 4), font, 0.4, (110, 110, 110), 1)
-            tick += step_y
+                cv2.putText(image, format_tick(tick, decimals), (left - 30, py + 4),
+                            font, 0.4, (110, 110, 110), 1)
 
         cv2.rectangle(image, (left, top), (right, bottom), (120, 120, 120), 1)
 
@@ -107,18 +95,22 @@ class ViewVelocity:
         cv2.putText(image, "X [m]", (right - 45, bottom + 30), font, 0.5, (80, 80, 80), 1)
         cv2.putText(image, "Y [m]", (4, top + 6), font, 0.5, (80, 80, 80), 1)
 
+        box = (left, top, right - left, bottom - top)
         points = [(t, p) for t, p in self._history if p is not None]
         for previous, current in zip(points, points[1:]):
-            cv2.line(image, self._top_point(previous[1][0], previous[1][1]),
-                     self._top_point(current[1][0], current[1][1]),
-                     (40, 160, 115), 2, cv2.LINE_AA)
+            ok, a, b = cv2.clipLine(box, self._top_point(previous[1][0], previous[1][1]),
+                                    self._top_point(current[1][0], current[1][1]))
+            if ok:
+                cv2.line(image, a, b, (40, 160, 115), 2, cv2.LINE_AA)
         if P is not None:
             point = self._top_point(P[0], P[1])
             if left <= point[0] <= right and top <= point[1] <= bottom:
                 cv2.circle(image, point, 7, (40, 160, 115), -1, cv2.LINE_AA)
                 if np.linalg.norm(velocity[:2]) > 0.1:
                     end = self._top_point(P[0] + velocity[0], P[1] + velocity[1])
-                    cv2.arrowedLine(image, point, end, (60, 70, 220), 2, cv2.LINE_AA, tipLength=0.2)
+                    ok, a, b = cv2.clipLine(box, point, end)
+                    if ok:
+                        cv2.arrowedLine(image, a, b, (60, 70, 220), 2, cv2.LINE_AA, tipLength=0.2)
 
     def _draw_metrics(self, image, speed_h, speed_3d, altitude_rate, altitude):
         x = 660

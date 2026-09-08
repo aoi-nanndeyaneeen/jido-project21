@@ -4,6 +4,7 @@ import time
 from collections import deque
 
 from utils.config import VIEW_X, VIEW_Y, VIEW_Z
+from ui._scale import nice_step, tick_decimals, format_tick, ticks
 
 
 class ViewGraph:
@@ -48,13 +49,14 @@ class ViewGraph:
         cv2.rectangle(image, (left, top), (right, bottom), (100, 100, 100), 1)
 
         # 横グリッド + Y軸目盛り（値）
-        rows = 5
-        for i in range(rows + 1):
-            y = int(top + i * (bottom - top) / rows)
-            if 0 < i < rows:
+        step_y = nice_step(y_max - y_min, target_ticks=6)
+        decimals = tick_decimals(step_y)
+        for val in ticks(y_min, y_max, step_y):
+            ratio = (val - y_min) / max(y_max - y_min, 1e-6)
+            y = int(bottom - ratio * (bottom - top))
+            if top < y < bottom:
                 cv2.line(image, (left, y), (right, y), (225, 225, 225), 1)
-            val = y_max - i * (y_max - y_min) / rows
-            cv2.putText(image, f"{val:.1f}", (4, y + 4), font, 0.38, (90, 90, 90), 1)
+            cv2.putText(image, format_tick(val, decimals), (4, y + 4), font, 0.38, (90, 90, 90), 1)
 
         # 縦グリッド + X軸目盛り（時間 [s]、右端が現在）
         cols = 5
