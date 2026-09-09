@@ -88,4 +88,8 @@ public:
     bool isSafe() {
         return !_data.failsafe && !(connection_fail>3000);
     }
+
+    // 直近 update() でフレームを取れなかった連続回数。0 = 今まさに受信できている。
+    // 起動時に「受信機がつながっているか」を判定するのに使う。
+    int failCount() const { return connection_fail; }
 };

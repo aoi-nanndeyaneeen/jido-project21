@@ -99,8 +99,12 @@ public:
 
         mpu.initialize();
 
-        // --- スケール強制設定 MPU6050 (±2g / ±250dps) ---
-        wire->beginTransmission(0x68); wire->write(0x1C); wire->write(0x00); wire->endTransmission(); // Accel ±2g
+        // --- スケール強制設定 MPU6050 (±8g / ±250dps) ---
+        //  ★ 2026-09-09: Accel を ±2g(0x00) -> ±8g(0x10) に。理由は Config.h の
+        //    ACCEL_SCALE のコメント参照 (上下逆マウント + s_az_bias≈-2 で上向き
+        //    加速の余裕が 1g しか無く、AltEstimator が飽和していた)。
+        //    ACCEL_SCALE = 4096.0f と対で変えること。
+        wire->beginTransmission(0x68); wire->write(0x1C); wire->write(0x10); wire->endTransmission(); // Accel ±8g
         wire->beginTransmission(0x68); wire->write(0x1B); wire->write(0x00); wire->endTransmission(); // Gyro ±250dps
         
         // ★ここを追加：DLPF (Digital Low Pass Filter) を42Hzに設定
@@ -119,6 +123,9 @@ public:
                       Config::sensor::s_az_bias, Config::sensor::s_gx_bias,
                       Config::sensor::s_gy_bias, Config::sensor::s_gz_bias);
     }
+
+    // I2C 上で MPU6050 が応答し WHO_AM_I が一致するか (起動時のデバイスチェック用)。
+    bool connected() { return mpu.testConnection(); }
 
     void update() {
         // センサから生データを読み出す
@@ -246,8 +253,9 @@ public:
             Serial.printf("   実測 ax=%+.4f ay=%+.4f az=%+.4f |a|=%.4f g   "
                           "傾き %.1f deg   ジャイロ振れ幅 %.2f deg/s\n",
                           m_ax, m_ay, m_az, g_norm, tilt_deg, g_span);
-            Serial.printf("   許容: 傾き < %.1f deg / ジャイロ振れ幅 < %.1f deg/s / az > 0\n",
+            Serial.printf("   許容: 傾き < %.1f deg / ジャイロ振れ幅 < %.1f deg/s / |a| ≒ 1g\n",
                           MAX_CAL_TILT_DEG, MAX_CAL_GYRO_SPAN);
+            Serial.println("   (az の符号は問わない。IMU 上下逆マウントでも az≈-1g で通る)");
             Serial.println("   → 水平な床に置き、手を離して静止させてから 'k' を押し直してください。");
             Serial.println("   キャリブレーション値は変更していません (前の値のまま)。");
             return;

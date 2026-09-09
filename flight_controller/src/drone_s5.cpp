@@ -99,6 +99,7 @@
 #include "quad/PosHold.h"
 #include "quad/AltHold.h"        // s5c: 高度ホールド (カスケード + engage 状態遷移)
 #include "quad/AltEstimator.h"   // s5c: 加速度Z×測距の相補フィルタ (高度・上昇速度の推定)
+#include "quad/SdLog.h"          // 飛行まるごとSDへストリーミング + 着陸後CSV変換 (HW-125, CS=9)
 
 namespace Q = Quad;
 
@@ -403,6 +404,9 @@ uint32_t g_thr_used_n   = 0;
 // ドライラン: true の間は ESC へ 0 しか送らない (g_out は計算・記録する)
 bool  g_dry_run = S5::DRY_RUN;
 
+// ---- SD ログ (HW-125, CS=9, SPI0 を PMW3901 と共有) ----
+bool  g_sd_ok              = false;   // SdLog::begin() が成功したか
+
 } // anonymous namespace
 
 // ============================================================
@@ -591,6 +595,12 @@ enum RFlag : uint16_t {
     RF_HOLDING  = 1u << 5,   // poshold.holding()
 };
 
+// ★ Rec の列を足す/型を変えたら +1 する。SdLog の BIN ヘッダに書き込まれ、
+//   SdLog::convertLast() と scripts/bin2csv.py が古い BIN を弾くのに使う。
+// v2 (2026-09-09): accx/accy/accz の量子化スケールを SC_1E4 -> 1000 に変更
+//   (±8g 化で値域が広がり ±3.27g で頭打ちしていた)。列の並び・サイズは不変。
+constexpr uint8_t REC_VER = 2;
+
 struct __attribute__((packed)) Rec {
     uint32_t t_ms;
     uint16_t dt_us;
@@ -630,6 +640,9 @@ struct __attribute__((packed)) Rec {
     int16_t  est_vz;                                // mm/s
     int16_t  est_bias;                              // m/s^2 x1e3
 };
+// ★ この値が変わる = SD の BIN 形式が変わった。REC_VER を +1 し、
+//   scripts/bin2csv.py の _FIELDS / REC_VER も合わせること。
+static_assert(sizeof(Rec) == 116, "RamLog::Rec のサイズが変わった。上のコメント参照");
 
 // OCRAM2 (DMAMEM) に置く。RAM1 (スタック/大半の変数) と競合しない。
 DMAMEM Rec buf[CAPACITY];
@@ -648,6 +661,12 @@ bool     manual_trigger = false;  // ベンチ検証用の手動トリガ中か 
 inline void resetBuffer() {
     head = 0; count = 0; wrapped = false; div_cnt = 0;
 }
+
+// 定義は update() の直後。update() と loop() の SD ストリーミングが共用する。
+inline void fillRec(Rec& r, uint32_t dt_us, int mode, bool armed, float thr);
+// with_prefix=true  : "DATA,..." 形式 (USB ダンプ用。scripts/logger.py が剥がす)
+// with_prefix=false : 先頭 "DATA," 無し (SD 上の .CSV 用。そのまま analyze_log.py に食わせる)
+void formatRow(Print& out, const Rec& r, bool with_prefix = true);
 
 // ★ 2026-09-06: ベンチ検証用の手動トリガ。
 //   通常のトリガは armed && thr>0.20 が条件だが、加速度Z相補フィルタの
@@ -721,7 +740,18 @@ inline void update(uint32_t dt_us, int mode, bool armed, float thr) {
     if (++div_cnt < DIV) return;
     div_cnt = 0;
 
-    Rec& r = buf[head];
+    fillRec(buf[head], dt_us, mode, armed, thr);
+
+    head = (head + 1) % CAPACITY;
+    if (count < CAPACITY) ++count;
+    else wrapped = true;
+}
+
+// 1レコードぶんを「今の全グローバル状態」から量子化して埋める。
+// RamLog::update() (RAM リング) と SdLog へのストリーミング (loop() 内) の
+// 両方がこれを呼ぶので、列の追加はここ 1 箇所だけで済む。
+// ★ 列を足したら Rec / REC_VER / formatRow() / scripts の 3 つも合わせること。
+inline void fillRec(Rec& r, uint32_t dt_us, int mode, bool armed, float thr) {
     r.t_ms = millis();
     r.dt_us = (uint16_t)constrain(dt_us, 0u, 65535u);
 
@@ -798,18 +828,70 @@ inline void update(uint32_t dt_us, int mode, bool armed, float thr) {
     r.alt_used      = S5T::qu8(g_mix.thr_used,   250.0f);
 
     // 2026-09-06: 加速度Z相補フィルタ検討用 (制御には未使用)。
-    r.accx = S5T::q16(g_att.acc_x, S5T::SC_1E4);
-    r.accy = S5T::q16(g_att.acc_y, S5T::SC_1E4);
-    r.accz = S5T::q16(g_att.acc_z, S5T::SC_1E4);
+    // ★ 2026-09-09: scale を SC_1E4(±3.27g で飽和) -> 1000(±32.7g) に。
+    //   ±8g 化 + s_az_bias≈-2 で acc_z は [-10,+6] を取りうるため、
+    //   従来スケールだと BIN 上で頭打ちしていた (REC_VER 2)。
+    r.accx = S5T::q16(g_att.acc_x, 1000.0f);
+    r.accy = S5T::q16(g_att.acc_y, 1000.0f);
+    r.accz = S5T::q16(g_att.acc_z, 1000.0f);
     //  acc_up / est_bias は m/s^2。1e3 倍で ±32 m/s^2 まで入る。
     r.acc_up   = S5T::q16(altest.accUp(),    1000.0f);
     r.est_h    = S5T::q16(altest.heightM(),  S5T::SC_MM);
     r.est_vz   = S5T::q16(altest.climbMps(), S5T::SC_MM);
     r.est_bias = S5T::q16(altest.biasMps2(), 1000.0f);
+}
 
-    head = (head + 1) % CAPACITY;
-    if (count < CAPACITY) ++count;
-    else wrapped = true;
+// 1レコードを CSV の 1 行 ("DATA,....\n") にして out へ書く。
+// out は Serial (RamLog::dump) でも FsFile (SdLog::convertLast の CSV 変換) でもよい。
+// 列順・フォーマットは Log::HEADER と厳密に一致させること
+// (scripts/analyze_log.py が列名で参照するので、順序が命)。
+void formatRow(Print& out, const Rec& r, bool with_prefix) {
+    const float thrBase = (r.flags & RF_ALT_ACT) ? Q::ALT_HOVER_THR : 0.0f;
+    if (with_prefix) out.print("DATA,");
+    out.printf(
+        "%lu,%lu,%d,%d,%.3f,"
+        "%.3f,%.3f,%.3f,"
+        "%.2f,%.2f,%.2f,"
+        "%.2f,%.2f,%.2f,"
+        "%.4f,%.4f,%.4f,"
+        "%.3f,%.3f,%.3f,%.3f,%.3f,%u,"
+        "%.1f,%.1f,%.1f,%.1f,"
+        "%d,%.1f,%.1f,%.1f,%.1f,%.3f,%.3f,%.2f,"
+        "%.4f,%.4f,"
+        "%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,"
+        "%.3f,%.3f,%d,"
+        "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f,"
+        "%.3f,"
+        "%.4f,%.4f,%.4f,"
+        "%.3f,%.3f,%.3f,%.3f\n",
+        (unsigned long)r.t_ms, (unsigned long)r.dt_us, (int)r.mode,
+        (r.flags & RF_ARMED) ? 1 : 0, r.thr / 250.0f,
+        r.roll_stick / 100.0f, r.pitch_stick / 100.0f, r.yaw_stick / 100.0f,
+        r.roll_ang / S5T::SC_CDEG, r.pitch_ang / S5T::SC_CDEG, r.yaw_est / S5T::SC_CDEG,
+        r.roll_rate / S5T::SC_DDEG, r.pitch_rate / S5T::SC_DDEG, r.yaw_rate / S5T::SC_DDEG,
+        r.roll_cmd / S5T::SC_1E4, r.pitch_cmd / S5T::SC_1E4, r.yaw_cmd / S5T::SC_1E4,
+        r.m1 / 250.0f, r.m2 / 250.0f, r.m3 / 250.0f, r.m4 / 250.0f,
+        r.span_limit / 1000.0f, (unsigned)r.mixsat,
+        r.roll_ratetar / S5T::SC_DDEG, r.pitch_ratetar / S5T::SC_DDEG,
+        r.roll_angtar / S5T::SC_CDEG, r.pitch_angtar / S5T::SC_CDEG,
+        (r.flags & RF_FLOW_OK) ? 1 : 0,
+        r.flow_raw_x / 10.0f, r.flow_raw_y / 10.0f, r.flow_dx / 10.0f, r.flow_dy / 10.0f,
+        r.flow_vx / S5T::SC_MM, r.flow_vy / S5T::SC_MM, r.flow_h / S5T::SC_MM,
+        (double)r.flow_accx, (double)r.flow_accy,
+        r.fh_vxc / S5T::SC_MM, r.fh_vyc / S5T::SC_MM, r.fh_vxt / S5T::SC_MM, r.fh_vyt / S5T::SC_MM,
+        r.fh_leanr / S5T::SC_CDEG, r.fh_leanp / S5T::SC_CDEG,
+        r.fh_posn / S5T::SC_MM, r.fh_pose / S5T::SC_MM,
+        r.fh_holdn / S5T::SC_MM, r.fh_holde / S5T::SC_MM,
+        (r.flags & RF_HOLDING) ? 1 : 0,
+        (r.flags & RF_RANGE_OK) ? 1 : 0, r.range_raw / S5T::SC_MM, r.range_h / S5T::SC_MM,
+        r.climb / S5T::SC_MM,
+        (r.flags & RF_ALT_EN) ? 1 : 0, (r.flags & RF_ALT_ACT) ? 1 : 0,
+        r.alt_holdm / S5T::SC_MM, r.alt_vzt / S5T::SC_MM, thrBase,
+        r.alt_corr / S5T::SC_1E4, r.alt_thr_out / 250.0f,
+        r.alt_used / 250.0f,
+        r.accx / 1000.0f, r.accy / 1000.0f, r.accz / 1000.0f,
+        r.acc_up / 1000.0f, r.est_h / S5T::SC_MM,
+        r.est_vz / S5T::SC_MM, r.est_bias / 1000.0f);
 }
 
 inline void status() {
@@ -865,54 +947,7 @@ inline void dump() {
             }
         }
 
-        const Rec& r = buf[(start + i) % CAPACITY];
-
-        const float thrBase = (r.flags & RF_ALT_ACT) ? Q::ALT_HOVER_THR : 0.0f;
-
-        Serial.printf(
-            "DATA,%lu,%lu,%d,%d,%.3f,"
-            "%.3f,%.3f,%.3f,"
-            "%.2f,%.2f,%.2f,"
-            "%.2f,%.2f,%.2f,"
-            "%.4f,%.4f,%.4f,"
-            "%.3f,%.3f,%.3f,%.3f,%.3f,%u,"
-            "%.1f,%.1f,%.1f,%.1f,"
-            "%d,%.1f,%.1f,%.1f,%.1f,%.3f,%.3f,%.2f,"
-            "%.4f,%.4f,"
-            "%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,"
-            "%.3f,%.3f,%d,"
-            "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f,"
-            "%.3f,"
-            "%.4f,%.4f,%.4f,"
-            "%.3f,%.3f,%.3f,%.3f\n",
-            (unsigned long)r.t_ms, (unsigned long)r.dt_us, (int)r.mode,
-            (r.flags & RF_ARMED) ? 1 : 0, r.thr / 250.0f,
-            r.roll_stick / 100.0f, r.pitch_stick / 100.0f, r.yaw_stick / 100.0f,
-            r.roll_ang / S5T::SC_CDEG, r.pitch_ang / S5T::SC_CDEG, r.yaw_est / S5T::SC_CDEG,
-            r.roll_rate / S5T::SC_DDEG, r.pitch_rate / S5T::SC_DDEG, r.yaw_rate / S5T::SC_DDEG,
-            r.roll_cmd / S5T::SC_1E4, r.pitch_cmd / S5T::SC_1E4, r.yaw_cmd / S5T::SC_1E4,
-            r.m1 / 250.0f, r.m2 / 250.0f, r.m3 / 250.0f, r.m4 / 250.0f,
-            r.span_limit / 1000.0f, (unsigned)r.mixsat,
-            r.roll_ratetar / S5T::SC_DDEG, r.pitch_ratetar / S5T::SC_DDEG,
-            r.roll_angtar / S5T::SC_CDEG, r.pitch_angtar / S5T::SC_CDEG,
-            (r.flags & RF_FLOW_OK) ? 1 : 0,
-            r.flow_raw_x / 10.0f, r.flow_raw_y / 10.0f, r.flow_dx / 10.0f, r.flow_dy / 10.0f,
-            r.flow_vx / S5T::SC_MM, r.flow_vy / S5T::SC_MM, r.flow_h / S5T::SC_MM,
-            (double)r.flow_accx, (double)r.flow_accy,
-            r.fh_vxc / S5T::SC_MM, r.fh_vyc / S5T::SC_MM, r.fh_vxt / S5T::SC_MM, r.fh_vyt / S5T::SC_MM,
-            r.fh_leanr / S5T::SC_CDEG, r.fh_leanp / S5T::SC_CDEG,
-            r.fh_posn / S5T::SC_MM, r.fh_pose / S5T::SC_MM,
-            r.fh_holdn / S5T::SC_MM, r.fh_holde / S5T::SC_MM,
-            (r.flags & RF_HOLDING) ? 1 : 0,
-            (r.flags & RF_RANGE_OK) ? 1 : 0, r.range_raw / S5T::SC_MM, r.range_h / S5T::SC_MM,
-            r.climb / S5T::SC_MM,
-            (r.flags & RF_ALT_EN) ? 1 : 0, (r.flags & RF_ALT_ACT) ? 1 : 0,
-            r.alt_holdm / S5T::SC_MM, r.alt_vzt / S5T::SC_MM, thrBase,
-            r.alt_corr / S5T::SC_1E4, r.alt_thr_out / 250.0f,
-            r.alt_used / 250.0f,
-            r.accx / S5T::SC_1E4, r.accy / S5T::SC_1E4, r.accz / S5T::SC_1E4,
-            r.acc_up / 1000.0f, r.est_h / S5T::SC_MM,
-            r.est_vz / S5T::SC_MM, r.est_bias / 1000.0f);
+        formatRow(Serial, buf[(start + i) % CAPACITY]);
     }
 
     Serial.println("LOG_STOP");
@@ -920,6 +955,143 @@ inline void dump() {
 }
 
 } // namespace RamLog
+
+// ============================================================
+//  SelfTest  -  起動時に「どのデバイスがつながっているか」を 1 回だけ調べ、
+//               結果を保持して 起動後も画面に残す
+// ============================================================
+//  setup() 末尾で probe() を呼ぶ。結果は:
+//    ・その場で詳細ブロックを Serial に出す
+//    ・printStatus() が毎フレーム 1 行 (compact) を出すので画面に残り続ける
+//    ・シリアル 'd' で詳細ブロックを再表示できる
+//  ※ IMU/測距/フロー/SD は「起動時に応答したか」の固定スナップショット。
+//    SBUS/IM920 は起動時に信号が来ていたか。飛行中の生死は printStatus の
+//    link= / IM920 link= 行が別に出す。
+// ============================================================
+namespace SelfTest {
+
+enum St : uint8_t { ST_SKIP, ST_OK, ST_FAIL, ST_NOSIG };
+
+struct Dev {
+    const char* name;
+    const char* bus;
+    St          st;
+    char        note[40];
+};
+
+// 並びはバス順 (I2C → SPI → UART)
+Dev devs[] = {
+    { "IMU MPU6050",  "I2C 0x68", ST_SKIP, "" },
+    { "Rangefinder",  "I2C/PW",   ST_SKIP, "" },
+    { "PMW3901 flow", "SPI CS10", ST_SKIP, "" },
+    { "SD HW-125",    "SPI CS9",  ST_SKIP, "" },
+    { "SBUS RX",      "Serial5",  ST_SKIP, "" },
+    { "IM920",        "Serial3",  ST_SKIP, "" },
+};
+constexpr int N = sizeof(devs) / sizeof(devs[0]);
+enum { D_IMU, D_RANGE, D_FLOW, D_SD, D_SBUS, D_IM920 };
+
+inline const char* tag(St s) {
+    switch (s) {
+        case ST_OK:    return "OK ";
+        case ST_FAIL:  return "FAIL";
+        case ST_NOSIG: return "--  ";
+        default:       return "skip";
+    }
+}
+
+// 起動時に1回。ブロッキングで良い (まだ飛んでいない)。
+inline void probe() {
+    // --- IMU (I2C 0x68, WHO_AM_I) ---
+    if (S5::USE_MPU) {
+        devs[D_IMU].st = mpu.connected() ? ST_OK : ST_FAIL;
+        if (devs[D_IMU].st == ST_FAIL)
+            strcpy(devs[D_IMU].note, "応答なし SDA18/SCL19");
+    }
+
+    // --- 測距 (VL53L1X I2C 0x29 / MaxBotix PW) ---
+    if (S5::USE_RANGE) {
+        const bool sonar = (Q::RANGE_BACKEND == Q::RangeBackend::Sonar_EZ);
+        devs[D_RANGE].bus = sonar ? "PW pin" : "I2C 0x29";
+        devs[D_RANGE].st  = g_range_ok ? ST_OK : ST_FAIL;
+        strcpy(devs[D_RANGE].note, sonar ? "MaxBotix EZ" : "VL53L1X");
+    }
+
+    // --- PMW3901 (SPI CS10) ---
+    if (S5::USE_FLOW) {
+        devs[D_FLOW].st = g_flow_ok ? ST_OK : ST_FAIL;
+        if (devs[D_FLOW].st == ST_FAIL) strcpy(devs[D_FLOW].note, "応答なし");
+    }
+
+    // --- SD HW-125 (SPI CS9) ---
+    devs[D_SD].st = g_sd_ok ? ST_OK : ST_FAIL;
+    strcpy(devs[D_SD].note, g_sd_ok ? "" : "VCC=5V/FAT32/配線");
+
+    // --- SBUS: ~250ms 受信機のフレームを待つ ---
+    if (S5::USE_SBUS) {
+        devs[D_SBUS].st = ST_NOSIG;
+        const uint32_t t0 = millis();
+        while (millis() - t0 < 250) {
+            sbus.update();
+            if (sbus.failCount() == 0) { devs[D_SBUS].st = ST_OK; break; }
+        }
+        if (devs[D_SBUS].st == ST_NOSIG)
+            strcpy(devs[D_SBUS].note, "信号なし(受信機OFF/未接続?)");
+    }
+
+    // --- IM920: RDID を送って ~300ms 応答を待つ ---
+    if (S5::USE_IM920) {
+        while (Serial3.available()) Serial3.read();      // 掃除
+        Serial3.print("RDID\r\n");
+        String resp;
+        const uint32_t t0 = millis();
+        while (millis() - t0 < 300) {
+            while (Serial3.available()) resp += (char)Serial3.read();
+        }
+        resp.trim();
+        if (resp.length() > 0) {
+            devs[D_IM920].st = ST_OK;
+            resp.replace("\r", " "); resp.replace("\n", " ");
+            snprintf(devs[D_IM920].note, sizeof(devs[D_IM920].note), "resp:%s", resp.c_str());
+        } else {
+            devs[D_IM920].st = ST_NOSIG;
+            strcpy(devs[D_IM920].note, "無応答 (baud/配線/電源?)");
+        }
+        while (Serial3.available()) Serial3.read();      // 応答の残りを main ループへ持ち越さない
+    }
+}
+
+// 詳細ブロック (setup 末尾 と 'd' で表示)
+inline void printFull(Print& out) {
+    out.println();
+    out.println("=== 起動時デバイスチェック ===");
+    for (int i = 0; i < N; ++i) {
+        out.printf("  [%s] %-13s %-9s %s\n",
+                   tag(devs[i].st), devs[i].name, devs[i].bus, devs[i].note);
+    }
+    out.println("  (IMU/測距/フロー/SD は起動時スナップショット。"
+                "SBUS/IM920 の現在値は下の link= 行)");
+    out.println("=============================");
+}
+
+// printStatus() の 1 行 (画面に残す用)
+inline void printCompact(Print& out) {
+    out.print("DEV(boot): ");
+    for (int i = 0; i < N; ++i) {
+        const char* s = devs[i].st == ST_OK ? "OK"
+                      : devs[i].st == ST_FAIL ? "X"
+                      : devs[i].st == ST_NOSIG ? "--" : "sk";
+        // name の先頭語だけ短く出す
+        char short_name[8];
+        int k = 0;
+        for (const char* p = devs[i].name; *p && *p != ' ' && k < 7; ++p) short_name[k++] = *p;
+        short_name[k] = 0;
+        out.printf("%s:%s ", short_name, s);
+    }
+    out.println();
+}
+
+} // namespace SelfTest
 
 // ============================================================
 //  StallLog  -  ループが異常に長くかかった回だけ、どの処理が原因かを
@@ -1829,6 +2001,15 @@ static void handleSerial() {
                             ? "  ※ただし今は測距が無効なので効きません" : "");
             break;
         }
+        case 'd':
+            // 起動時デバイスチェックの結果を再表示する (画面クリアで流れたとき用)
+            SelfTest::printFull(Serial);
+            break;
+        case 's':
+            // SD の状態表示。ディスアーム中は単体テスト (再init + 書込/読戻 + エラーコード) も走る。
+            SdLog::status();
+            if (!isArmed()) SdLog::selftest(Serial);
+            break;
         case 'z':
             // フロー積算のゼロ。既知距離キャリブレーションの開始点。
             g_flow_acc_raw_x = g_flow_acc_raw_y = 0.0;
@@ -1872,6 +2053,7 @@ static void printStatus(uint32_t dt_us) {
                   sbus.isSafe() ? "OK" : "LOST");
     Serial.printf("MODE = %s   (SW_HOVER: down=ANGLE / cen=ALTHOLD / up=POSHOLD)\n",
                   modeName(g_mode));
+    SelfTest::printCompact(Serial);   // 起動時に何がつながっていたか (画面に残す)
 
     if (S5::USE_IM920) {
         const GroundData& g = telemetry.lastGroundData();
@@ -1884,6 +2066,8 @@ static void printStatus(uint32_t dt_us) {
                       (unsigned long)s5tx.sent(), (unsigned long)s5tx.dropped(),
                       s5tx.busy() ? "(sending)" : "");
     }
+
+    if (g_sd_ok) SdLog::brief(Serial);
 
     if (g_mode == S5::MODE_ANGLE || g_mode == S5::MODE_AUTO ||
         g_mode == S5::MODE_ALTHOLD || g_mode == S5::MODE_POSHOLD) {
@@ -1998,7 +2182,8 @@ static void printStatus(uint32_t dt_us) {
     Serial.println("\n[p]ゲイン [k]IMUキャリブ(EEPROM保存) [x]キャリブ消去 [r]PIDリセット "
                    "[l]ログ(USB直結時) [v]RAMログdump [y]RAMログ状態 [w]停止調査ログdump "
                    "[z]フロー積算ゼロ "
-                   "[h]フロー高度(手動) [g]高度ホールド切替 [i]I2Cスキャン [m]ドライラン切替");
+                   "[h]フロー高度(手動) [g]高度ホールド切替 [i]I2Cスキャン [m]ドライラン切替 "
+                   "[s]SD状態/単体テスト [d]起動時デバイスチェック再表示");
 }
 
 // ============================================================
@@ -2012,6 +2197,15 @@ void setup() {
     Serial.println("\n\n=== Stage 5d : 1スイッチ完全自動ホバリング ===");
     Serial.println("!! 2モード: SW_HOVER UP = POSHOLD(完全自動) / それ以外 = ANGLE(手動) !!");
     Serial.println("!! bail-out = SW_HOVER を下げる or THR_CUT。初回は広い床で指をスイッチに !!");
+
+    // ★ 共有 SPI0: 全 CS を「最初に」HIGH へ固定する。
+    //   これが無いと、flow.begin() が PMW3901 を初期化している間、SD の CS(9) は
+    //   まだ入力(フロート)のまま。9 が Low に落ちていると SD も選択されてしまい、
+    //   PMW3901 宛ての SPI クロックに SD が応答して両方のバスが壊れる
+    //   (SD 追加後に PMW3901 まで FAIL するのはこれが典型)。CS を分けるだけでは
+    //   足りず、未初期化のあいだに Low へ落とさないことが要る。
+    pinMode(10, OUTPUT); digitalWrite(10, HIGH);   // PMW3901 CS (Quad::FLOW_CS_PIN)
+    pinMode(9,  OUTPUT); digitalWrite(9,  HIGH);   // SD HW-125 CS
 
     roll_axis.rate .set_gains(Gain::RATE_ROLL [0], Gain::RATE_ROLL [1], Gain::RATE_ROLL [2]);
     pitch_axis.rate.set_gains(Gain::RATE_PITCH[0], Gain::RATE_PITCH[1], Gain::RATE_PITCH[2]);
@@ -2075,6 +2269,23 @@ void setup() {
                       (Q::ALT_HOVER_THR > 0.01f) ? "実測値" : "未設定(engageしない)",
                       (Q::ALT_TARGET_M  > 0.0f)  ? "固定"   : "突入時の高度");
     }
+
+    // SD ログ (HW-125 / CS=9 / SPI0 を PMW3901 と共有)。飛行まるごとを
+    // LOGnnnn.BIN へストリーミングし、ディスアーム後に LOGnnnn.CSV へ変換する。
+    Serial.println("Init SD (HW-125, CS=9, SPI0 共有)...");
+    g_sd_ok = SdLog::begin(/*cs=*/9, sizeof(RamLog::Rec), RamLog::REC_VER,
+                           (uint16_t)RamLog::RAMLOG_HZ);
+    if (g_sd_ok) {
+        Serial.println("  SD OK");
+    } else {
+        Serial.println("  !! SD 応答なし (CS=9 / VCC=5V / SCK13 MOSI11 MISO12 / FAT32 を確認) !!");
+        SdLog::selftest(Serial);   // 起動時にもエラーコード付きの詳細を出す
+    }
+
+    // 起動時デバイスチェック (どのデバイスが応答するか)。結果は画面に残り、
+    // シリアル 'd' で再表示できる。
+    SelfTest::probe();
+    SelfTest::printFull(Serial);
 
     resetControllers();
 
@@ -2191,6 +2402,42 @@ void loop() {
     // 姿勢ループのフル解像度を残せる)。
     RamLog::update(main_tick.dt_us, (int)g_mode, isArmed(),
                    S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f);
+
+    // --- SD ログ (HW-125): アーム〜ディスアームの全区間を LOGnnnn.BIN へ ---
+    //  RamLog と違い 8 秒制限なし。push() はリングへ memcpy するだけ、
+    //  service() は毎ループ有界サイズだけ書く (詳細は SdLog.h)。
+    //  ディスアームで BIN を閉じる。CSV 化は PC で scripts/bin2csv.py。
+    if (g_sd_ok) {
+        static bool s_sd_was_armed = false;
+        static int  s_sd_div       = 0;
+        const bool sd_armed = isArmed();
+
+        if (sd_armed && !s_sd_was_armed) {          // アーム: 新規ファイル
+            SdLog::startFile();                      // open + preAllocate で数十ms
+            s_sd_div = 0;
+            // ↑のブロックで main_tick の基準がずれる。次の ready() が
+            //   dt=数十ms を返すと updateControl がその dt で積分を一気に
+            //   進めてしまう (アーム直後にモーターがピクつく) ので基準を取り直す。
+            main_tick.prime();
+        }
+        if (sd_armed && SdLog::recording()) {
+            if (++s_sd_div >= RamLog::DIV) {         // 1000Hz → RAMLOG_HZ に間引き
+                s_sd_div = 0;
+                RamLog::Rec r;
+                RamLog::fillRec(r, main_tick.dt_us, (int)g_mode, true,
+                                S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f);
+                SdLog::push(&r, sizeof(r));
+            }
+        }
+        if (!sd_armed && s_sd_was_armed) {          // ディスアーム: BIN を閉じる
+            SdLog::stopFile();
+            //  ★ 2026-09-09: オンボードの BIN→CSV 変換は廃止 (1万行で数十秒
+            //    かかる上、共有 SPI を長時間占有する)。カードを PC に挿して
+            //    scripts/bin2csv.py で変換する運用に一本化した。
+        }
+        SdLog::service();                            // 毎ループ、有界の書き出し
+        s_sd_was_armed = sd_armed;
+    }
 
     // s5 解析テレメトリの送信 (TELEM_TX_HZ = 10Hz)。地上局が CSV に落とす。
     //  yaw はヘディングホールドの積分値を送る。Madgwick の6軸ヨーは

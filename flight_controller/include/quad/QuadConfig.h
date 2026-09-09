@@ -553,7 +553,12 @@ constexpr float ALT_EST_W = 2.0f;
 //  ★ 判定方法: ログで機体が上昇している区間 (range_h が増える) で
 //    acc_up が正になっていれば +1 で正しい。逆なら -1。
 //    analyze_alt_pid.py が自動で判定して教えてくれる。
-constexpr float ALT_ACC_Z_SIGN = +1.0f;
+//  ★ 2026-09-09: log_007 (上下振りテスト) で判定。
+//    analyze_alt_pid.py [6]: acc_up と d2(range_h)/dt2 の相関 -0.17、
+//    手計算 (平滑化 + 高加速度サンプルのみ) では相関 -0.51 / 傾き -0.60。
+//    d(range_h)/dt に対し climb は +0.82、est_vz は -0.26 (逆相関)。
+//    -> IMU は上下逆マウント。+1.0 -> -1.0 に反転。
+constexpr float ALT_ACC_Z_SIGN = -1.0f;
 
 // 推定と測距がこれ以上食い違ったら推定を捨てて測距に合わせ直す [m]
 constexpr float ALT_EST_RESET_ERR_M = 0.8f;

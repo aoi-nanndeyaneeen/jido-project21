@@ -90,8 +90,16 @@ namespace Config {
     // ============================================================
     namespace sensor {
 
-        // MPU6050のスケール (±2g, ±250dps)
-        constexpr float ACCEL_SCALE = 16384.0f;
+        // MPU6050のスケール (±8g, ±250dps)
+        //  ★ 2026-09-09: 加速度 ±2g -> ±8g。この機体は IMU が上下逆マウントで、
+        //    recalibrate() が az=+1g 前提で s_az_bias ≈ -2.0 を焼くため、
+        //    getAccZ() の実効測定窓が 2g ぶんずれて「上向き加速の余裕が 1g しか
+        //    ない」状態だった (実ログで accz が -4.0/0.0 の両端に張り付き、
+        //    AltEstimator の est_bias が下限 -3.0 に張り付いていた原因)。
+        //    ±8g にすると上向き 7g の余裕ができる。Madgwick は加速度ベクトルを
+        //    正規化するので姿勢推定の挙動は不変。分解能 4096LSB/g (0.24mg) は
+        //    ノイズ (~12mg rms) より十分細かい。IMU.h の 0x1C 書き込みと対。
+        constexpr float ACCEL_SCALE = 4096.0f;
         constexpr float GYRO_SCALE  = 131.0f;
 
         // ---- ソフトウェア・キャリブレーション補正値 ----
