@@ -43,8 +43,14 @@
 // ============================================================
 namespace Cal {
 
-// モーターの信号ピン。drone.cpp と揃えること。
-constexpr int PIN[] = { 0, 1, 2, 3 };
+// モーターの信号ピン。★ drone_s5 / drone の MOTOR_PIN と揃えること。
+//  ★ 2026-09-09 修正: ここが { 0, 1, 2, 3 } になっていた。実機は
+//    QuadConfig.h の MOTOR_PIN = { 1, 2, 3, 4 } なので、旧値だと
+//    ピン0 (モーターではない) に校正信号が出て、M4 (ピン4) には
+//    一切出ていなかった = M4 だけ校正されないまま。
+//    (esc_calib は QuadConfig.h を include しない最小スケッチなので
+//     手で合わせる。MOTOR_PIN を並べ替えたらここも直すこと)
+constexpr int PIN[] = { 1, 2, 3, 4 };
 constexpr int COUNT = sizeof(PIN) / sizeof(PIN[0]);
 
 constexpr int PWM_HZ  = 400;   // drone.cpp と同じ

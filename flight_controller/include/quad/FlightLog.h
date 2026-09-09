@@ -320,12 +320,19 @@ inline void forceTrigger() {
 //   'v' で "記録がありません" になるのはこれが原因。armed_and_triggered
 //   ラッチを追加し、ディスアームするまで 1 アームセッションにつき
 //   1 回しかトリガしないようにしてある。
-inline void tick(bool armed, float thr) {
+//
+// gate: 呼び出し側が渡す追加のトリガ条件 (既定 true)。
+//   フロー試験では「SW_HOVER=up (POSHOLD) の間だけ録りたい」。gate に
+//   その条件を渡すと、ANGLE で離陸 → 上空で POSHOLD に入れた瞬間から
+//   8 秒を録れる (地上待機や離陸上昇でバッファを食い潰さない)。
+//   gate が false に戻っても記録は 8 秒 or ディスアームまで続く
+//   (トリガは「gate が true に立った瞬間」だけを見る。オシロと同じ)。
+inline void tick(bool armed, float thr, bool gate = true) {
     last_armed = armed; last_thr = thr;        // status() 表示用
 
     if (!armed) armed_and_triggered = false;   // ディスアームでラッチ解除
 
-    const bool trigger = armed && (thr > THR_GATE) && !armed_and_triggered;
+    const bool trigger = armed && (thr > THR_GATE) && gate && !armed_and_triggered;
 
     if (trigger && !recording) {
         // 新しい記録セッションのトリガ。前回ぶんは上書きされて消える。

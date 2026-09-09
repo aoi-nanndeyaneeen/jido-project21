@@ -224,12 +224,19 @@ constexpr float FLOW_SIGN_Y  = -1.0f;   // 右移動で + になる向き
 //  ★ 幾何(画素数/FOV)から出る 40 前後は間違い。PMW3901 の生カウントは
 //    内部でサブピクセル化されていて、実効値は 100倍ほど大きい。
 //    (Crazyflie の flowdeck は換算すると raw ≒ 4098 count/rad 相当)
-//  de-rotation と 速度換算の両方で使う。★必ず s5a のベンチで実測する:
-//    [z] でゼロ → 実測高度 h で実測距離 D を1方向スライド → 積算raw を読む
-//    FLOW_PX_PER_RAD = (積算raw ÷ D[m]) × h[m]
-//  この値が桁で外れていると de-rotation がほぼ効かず (derot ≒ raw)、
-//  速度換算も桁でズレる。
-constexpr float FLOW_PX_PER_RAD = 450.0f;   // ← 仮値。ベンチ実測に置き換えること
+//  de-rotation と 速度換算の両方で使う。
+// ★ 2026-09-09: log_020 (回転テスト: 機体をその場で pitch±50°/roll±40° を
+//   1〜2Hz で振る, 28秒) から回帰で実測。
+//     flow_raw_x を pitch_rate·dt に回帰: slope +599 (相関 0.97)
+//     flow_raw_y を roll_rate·dt  に回帰: slope -601 (相関 0.94)
+//     ※ 並進 (fh_v*c) が 0.15m/s 未満の行だけで回帰。全データだと Y が
+//       751 に膨らむ (並進フローの混入)。絞ると X/Y とも ~600 で一致。
+//   仮値 450 は真値の 75% (1.3倍過小) で、de-rotation が効き切らず
+//   速度換算も 1.3倍ズレていた (位置ホールドが緩かった一因)。
+//   DEROT_SIGN_X/Y (-1 / +1) は符号正しく、変更不要。
+//   再実測するなら: [z] ゼロ → 既知高度 h で既知距離 D を1方向スライド →
+//                   flow_accx の読み ÷ D で現行値を補正。
+constexpr float FLOW_PX_PER_RAD = 600.0f;   // 2026-09-09 log_020 回帰で実測
 
 // de-rotation: 機体の角速度が作る「見かけの流れ」をジャイロで差し引く。
 //  pitch(Y軸まわり)レート → flow_x に乗る / roll(X軸まわり)レート → flow_y に乗る
@@ -309,13 +316,31 @@ constexpr float FLOW_STICK_DEAD = 0.05f;    // これ以下は「手を離した
 constexpr float FLOW_MAX_LEAN   = 8.0f;
 
 // 目標リーン角の符号。手で押して「押し返す」向きにならなければ反転する。
-//  vx(前進ドリフト) を止めるには機首上げ(pitch +)、vy(右ドリフト) を止めるには左バンク(roll -)。
-constexpr float FLOW_LEAN_SIGN_ROLL  = -1.0f;
-constexpr float FLOW_LEAN_SIGN_PITCH = +1.0f;
+//  vx(前進ドリフト) を止めるには機首上げ、vy(右ドリフト) を止めるには左バンク。
+// ★ 2026-09-09: 実測で両方とも反転していた (ドリフトを「追いかける」向きだった)。
+//   log_012 (ANGLE/ドライラン): pitch stick 前フル → pitch_angtar -20°、
+//                               後フル → +20°   ⇒ 「前へ飛ぶ」= angtar 負
+//   log_013 (同上):             roll stick 右フル → roll_angtar +12°、
+//                               左フル → -19°    ⇒ 「右へ飛ぶ」= angtar 正
+//   フローループを追跡すると:
+//     前へ流れる → flow_vx>0 → … → px<0 → leanPitch = (+1)*px = 負 = 「前へ飛ぶ」= 追跡
+//     右へ流れる → flow_vy>0 → … → py<0 → leanRoll  = (-1)*py = 正 = 「右へ飛ぶ」= 追跡
+//   ドリフトを止めるには逆符号 (前流れ→angtar 正 / 右流れ→angtar 負) が要るので両方反転。
+//   → PITCH: +1 -> -1  /  ROLL: -1 -> +1
+//   ★ 初回 POSHOLD は必ず広い床・低空・指をスイッチに (符号ミス = 壁行き)。
+constexpr float FLOW_LEAN_SIGN_ROLL  = +1.0f;
+constexpr float FLOW_LEAN_SIGN_PITCH = -1.0f;
 
-// スティックの符号 (プロポに合わせる)。ピッチを引いて機体が「後退」する向きが正。
+// スティックの符号 (プロポに合わせる)。「スティックを倒した向きへ機体が動く」ように。
+// ★ 2026-09-09: FLOW_LEAN_SIGN_* を反転したのに合わせて Y も反転。
+//   反転前は LEAN 符号と STICK 符号が互いに打ち消して「スティックだけは
+//   合っていた」状態だった (位置ホールドは追跡=逆のまま)。
+//   実測 (log_012/013): ピッチ前倒し = sbus.des[PITCH] -1 / ロール右倒し = sbus.des[ROLL] +1。
+//   「倒した向きへ動く」= _vx_tar/_vy_tar が正になる符号:
+//     X: STICK_SIGN_PITCH(+1)×(-1) = -1、 -1 × FLOW_STICK_SIGN_X = + → FLOW_STICK_SIGN_X = -1 (据え置き)
+//     Y: STICK_SIGN_ROLL (+1)×(+1) = +1、 +1 × FLOW_STICK_SIGN_Y = + → FLOW_STICK_SIGN_Y = +1 (反転)
 constexpr float FLOW_STICK_SIGN_X = -1.0f;  // pitch stick → 前後 目標速度
-constexpr float FLOW_STICK_SIGN_Y = -1.0f;  // roll  stick → 左右 目標速度
+constexpr float FLOW_STICK_SIGN_Y = +1.0f;  // roll  stick → 左右 目標速度
 
 // 制御に使う速度の LPF (0=なし, 1に近いほど強い)
 constexpr float FLOW_VEL_MEAS_ALPHA = 0.4f;
@@ -341,6 +366,9 @@ constexpr float FLOW_ENABLE_THR = 0.15f;
 //  true  = AltHold が離陸を検知するまで PosHold は出力 0 のまま待つ。
 //          地上でリーン角が溜まって離陸直後に飛び出すのを防ぐ。
 //  false = 従来動作 (スロットルが FLOW_ENABLE_THR を超えた時点で効き始める)。
+// ★ 2026-09-09: フロー符号のベンチ検証で一時 false にしていたが、
+//   log_017 で 4 方向とも符号確認 OK (FLOW_LEAN_SIGN_* 反転が正解) なので
+//   true に戻した。地上でリーン角が溜まって離陸直後に飛び出すのを防ぐ。
 constexpr bool  FLOW_REQUIRE_AIRBORNE = true;
 
 // ============================================================
@@ -715,6 +743,12 @@ constexpr float ALT_AIRBORNE_RISE_M      = 0.10f;
 //  engage 時の高度が これを超えていたら「空中で引き継いだ」とみなして
 //  最初から離陸済み扱いにする [m] (ANGLE ホバリングからの移行用)。
 //  地面に置いたときの測距値より確実に大きい値にすること。
-constexpr float ALT_AIRBORNE_GROUND_MAX_M = 0.40f;
+// ★ 2026-09-09: 0.40 -> 0.30。ALT_TARGET_M=0.50 に対し 0.40 は境界が近すぎた。
+//   log_021: POSHOLD 突入時 range_h=0.36m (<0.40) で _airborne が latch せず、
+//   その後高度が下がる一方 (条件2 の「+10cm 上昇」も来ない) で永久に false。
+//   → フローループが起動せず POSHOLD で ang_tar=0 (水平ロック) のまま沈んで転倒。
+//   0.30 なら 0.4〜0.5m の運用高度で POSHOLD に入れば engage 時に即 latch する。
+//   地面での測距最小値 (RANGE_MIN 0.03m 前後) より十分大きいので誤検知しない。
+constexpr float ALT_AIRBORNE_GROUND_MAX_M = 0.30f;
 
 } // namespace Quad

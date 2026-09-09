@@ -150,14 +150,15 @@ namespace Gain {
 //   それを消すのが I 項。ki = kp は積分時定数 1秒に相当する。
 //   ワインドアップ対策は既にある: integrate = (thr > I_ENABLE_THR) と
 //   RATE_I_LIMIT = 0.15 (出力の 15% で頭打ち)。
-// ★ 2026-09-09: ki を 0.0000 -> 0.0020 に。上の 2026-09-04 のコメントは
-//   「ki = kp = 0.0020 にする」と書いてあるのに、値は 0 に戻されていた
-//   (理由の記載なし)。LOG0054 のホバーで角度ループ側に ki=0.04 が入って
-//   いたため、系の積分器が「角度ループだけ」に存在する状態になっており、
-//   §1 冒頭が警告する構成そのものだった。積分はレート側に戻す。
-//   ワインドアップ対策: integrate = (thr > I_ENABLE_THR) と RATE_I_LIMIT=0.15。
-constexpr float RATE_ROLL [3] = { 0.0015f, 0.0020f, 0.00004f };
-constexpr float RATE_PITCH[3] = { 0.0015f, 0.0020f, 0.00004f };
+// ★ 2026-09-09: ki を 0.0000 -> 0.0020 にしたが、同じコミットで ANG ki=0 と
+//   RATE_D_ALPHA=0.95 も同時に変えた結果、LOG0057 で roll gyro_rms が
+//   17 -> 97 dps、レート追従相関 +0.49 -> +0.10 に崩壊した (元々 roll は
+//   一番安定していた軸)。LOG0054 は「旧ゲインのまま同じ非対称機で 15 秒
+//   ホバーできていた」ので、3点同時変更が回帰だった。飛んでいた値に戻す。
+//   → 積分の置き場所 (レート vs 角度) や D フィルタは、M1/M4 非対称を
+//     直した機体で 1 つずつ検証すること。
+constexpr float RATE_ROLL [3] = { 0.0015f, 0.0000f, 0.00004f };
+constexpr float RATE_PITCH[3] = { 0.0015f, 0.0000f, 0.00004f };
 
 // ★ ヨーの I項。P制御だけでは定常偏差が残る。
 //   機体には必ず一定のヨートルクが残っている:
@@ -172,21 +173,15 @@ constexpr float RATE_PITCH[3] = { 0.0015f, 0.0020f, 0.00004f };
 //   s4 と揃えて 0.0020 に戻す案もあったが、まずは中間の 0.0015 で様子を見る。
 constexpr float RATE_YAW  [3] = { 0.0015f, 0.0020f, 0.00004f };
 
-// ★ 2026-09-09: 0.80 -> 0.95。D項のLPF (_d_lpf = a*_d_lpf + (1-a)*d_raw)。
-//   1000Hz で a=0.80 は遮断 ~35Hz。LOG0054 のホバーを FFT にかけると
-//   17.2Hz のリミットサイクルが立っていた:
-//     pitch_gyr の 10-25Hz 成分 = 18.6 dps
-//     D が作る 17Hz 出力 = kd*2pi*f*A = 0.0674   (P は kp*A = 0.0234)
-//     実測 pitch_cmd の 10-25Hz = 0.0862 ≒ 0.0674+0.0234  -> D が 74% を占める
-//     結果 m1..m4 が 17Hz で ±10% 振れ、機体振動 -> ジャイロ -> D と閉ループ
-//   pitch_cmd の全エネルギーのうち制御帯域 (0.3-3Hz) は 0.018 しかなく、
-//   残り 87% は 10Hz 以上のノイズをモーターに叩き込んでいた。
-//   a=0.95 で遮断 ~8Hz。17Hz を -7.5dB 落とす (D寄与 0.067 -> 0.028)。
-//   ★ これでも 17Hz が残るなら kd を 0.00004 -> 0.00002 に半減させること。
-//   ★ この振動は加速度計にも乗って acc_up の DC 整流を作っており
-//     (accz の 10-25Hz = 0.167g / >25Hz = 0.331g)、AltEstimator の
-//     est_bias 張り付きの一因でもある。
-constexpr float RATE_D_ALPHA = 0.95f;
+// ★ 2026-09-09: 一度 0.80 -> 0.95 にしたが (LOG0054 の 17Hz リミットサイクル
+//   対策)、LOG0057 で roll のレートループが発散気味になった。a=0.95 は
+//   遮断 ~8Hz で、ループのクロスオーバー帯 (1〜5Hz) に D 項の位相遅れが
+//   入り、D が「制動」ではなく「加振」に回ったと見られる。0.80 に戻す。
+//   17Hz リミットサイクルは本物だが、LOG0054 は 15 秒ホバーできていたので
+//   優先度は低い。潰すなら kd を 0.00004 -> 0.00002 に半減する方が安全
+//   (位相を触らずゲインだけ下げる)。まず M1/M4 非対称を直してから。
+//   参考: LOG0054 の 17Hz 内訳 = D 寄与 0.067 / P 寄与 0.023 (D が 74%)。
+constexpr float RATE_D_ALPHA = 0.80f;
 constexpr float RATE_I_LIMIT = 0.15f;
 
 // ---- ヘディングホールド (ヨー) ----
@@ -217,14 +212,13 @@ constexpr float YAW_STICK_DEAD    = 0.03f;
 //  ★ 積分はレートループ (RATE_*) 側だけで持たせています。ここに ki を
 //    入れるとレートループの I項と干渉して低周波の揺れが出ます。0 のままに。
 //                               kp     ki    kd
-// ★ 2026-09-09: ki を 0.04 -> 0 に (上の注意書きどおりに戻した)。
-//   LOG0054 のホバー (t=25-40s) で pitch に 0.7〜1.3Hz の揺れが出ていた:
-//     pitch_gyr rms 43dps (ピーク 1.3/0.7/1.2Hz) / pitch_ang rms 4.4deg
-//     角度追従誤差 rms 2.5deg (roll は 0.6deg)
-//   これは「角度ループに ki を入れると低周波の揺れが出る」という、まさに
-//   この直上のコメントが予告していた現象。積分は RATE_* 側へ移した。
-constexpr float ANG_ROLL [3] = { 30.0f, 0.00f, 0.0f };
-constexpr float ANG_PITCH[3] = { 30.0f, 0.00f, 0.0f };
+// ★ 2026-09-09: 一度 ki 0.04 -> 0 にしたが、RATE ki と D_ALPHA も同時に
+//   変えたため回帰の切り分けができなくなった (LOG0057)。飛んでいた
+//   LOG0054 の値 (0.04) に戻す。pitch の 0.7〜1.3Hz 揺れ (pitch_ang rms
+//   4.4deg / 追従誤差 roll の 4倍) は本物なので、非対称を直したあと
+//   「ANG ki だけ」を 0.04 -> 0 にして 1 本録って検証すること。
+constexpr float ANG_ROLL [3] = { 30.0f, 0.04f, 0.0f };
+constexpr float ANG_PITCH[3] = { 30.0f, 0.04f, 0.0f };
 
 constexpr float ANG_D_ALPHA = 0.70f;
 // 角度ループの積分項の上限 [deg/s]
@@ -243,6 +237,20 @@ constexpr bool USE_MOTOR = true;
 constexpr bool USE_IM920 = true;   // 地上局(position_estimator)との無線
 constexpr bool USE_FLOW  = true;   // PMW3901 オプティカルフロー
 constexpr bool USE_RANGE = true;   // s5c: VL53L1X 測距 (高度を flow へ供給)
+
+// ★ SD ログ (HW-125) と PMW3901 は SPI0 を共有していて共存できない
+//   (HW-125 クローンの 74LVC125 が MISO を Hi-Z にせず、フローを潰す)。
+//   なので「フローを使うときは SD を切り、RAM ログで録る」運用にする。
+//   USE_SD を明示的に持ち、既定を !USE_FLOW にしておけば、USE_FLOW を
+//   切り替えるだけで自動的に排他になる。
+//   ・USE_FLOW=true  → USE_SD=false : ログは RAM ('n'手動 / スロットルで自動) と
+//                                     USB 'l'。8秒制限あり
+//   ・USE_FLOW=false → USE_SD=true  : ログは SD (飛行まるごと、制限なし)
+//   どうしても両方 true にしたい (別 SPI に逃がした等) ときは下を手で書き換える。
+constexpr bool USE_SD = !USE_FLOW;
+static_assert(!(USE_FLOW && USE_SD),
+              "USE_FLOW と USE_SD は同時に true にできない (SPI0 共有)。"
+              "別バスに分けたなら、この static_assert を消して自己責任で。");
 
 // s5c: 高度ホールド (スロットルPID)。
 //  ★ 運用は2モードのみ:
@@ -1619,6 +1627,12 @@ static void handleSerial() {
             break;
         case 's':
             // SD の状態表示。ディスアーム中は単体テスト (再init + 書込/読戻 + エラーコード) も走る。
+            //  ★ USE_SD=false (USE_FLOW=true) のときは selftest が SPI0 を
+            //    再初期化してフローを潰すので、状態表示だけにする。
+            if (!S5::USE_SD) {
+                Serial.println("SD: 無効 (USE_FLOW=true)。selftest は SPI0 競合を避けてスキップ");
+                break;
+            }
             SdLog::status();
             if (!isArmed()) SdLog::selftest(Serial);
             break;
@@ -1896,15 +1910,22 @@ void setup() {
     }
 
     // SD ログ (HW-125 / CS=9 / SPI0 を PMW3901 と共有)。飛行まるごとを
-    // LOGnnnn.BIN へストリーミングし、ディスアーム後に LOGnnnn.CSV へ変換する。
-    Serial.println("Init SD (HW-125, CS=9, SPI0 共有)...");
-    g_sd_ok = SdLog::begin(/*cs=*/9, sizeof(FlightLog::Rec), FlightLog::REC_VER,
-                           (uint16_t)FlightLog::LOG_HZ);
-    if (g_sd_ok) {
-        Serial.println("  SD OK");
+    // LOGnnnn.BIN へストリーミングする。CSV 化は PC で scripts/bin2csv.py。
+    //  ★ USE_FLOW=true のときは SPI0 競合を避けるため SD を初期化しない。
+    //    そのフライトのログは RAM ('n' / スロットル自動トリガ, 8秒) と USB 'l'。
+    if (S5::USE_SD) {
+        Serial.println("Init SD (HW-125, CS=9, SPI0 共有)...");
+        g_sd_ok = SdLog::begin(/*cs=*/9, sizeof(FlightLog::Rec), FlightLog::REC_VER,
+                               (uint16_t)FlightLog::LOG_HZ);
+        if (g_sd_ok) {
+            Serial.println("  SD OK");
+        } else {
+            Serial.println("  !! SD 応答なし (CS=9 / VCC=5V / SCK13 MOSI11 MISO12 / FAT32 を確認) !!");
+            SdLog::selftest(Serial);   // 起動時にもエラーコード付きの詳細を出す
+        }
     } else {
-        Serial.println("  !! SD 応答なし (CS=9 / VCC=5V / SCK13 MOSI11 MISO12 / FAT32 を確認) !!");
-        SdLog::selftest(Serial);   // 起動時にもエラーコード付きの詳細を出す
+        g_sd_ok = false;
+        Serial.println("SD: 無効 (USE_FLOW=true のため。ログは RAM 'n'/'v' と USB 'l')");
     }
 
     // 起動時デバイスチェック (どのデバイスが応答するか)。結果は画面に残り、
@@ -2054,7 +2075,14 @@ void loop() {
         static int s_log_div = 0;
         if (++s_log_div >= FlightLog::DIV) {
             s_log_div = 0;
-            FlightLog::Ram::tick(armed_now, thr_now);   // トリガ状態機械 (軽い)
+            // RAM トリガの追加ゲート。フロー試験時 (USE_FLOW=true) は
+            //  「SW_HOVER=up = フロー水平ホールドに入れた瞬間」からの 8 秒を
+            //  録る。ANGLE で離陸してから上空でスイッチを上げるので、
+            //  地上待機や上昇でバッファを食い潰さずに済む。
+            //  SD 運用 (USE_FLOW=false) では従来どおり thr>0.20 だけで録る。
+            const bool ram_gate = !S5::USE_FLOW
+                                || sbus.Ch_state(Ch::SW_HOVER) == up;
+            FlightLog::Ram::tick(armed_now, thr_now, ram_gate);   // トリガ状態機械 (軽い)
             // どのシンクも動いていなければ量子化そのものを省く
             if (FlightLog::Usb::active || FlightLog::Ram::recording ||
                 SdLog::recording()) {
