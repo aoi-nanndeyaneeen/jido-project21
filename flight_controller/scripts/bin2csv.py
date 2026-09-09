@@ -177,6 +177,29 @@ def main():
     if tail:
         print(f"[WARN] 末尾 {tail} バイトが半端です (電源断で切れた?)。無視します。")
 
+    # --- preAllocate の未使用領域を切り落とす -------------------------------
+    #  SdLog::startFile() は PREALLOC (16MB) を先に確保し、stopFile() が
+    #  truncate して余りを返す。ディスアームせずに電源を抜くと stopFile() が
+    #  走らないので、実データの後ろに未書き込み領域がまるごと残る。
+    #  未書き込みセクタは 0xFF (または 0x00) で読めるので、そこで打ち切る。
+    #  (LOG0054 は 9.1MB の実データ + 7MB の 0xFF で、そのまま変換すると
+    #   t_ms=4294967295 のゴミ行が 7 万行できていた)
+    def _is_blank(rec):
+        return rec.count(0xFF) == len(rec) or rec.count(0x00) == len(rec)
+
+    n_valid = n_full
+    for i in range(n_full):
+        if _is_blank(body[i * step:i * step + step]):
+            n_valid = i
+            break
+    if n_valid < n_full:
+        print(f"[WARN] {n_valid} 行目以降が未書き込み領域 (preAllocate の余り) でした。"
+              f"{n_full - n_valid} 行を切り捨てます。")
+        print("       → ディスアームしてから電源を切ると truncate されます。")
+        n_full = n_valid
+    if n_full == 0:
+        sys.exit("[ERROR] 有効なレコードがありません。")
+
     if args.out:
         outp = Path(args.out)
         outp = outp / (binpath.stem + ".csv") if outp.is_dir() or args.out.endswith(("\\", "/")) else outp

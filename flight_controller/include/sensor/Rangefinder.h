@@ -95,10 +95,18 @@ public:
         float slant_m   = 0.0f;
         bool  status_ok = false;
         if (!readSlant(slant_m, status_ok)) {
-            // 新サンプル無し。ソナーは長く途切れたら失探にする
-            // (ToF は dataReady() 待ちなので、ここは単に前回値保持)。
-            if (Quad::RANGE_BACKEND == Quad::RangeBackend::Sonar_EZ &&
-                _have_h && (millis() - _last_new_ms) > Quad::RANGE_SONAR_STALE_MS) {
+            // 新サンプル無し。一定時間まったく更新が来なければ失探にする。
+            // ★ 2026-09-09: 以前は Sonar_EZ にしか stale 判定を掛けておらず、
+            //   ToF は「dataReady() 待ちだから前回値保持でよい」としていた。
+            //   しかし VL53L1X が固まると readSlant() が false を返し続ける
+            //   だけなので _have_h が true のまま残り、valid() が「凍った
+            //   高度」を有効と言い続ける (実機で多発。QuadConfig の
+            //   RANGE_STALE_MS のコメント参照)。高度ホールド中にこれが
+            //   起きると止まった値を信じて飛ぶので、両バックエンドで切る。
+            const uint32_t stale_ms =
+                (Quad::RANGE_BACKEND == Quad::RangeBackend::Sonar_EZ)
+                    ? Quad::RANGE_SONAR_STALE_MS : Quad::RANGE_STALE_MS;
+            if (_have_h && (millis() - _last_new_ms) > stale_ms) {
                 _have_h = false;
             }
             return false;

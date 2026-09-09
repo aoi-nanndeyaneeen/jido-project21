@@ -71,6 +71,22 @@ public:
         raw_x = fx;
         raw_y = fy;
 
+        // --- 1b) 生存検出 ------------------------------------------------
+        //  ★ 2026-09-09 追加。PMW3901 が飛行中に固まると readMotionCount() は
+        //    (0,0) を返し続けるが、これは「完全に静止している」のと区別が
+        //    つかないため、PosHold の失探検出 (|速度| >= FLOW_VEL_SANE) には
+        //    絶対に引っかからない。位置制御は「機体は止まっている」と信じて
+        //    一切補正せず、機体は流れていく。測距の凍結と同じ失敗パターン。
+        //
+        //  判定: 生カウントが「ぴったり (0,0)」の状態が続いた時間を数える。
+        //    モーターが回っている機体は必ず振動しているので、生きたセンサが
+        //    数百サンプル連続で厳密に 0 を返すことは実質ありえない。
+        //    逆に地上で完全静止しているときも 0 が続くので、これを
+        //    「異常」と断ずるかどうかの判断は呼び出し側に任せる
+        //    (このクラスは時間を数えるだけ)。
+        if (dx == 0 && dy == 0) _zero_run_s += dt_s;
+        else                    _zero_run_s = 0.0f;
+
         // --- 2) de-rotation ---
         //  pitch レート → flow_x に乗る / roll レート → flow_y に乗る
         //  見かけ流量 [px] = PX_PER_RAD * 角速度[rad/s] * dt
@@ -104,12 +120,21 @@ public:
     // 表示 / ログで「今ループで更新されたか」を知りたいとき用
     bool  consumeFresh() { const bool f = _fresh; _fresh = false; return f; }
 
+    // 生カウントが厳密に (0,0) のまま続いている時間 [s]。
+    //  「センサが死んでいる」判定そのものは呼び出し側が行う (上のコメント参照)。
+    //  地上で静止していても伸びるので、これ単体では異常を意味しない。
+    float zeroRunS() const { return _zero_run_s; }
+
+    // Quad::FLOW_DEAD_S を超えて 0 が続いたか。飛行中なら「固まった」とみなせる。
+    bool  suspectDead() const { return _zero_run_s >= Quad::FLOW_DEAD_S; }
+
 private:
     static constexpr float DEG2RAD = 0.01745329252f;
 
     Bitcraze_PMW3901 _sensor;
-    bool  _ok_init  = false;
-    float _height_m = 1.0f;
-    float _last_dt  = 0.0f;
-    bool  _fresh    = false;
+    bool  _ok_init    = false;
+    float _height_m   = 1.0f;
+    float _last_dt    = 0.0f;
+    bool  _fresh      = false;
+    float _zero_run_s = 0.0f;   // 生カウントが (0,0) のまま続いた時間 [s]
 };

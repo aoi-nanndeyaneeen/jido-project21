@@ -99,7 +99,8 @@
 #include "quad/PosHold.h"
 #include "quad/AltHold.h"        // s5c: 高度ホールド (カスケード + engage 状態遷移)
 #include "quad/AltEstimator.h"   // s5c: 加速度Z×測距の相補フィルタ (高度・上昇速度の推定)
-#include "quad/SdLog.h"          // 飛行まるごとSDへストリーミング + 着陸後CSV変換 (HW-125, CS=9)
+#include "quad/SdLog.h"          // 飛行まるごとSDへストリーミング (HW-125, CS=9)
+#include "quad/FlightLog.h"      // ログ1行の定義/整形 + USBストリーム + RAMリング
 
 namespace Q = Quad;
 
@@ -149,8 +150,14 @@ namespace Gain {
 //   それを消すのが I 項。ki = kp は積分時定数 1秒に相当する。
 //   ワインドアップ対策は既にある: integrate = (thr > I_ENABLE_THR) と
 //   RATE_I_LIMIT = 0.15 (出力の 15% で頭打ち)。
-constexpr float RATE_ROLL [3] = { 0.0015f, 0.0000f, 0.00004f };
-constexpr float RATE_PITCH[3] = { 0.0015f, 0.0000f, 0.00004f };
+// ★ 2026-09-09: ki を 0.0000 -> 0.0020 に。上の 2026-09-04 のコメントは
+//   「ki = kp = 0.0020 にする」と書いてあるのに、値は 0 に戻されていた
+//   (理由の記載なし)。LOG0054 のホバーで角度ループ側に ki=0.04 が入って
+//   いたため、系の積分器が「角度ループだけ」に存在する状態になっており、
+//   §1 冒頭が警告する構成そのものだった。積分はレート側に戻す。
+//   ワインドアップ対策: integrate = (thr > I_ENABLE_THR) と RATE_I_LIMIT=0.15。
+constexpr float RATE_ROLL [3] = { 0.0015f, 0.0020f, 0.00004f };
+constexpr float RATE_PITCH[3] = { 0.0015f, 0.0020f, 0.00004f };
 
 // ★ ヨーの I項。P制御だけでは定常偏差が残る。
 //   機体には必ず一定のヨートルクが残っている:
@@ -165,7 +172,21 @@ constexpr float RATE_PITCH[3] = { 0.0015f, 0.0000f, 0.00004f };
 //   s4 と揃えて 0.0020 に戻す案もあったが、まずは中間の 0.0015 で様子を見る。
 constexpr float RATE_YAW  [3] = { 0.0015f, 0.0020f, 0.00004f };
 
-constexpr float RATE_D_ALPHA = 0.80f;
+// ★ 2026-09-09: 0.80 -> 0.95。D項のLPF (_d_lpf = a*_d_lpf + (1-a)*d_raw)。
+//   1000Hz で a=0.80 は遮断 ~35Hz。LOG0054 のホバーを FFT にかけると
+//   17.2Hz のリミットサイクルが立っていた:
+//     pitch_gyr の 10-25Hz 成分 = 18.6 dps
+//     D が作る 17Hz 出力 = kd*2pi*f*A = 0.0674   (P は kp*A = 0.0234)
+//     実測 pitch_cmd の 10-25Hz = 0.0862 ≒ 0.0674+0.0234  -> D が 74% を占める
+//     結果 m1..m4 が 17Hz で ±10% 振れ、機体振動 -> ジャイロ -> D と閉ループ
+//   pitch_cmd の全エネルギーのうち制御帯域 (0.3-3Hz) は 0.018 しかなく、
+//   残り 87% は 10Hz 以上のノイズをモーターに叩き込んでいた。
+//   a=0.95 で遮断 ~8Hz。17Hz を -7.5dB 落とす (D寄与 0.067 -> 0.028)。
+//   ★ これでも 17Hz が残るなら kd を 0.00004 -> 0.00002 に半減させること。
+//   ★ この振動は加速度計にも乗って acc_up の DC 整流を作っており
+//     (accz の 10-25Hz = 0.167g / >25Hz = 0.331g)、AltEstimator の
+//     est_bias 張り付きの一因でもある。
+constexpr float RATE_D_ALPHA = 0.95f;
 constexpr float RATE_I_LIMIT = 0.15f;
 
 // ---- ヘディングホールド (ヨー) ----
@@ -196,8 +217,14 @@ constexpr float YAW_STICK_DEAD    = 0.03f;
 //  ★ 積分はレートループ (RATE_*) 側だけで持たせています。ここに ki を
 //    入れるとレートループの I項と干渉して低周波の揺れが出ます。0 のままに。
 //                               kp     ki    kd
-constexpr float ANG_ROLL [3] = { 30.0f, 0.04f, 0.0f };
-constexpr float ANG_PITCH[3] = { 30.0f, 0.04f, 0.0f };
+// ★ 2026-09-09: ki を 0.04 -> 0 に (上の注意書きどおりに戻した)。
+//   LOG0054 のホバー (t=25-40s) で pitch に 0.7〜1.3Hz の揺れが出ていた:
+//     pitch_gyr rms 43dps (ピーク 1.3/0.7/1.2Hz) / pitch_ang rms 4.4deg
+//     角度追従誤差 rms 2.5deg (roll は 0.6deg)
+//   これは「角度ループに ki を入れると低周波の揺れが出る」という、まさに
+//   この直上のコメントが予告していた現象。積分は RATE_* 側へ移した。
+constexpr float ANG_ROLL [3] = { 30.0f, 0.00f, 0.0f };
+constexpr float ANG_PITCH[3] = { 30.0f, 0.00f, 0.0f };
 
 constexpr float ANG_D_ALPHA = 0.70f;
 // 角度ループの積分項の上限 [deg/s]
@@ -410,358 +437,27 @@ bool  g_sd_ok              = false;   // SdLog::begin() が成功したか
 } // anonymous namespace
 
 // ============================================================
-//  § 4-2  ログ出力 (USBシリアル → scripts/logger.py)
+//  § 4-2  ログ 1 行の作成  (定義とフォーマットは quad/FlightLog.h)
 // ============================================================
-//  drone.cpp から移植。logger.py / analyze_log.py が期待するプロトコル:
-//    HEADER,<列名>   ... LOG_START の直前に1回
-//    LOG_START       ... 記録開始
-//    DATA,<値,...>   ... 1サンプル
-//    LOG_STOP        ... 記録終了
-//  シリアルで 'l' を送るたびに 開始/停止 が切り替わる。
+//  「今の全グローバル状態」を FlightLog::Rec に量子化して詰める。
+//  この 1 個の Rec を loop() が USB / RAM / SD の 3 つのシンクへ配る。
+//  drone_s5.cpp のグローバルを触るのはここだけなので、この関数だけが
+//  FlightLog.h に入らず残っている。
 //
-//  ★列名は drone.cpp と完全に同じにしてある。
-//    scripts/analyze_log.py を一切変更せずにそのまま使える。
-//
-//  10Hzの画面表示では数十Hzの振動は絶対に見えないので、
-//  制御ループと同じ土俵(500Hz)で全信号を落とす。
-namespace Log {
-
-constexpr int  LOG_HZ = 500;                    // 記録レート [Hz]
-constexpr int  DIV    = S5::MAIN_HZ / LOG_HZ;   // メインループ何回に1回
-constexpr char HEADER[] =
-    "t_ms,dt_us,mode,armed,thr,"
-    "roll_sbus,pitch_sbus,yaw_sbus,"
-    "roll_ang,pitch_ang,yaw_ang,"
-    "roll_gyr,pitch_gyr,yaw_gyr,"
-    "roll_cmd,pitch_cmd,yaw_cmd,"
-    "m1,m2,m3,m4,corr_limit,sat,"
-    "roll_ratetar,pitch_ratetar,roll_angtar,pitch_angtar,"
-    // --- s5a: オプティカルフロー (末尾に追記。analyze_log.py は列名参照なので
-    //     既存の解析はそのまま動く。新列を見たいときだけ列名を足す) ---
-    "flow_ok,flow_raw_x,flow_raw_y,flow_dx,flow_dy,flow_vx,flow_vy,flow_h,"
-    "flow_accx,flow_accy,"
-    // --- s5b/s5d: 速度・位置ホールド (位置は地面固定フレーム N/E) ---
-    "fh_vxc,fh_vyc,fh_vxt,fh_vyt,fh_leanr,fh_leanp,fh_posn,fh_pose,"
-    "fh_holdn,fh_holde,fh_hold,"
-    // --- s5c: 距離センサ + 高度ホールド ---
-    "range_ok,range_raw,range_h,climb,alt_en,alt_act,alt_hold,alt_vzt,alt_base,alt_corr,alt_thr,"
-    // --- 2026-09-07: alt_used = ミキサーが実際に使ったスロットル。
-    //     alt_thr との差が「姿勢優先に奪われた量」。ここが常時 0 でなければ
-    //     高度制御は自分の指令どおりに飛べていない (log_037 では平均 +0.127)。
-    "alt_used,"
-    // --- 2026-09-06: 加速度Z相補フィルタの検討用。制御には未使用、記録のみ。
-    //     g_att.acc_* (FRD系, g単位) をそのまま出す。回転・積分・フィルタは
-    //     全部 Python 側でオフライン検証する (analyze_alt_pid.py 系のツール)。
-    "accx,accy,accz,"
-    // --- 2026-09-07: 加速度Z×測距の相補フィルタ (quad/AltEstimator.h)。
-    //     ALT_USE_ACC_FUSION=false の間は制御に未使用、記録のみ。
-    //     est_vz が climb より何ms 速いかを analyze_alt_pid.py が判定する。
-    "acc_up,est_h,est_vz,est_bias";
-
-bool     active  = false;
-uint32_t dropped = 0;   // USBが詰まって捨てたサンプル数
-uint32_t written = 0;
-int      div_cnt = 0;
-
-inline void start() {
-    Serial.println();
-    Serial.print("HEADER,"); Serial.println(HEADER);
-    Serial.println("LOG_START");
-    active  = true;
-    dropped = 0;
-    written = 0;
-    div_cnt = 0;
-}
-
-inline void stop() {
-    active = false;
-    Serial.println("LOG_STOP");
-    Serial.printf("INFO: %lu行記録 / %lu行ドロップ(USB詰まり)\n",
-                  (unsigned long)written, (unsigned long)dropped);
-}
-
-inline void toggle() { active ? stop() : start(); }
-
-// 1サンプル出力。★USBが詰まっていたら書かずに捨てる。
-//   ここでブロックすると制御ループが止まって、それ自体が振動源になる。
-inline void sample(uint32_t dt_us, int mode, bool armed, float thr) {
-    if (!active) return;
-    if (++div_cnt < DIV) return;
-    div_cnt = 0;
-
-    // 1行ぶん(約160バイト)の空きが無ければ捨てる
-    if (Serial.availableForWrite() < 200) { dropped++; return; }
-
-    // yaw_ang にはヘディングホールドの積分値を入れる。
-    // (Madgwick の6軸ヨーは意味を持たないので記録しても仕方がない)
-    Serial.printf(
-        "DATA,%lu,%lu,%d,%d,%.3f,"
-        "%.3f,%.3f,%.3f,"
-        "%.2f,%.2f,%.2f,"
-        "%.2f,%.2f,%.2f,"
-        "%.4f,%.4f,%.4f,"
-        "%.3f,%.3f,%.3f,%.3f,%.3f,%u,"
-        "%.1f,%.1f,%.1f,%.1f,"
-        "%d,%.1f,%.1f,%.1f,%.1f,%.3f,%.3f,%.2f,"
-        "%.4f,%.4f,"
-        "%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,"
-        "%.3f,%.3f,%d,"
-        "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f,"
-        "%.3f,"
-        "%.4f,%.4f,%.4f,"
-        "%.3f,%.3f,%.3f,%.3f\n",
-        (unsigned long)millis(), (unsigned long)dt_us, mode, armed ? 1 : 0, thr,
-        roll_axis.stick,     pitch_axis.stick,     yaw_axis.stick,
-        roll_axis.ang_meas,  pitch_axis.ang_meas,  g_yaw_est,
-        roll_axis.rate_meas, pitch_axis.rate_meas, yaw_axis.rate_meas,
-        roll_axis.cmd,       pitch_axis.cmd,       yaw_axis.cmd,
-        g_out[0], g_out[1], g_out[2], g_out[3],
-        g_mix.span_limit, (unsigned)g_mix.sat,
-        roll_axis.rate_tar,  pitch_axis.rate_tar,
-        roll_axis.ang_tar,   pitch_axis.ang_tar,
-        g_flow_ok ? 1 : 0,
-        g_flow_raw_x, g_flow_raw_y, g_flow_dx, g_flow_dy,
-        g_flow_vx, g_flow_vy, flow.height(),
-        (double)g_flow_acc_m_x, (double)g_flow_acc_m_y,
-        poshold.vxCtl(), poshold.vyCtl(), poshold.vxTar(), poshold.vyTar(),
-        poshold.leanRoll(), poshold.leanPitch(), poshold.posN(), poshold.posE(),
-        poshold.holdN(), poshold.holdE(), poshold.holding() ? 1 : 0,
-        g_range_ok ? 1 : 0, g_range_raw_m, g_range_h_m, g_climb_mps,
-        g_alt_hold_enable ? 1 : 0, althold.active() ? 1 : 0,
-        althold.holdM(), althold.vzTar(), althold.thrBase(),
-        althold.thrCorr(), althold.thrOut(),
-        g_mix.thr_used,
-        g_att.acc_x, g_att.acc_y, g_att.acc_z,
-        altest.accUp(), altest.heightM(), altest.climbMps(), altest.biasMps2());
-    written++;
-}
-
-} // namespace Log
-
-// ============================================================
-//  § 4-4  RamLog  -  スロットル投入時だけ RAM に 500Hz で記録し、
-//                    着陸後に USB へまとめて吐き出す
-// ============================================================
-//  Log:: (直上) は「USB を挿しっぱなしのベンチ試験」専用だった。実飛行は
-//  USB を挿せないので、s5 解析テレメトリ (IM920SL, 7.5〜15Hz) しか手段が
-//  無く、姿勢ループの発振や離陸直後の転倒は追えなかった。
-//
-//  この機体の飛行は毎回 5 秒に満たない。それなら 500Hz のフル解像度の
-//  ログを「本体の RAM に溜めておいて、着陸後に USB を挿してから吐き出す」
-//  ほうが無線よりずっと濃い情報が手に入る。Teensy 4.0 の RAM (1024KB) の
-//  うち、これは DMAMEM 領域 (OCRAM2, 512KB) に確保するので、通常の変数や
-//  スタックとは競合しない。
-//
-//  ★ 記録レコードは Log::HEADER と同じ 58 列の値を持つが、RAM を食わない
-//    (dump() が Log::HEADER をそのまま出すので、列を足したら Rec と
-//     printf の両方に足すこと)
-//    よう int16/uint8 に量子化して積む (S5Telem.h の q16/qu8/qu16 を流用)。
-//    ダンプ時に Log::sample() と "同じ printf フォーマット" で書き戻すので、
-//    scripts/logger.py と scripts/analyze_log.py は無改造でそのまま使える。
-//
-//  ★ RAM は揮発性。着陸後、バッテリーを抜く前に USB を挿して 'v' で
-//    ダンプすること。ここで作った内容は電源を切ると消える。
-//
-//  運用 (2026-09-05 にトリガ方式へ変更。詳細は RamLog::update() のコメント参照):
-//    アーム中に thr が RAMLOG_THR_GATE (既定 0.20) を「上に横切った瞬間」を
-//    トリガとし、そこから RAMLOG_SECONDS 秒間 (既定8秒) は thr の増減を
-//    無視して録り続ける。止まるのはディスアーム or 8秒経過のどちらか。
-//    (旧方式は thr が一瞬でも 0.20 を割ると記録を止めて凍結し、次に
-//     0.20 を超えた瞬間に録り直していたため、ホバリング中の一瞬の
-//     スロットル低下だけで、それより前の穏やかな区間が消えてしまっていた)
-//    ディスアームで記録を止めて凍結する (次にトリガがかかったら0から録り直す)。
-//    'v' キーで USB へダンプ (HEADER/LOG_START/DATA.../LOG_STOP)。
-// ------------------------------------------------------------
-namespace RamLog {
-
-// スロットルがこれを超えている間だけ記録する。地面で粘っている待機時間や
-// 着陸後の惰性回転を録っても仕方が無いので、飛行に関係する区間だけに絞る。
-constexpr float    RAMLOG_THR_GATE = 0.20f;
-// 何秒ぶん持つか。500Hz x 8秒 x 約107B/行 (accx/y/z 追加後) ≒ 418KB
-// (OCRAM2 512KBに収まる。余裕 ~94KB)。列を足しても RAMLOG_SECONDS は
-// 変えなくて良い。
-constexpr uint32_t RAMLOG_SECONDS  = 8;
-constexpr uint32_t RAMLOG_HZ       = 500;
-constexpr uint32_t CAPACITY        = RAMLOG_SECONDS * RAMLOG_HZ;   // 4000
-constexpr int       DIV            = S5::MAIN_HZ / RAMLOG_HZ;
-
-// flags のビット (S5Telem.h の Flag と揃えてある。無線とは無関係、内部専用)
-enum RFlag : uint16_t {
-    RF_ARMED    = 1u << 0,
-    RF_FLOW_OK  = 1u << 1,
-    RF_RANGE_OK = 1u << 2,
-    RF_ALT_EN   = 1u << 3,
-    RF_ALT_ACT  = 1u << 4,
-    RF_HOLDING  = 1u << 5,   // poshold.holding()
-};
-
-// ★ Rec の列を足す/型を変えたら +1 する。SdLog の BIN ヘッダに書き込まれ、
-//   SdLog::convertLast() と scripts/bin2csv.py が古い BIN を弾くのに使う。
-// v2 (2026-09-09): accx/accy/accz の量子化スケールを SC_1E4 -> 1000 に変更
-//   (±8g 化で値域が広がり ±3.27g で頭打ちしていた)。列の並び・サイズは不変。
-constexpr uint8_t REC_VER = 2;
-
-struct __attribute__((packed)) Rec {
-    uint32_t t_ms;
-    uint16_t dt_us;
-    uint16_t flags;
-    uint8_t  mode;
-    uint8_t  mixsat;
-    uint8_t  thr;                                  // /250
-    int8_t   roll_stick, pitch_stick, yaw_stick;    // x100
-    int16_t  roll_ang, pitch_ang, yaw_est;          // cdeg
-    int16_t  roll_rate, pitch_rate, yaw_rate;       // ddeg/s
-    int16_t  roll_cmd, pitch_cmd, yaw_cmd;          // 1e4
-    uint8_t  m1, m2, m3, m4;                        // /250
-    int16_t  span_limit;                            // 1e3
-    int16_t  roll_ratetar, pitch_ratetar;           // ddeg/s
-    int16_t  roll_angtar, pitch_angtar;             // cdeg
-    int16_t  flow_raw_x, flow_raw_y, flow_dx, flow_dy;  // dpx (x10)
-    int16_t  flow_vx, flow_vy;                      // mm/s
-    int16_t  flow_h;                                // mm
-    float    flow_accx, flow_accy;                  // m (蓄積値なので float のまま)
-    int16_t  fh_vxc, fh_vyc, fh_vxt, fh_vyt;        // mm/s
-    int16_t  fh_leanr, fh_leanp;                    // cdeg
-    int16_t  fh_posn, fh_pose, fh_holdn, fh_holde;  // mm
-    int16_t  range_raw, range_h;                    // mm
-    int16_t  climb;                                 // mm/s
-    int16_t  alt_holdm;                             // mm
-    int16_t  alt_vzt;                               // mm/s
-    int16_t  alt_corr;                              // 1e4
-    uint8_t  alt_thr_out;                           // /250
-    // 2026-09-07: ミキサーが実際に使ったスロットル (MixInfo::thr_used)。
-    //   alt_thr_out との差 = 姿勢優先に奪われた量。
-    uint8_t  alt_used;                              // /250
-    // 2026-09-06: 加速度Z相補フィルタ検討用。制御には未使用、記録のみ。
-    int16_t  accx, accy, accz;                      // g x1e4 (FRD, g_att.acc_*)
-    // 2026-09-07: AltEstimator (加速度Z×測距の相補フィルタ) の出力。
-    int16_t  acc_up;                                // m/s^2 x1e3
-    int16_t  est_h;                                 // mm
-    int16_t  est_vz;                                // mm/s
-    int16_t  est_bias;                              // m/s^2 x1e3
-};
-// ★ この値が変わる = SD の BIN 形式が変わった。REC_VER を +1 し、
-//   scripts/bin2csv.py の _FIELDS / REC_VER も合わせること。
-static_assert(sizeof(Rec) == 116, "RamLog::Rec のサイズが変わった。上のコメント参照");
-
-// OCRAM2 (DMAMEM) に置く。RAM1 (スタック/大半の変数) と競合しない。
-DMAMEM Rec buf[CAPACITY];
-
-uint32_t head          = 0;      // 次に書く位置
-uint32_t count         = 0;      // 埋まっている行数 (CAPACITY で頭打ち)
-bool     wrapped       = false;  // CAPACITY を超えて上書きが始まったか
-bool     recording     = false;
-bool     armed_and_triggered = false;  // このアームセッションで既にトリガ済みか
-uint32_t session_start_ms = 0;   // トリガがかかった瞬間の millis()
-int      div_cnt       = 0;
-bool     last_armed    = false;  // 直近 update() が見た値 (status 表示用)
-float    last_thr      = 0.0f;
-bool     manual_trigger = false;  // ベンチ検証用の手動トリガ中か (armed 不問)
-
-inline void resetBuffer() {
-    head = 0; count = 0; wrapped = false; div_cnt = 0;
-}
-
-// 定義は update() の直後。update() と loop() の SD ストリーミングが共用する。
-inline void fillRec(Rec& r, uint32_t dt_us, int mode, bool armed, float thr);
-// with_prefix=true  : "DATA,..." 形式 (USB ダンプ用。scripts/logger.py が剥がす)
-// with_prefix=false : 先頭 "DATA," 無し (SD 上の .CSV 用。そのまま analyze_log.py に食わせる)
-void formatRow(Print& out, const Rec& r, bool with_prefix = true);
-
-// ★ 2026-09-06: ベンチ検証用の手動トリガ。
-//   通常のトリガは armed && thr>0.20 が条件だが、加速度Z相補フィルタの
-//   検証(機体を手で動かして accx/y/z + roll/pitch を見る)はモーターを
-//   回さない・アームもしない状態でやりたい。'n' キーでこれを呼ぶと、
-//   armed/thr に関係なく即座に8秒間の記録を開始する。
-//   manual_trigger 中は「ディスアームで止める」判定を無視し、8秒経過
-//   だけで止める (ここでは armed=false のままなので、通常の停止条件だと
-//   1tickも録れずに終わってしまう)。
-inline void forceTrigger() {
-    resetBuffer();
-    recording      = true;
-    manual_trigger = true;
-    session_start_ms = millis();
-    Serial.println("RamLog: 手動トリガ。8秒間記録します (armed/スロットル不問)");
-}
-
-// ★ 2026-09-05: トリガ方式に変更。
-//
-//   旧: armed && thr>0.20 の間だけ記録し、thr が一瞬でも 0.20 を割ると
-//       即座に記録を止めて凍結していた。次にまた 0.20 を超えた瞬間に
-//       resetBuffer() が走るため、「ホバリング中に一瞬スロットルが
-//       0.20 を割った」だけで、それより前の (穏やかに飛べていた) 区間が
-//       丸ごと消えてしまっていた。3秒以上の穏やかなホバリングを録った
-//       つもりが 1 秒程度しか残っていなかったのはこれが原因。
-//
-//   新: armed かつ thr が 0.20 を「上に横切った瞬間」だけをトリガとし、
-//       そこから RAMLOG_SECONDS 秒間は thr の増減を無視して録り続ける
-//       (止まるのはディスアームしたときだけ)。オシロのトリガと同じ考え方。
-//       8秒経過 or ディスアームで記録を止めて凍結する。
-//       トリガ後に再度 thr が 0.20 を超えても、このセッション中は
-//       resetBuffer() を呼ばない (録り直しは次にディスアームしてから)。
-inline void update(uint32_t dt_us, int mode, bool armed, float thr) {
-    // ★ 2026-09-06 バグ修正: 旧コードは「8秒経過で recording=false」の直後、
-    //   まだ armed && thr>0.20 (= ホバリング中) だと次の tick で
-    //   trigger && !recording が再び真になり resetBuffer() が走って
-    //   バッファを 0 に消していた。8秒より長くホバリングして着陸すると
-    //   'v' で "記録がありません" になるのはこれが原因。
-    //   armed_and_triggered ラッチを追加し、ディスアームするまで
-    //   1アームセッションにつき 1 回しかトリガしないようにする
-    //   (= トリガから 8 秒ぶんを確実に残す。オシロのシングルショット)。
-    last_armed = armed; last_thr = thr;        // status() 表示用
-
-    if (!armed) armed_and_triggered = false;   // ディスアームでラッチ解除
-
-    const bool trigger = armed && (thr > RAMLOG_THR_GATE) && !armed_and_triggered;
-
-    if (trigger && !recording) {
-        // 新しい記録セッションのトリガ。前回ぶんは上書きされて消える。
-        resetBuffer();
-        recording           = true;
-        armed_and_triggered = true;
-        manual_trigger       = false;   // 通常トリガなので手動フラグは下ろす
-        session_start_ms    = millis();
-    }
-
-    if (recording) {
-        const bool elapsed = (millis() - session_start_ms) >=
-                              (RAMLOG_SECONDS * 1000UL);
-        // 手動トリガ中は armed を無視 (ベンチ検証はそもそも disarm のまま)。
-        const bool stop_by_disarm = !manual_trigger && !armed;
-        if (stop_by_disarm || elapsed) {
-            // ディスアーム、または8秒経過 → 記録を止めて凍結する。
-            // 再トリガはディスアーム後の次のスロットル投入まで起きない
-            // (armed_and_triggered ラッチ)。バッファは残すので 'v' でダンプ可。
-            recording = false;
-        }
-    }
-    if (!recording) return;
-
-    if (++div_cnt < DIV) return;
-    div_cnt = 0;
-
-    fillRec(buf[head], dt_us, mode, armed, thr);
-
-    head = (head + 1) % CAPACITY;
-    if (count < CAPACITY) ++count;
-    else wrapped = true;
-}
-
-// 1レコードぶんを「今の全グローバル状態」から量子化して埋める。
-// RamLog::update() (RAM リング) と SdLog へのストリーミング (loop() 内) の
-// 両方がこれを呼ぶので、列の追加はここ 1 箇所だけで済む。
-// ★ 列を足したら Rec / REC_VER / formatRow() / scripts の 3 つも合わせること。
-inline void fillRec(Rec& r, uint32_t dt_us, int mode, bool armed, float thr) {
+//  ★ 列を足すときに触るのは、ここと FlightLog.h の Rec / HEADER /
+//    formatRow、それに scripts/bin2csv.py の合計 5 箇所。
+//    型か並びを変えたら FlightLog::REC_VER を +1 すること。
+static void fillRec(FlightLog::Rec& r, uint32_t dt_us, int mode, bool armed, float thr) {
     r.t_ms = millis();
     r.dt_us = (uint16_t)constrain(dt_us, 0u, 65535u);
 
     uint16_t f = 0;
-    if (armed)               f |= RF_ARMED;
-    if (g_flow_ok)           f |= RF_FLOW_OK;
-    if (g_range_ok)          f |= RF_RANGE_OK;
-    if (g_alt_hold_enable)   f |= RF_ALT_EN;
-    if (althold.active())    f |= RF_ALT_ACT;
-    if (poshold.holding())   f |= RF_HOLDING;
+    if (armed)               f |= FlightLog::RF_ARMED;
+    if (g_flow_ok)           f |= FlightLog::RF_FLOW_OK;
+    if (g_range_ok)          f |= FlightLog::RF_RANGE_OK;
+    if (g_alt_hold_enable)   f |= FlightLog::RF_ALT_EN;
+    if (althold.active())    f |= FlightLog::RF_ALT_ACT;
+    if (poshold.holding())   f |= FlightLog::RF_HOLDING;
     r.flags = f;
 
     r.mode   = (uint8_t)mode;
@@ -841,120 +537,8 @@ inline void fillRec(Rec& r, uint32_t dt_us, int mode, bool armed, float thr) {
     r.est_bias = S5T::q16(altest.biasMps2(), 1000.0f);
 }
 
-// 1レコードを CSV の 1 行 ("DATA,....\n") にして out へ書く。
-// out は Serial (RamLog::dump) でも FsFile (SdLog::convertLast の CSV 変換) でもよい。
-// 列順・フォーマットは Log::HEADER と厳密に一致させること
-// (scripts/analyze_log.py が列名で参照するので、順序が命)。
-void formatRow(Print& out, const Rec& r, bool with_prefix) {
-    const float thrBase = (r.flags & RF_ALT_ACT) ? Q::ALT_HOVER_THR : 0.0f;
-    if (with_prefix) out.print("DATA,");
-    out.printf(
-        "%lu,%lu,%d,%d,%.3f,"
-        "%.3f,%.3f,%.3f,"
-        "%.2f,%.2f,%.2f,"
-        "%.2f,%.2f,%.2f,"
-        "%.4f,%.4f,%.4f,"
-        "%.3f,%.3f,%.3f,%.3f,%.3f,%u,"
-        "%.1f,%.1f,%.1f,%.1f,"
-        "%d,%.1f,%.1f,%.1f,%.1f,%.3f,%.3f,%.2f,"
-        "%.4f,%.4f,"
-        "%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.3f,%.3f,"
-        "%.3f,%.3f,%d,"
-        "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f,"
-        "%.3f,"
-        "%.4f,%.4f,%.4f,"
-        "%.3f,%.3f,%.3f,%.3f\n",
-        (unsigned long)r.t_ms, (unsigned long)r.dt_us, (int)r.mode,
-        (r.flags & RF_ARMED) ? 1 : 0, r.thr / 250.0f,
-        r.roll_stick / 100.0f, r.pitch_stick / 100.0f, r.yaw_stick / 100.0f,
-        r.roll_ang / S5T::SC_CDEG, r.pitch_ang / S5T::SC_CDEG, r.yaw_est / S5T::SC_CDEG,
-        r.roll_rate / S5T::SC_DDEG, r.pitch_rate / S5T::SC_DDEG, r.yaw_rate / S5T::SC_DDEG,
-        r.roll_cmd / S5T::SC_1E4, r.pitch_cmd / S5T::SC_1E4, r.yaw_cmd / S5T::SC_1E4,
-        r.m1 / 250.0f, r.m2 / 250.0f, r.m3 / 250.0f, r.m4 / 250.0f,
-        r.span_limit / 1000.0f, (unsigned)r.mixsat,
-        r.roll_ratetar / S5T::SC_DDEG, r.pitch_ratetar / S5T::SC_DDEG,
-        r.roll_angtar / S5T::SC_CDEG, r.pitch_angtar / S5T::SC_CDEG,
-        (r.flags & RF_FLOW_OK) ? 1 : 0,
-        r.flow_raw_x / 10.0f, r.flow_raw_y / 10.0f, r.flow_dx / 10.0f, r.flow_dy / 10.0f,
-        r.flow_vx / S5T::SC_MM, r.flow_vy / S5T::SC_MM, r.flow_h / S5T::SC_MM,
-        (double)r.flow_accx, (double)r.flow_accy,
-        r.fh_vxc / S5T::SC_MM, r.fh_vyc / S5T::SC_MM, r.fh_vxt / S5T::SC_MM, r.fh_vyt / S5T::SC_MM,
-        r.fh_leanr / S5T::SC_CDEG, r.fh_leanp / S5T::SC_CDEG,
-        r.fh_posn / S5T::SC_MM, r.fh_pose / S5T::SC_MM,
-        r.fh_holdn / S5T::SC_MM, r.fh_holde / S5T::SC_MM,
-        (r.flags & RF_HOLDING) ? 1 : 0,
-        (r.flags & RF_RANGE_OK) ? 1 : 0, r.range_raw / S5T::SC_MM, r.range_h / S5T::SC_MM,
-        r.climb / S5T::SC_MM,
-        (r.flags & RF_ALT_EN) ? 1 : 0, (r.flags & RF_ALT_ACT) ? 1 : 0,
-        r.alt_holdm / S5T::SC_MM, r.alt_vzt / S5T::SC_MM, thrBase,
-        r.alt_corr / S5T::SC_1E4, r.alt_thr_out / 250.0f,
-        r.alt_used / 250.0f,
-        r.accx / 1000.0f, r.accy / 1000.0f, r.accz / 1000.0f,
-        r.acc_up / 1000.0f, r.est_h / S5T::SC_MM,
-        r.est_vz / S5T::SC_MM, r.est_bias / 1000.0f);
-}
 
-inline void status() {
-    const float secs = (float)count / (float)RAMLOG_HZ;
-    Serial.printf("RamLog: %s  %lu 行 (%.1f 秒)%s  容量 %lu 行 (%lu 秒)\n",
-                  recording ? "記録中" : (count ? "停止(ダンプ待ち)" : "空"),
-                  (unsigned long)count, secs, wrapped ? " [満杯/上書き済]" : "",
-                  (unsigned long)CAPACITY, (unsigned long)RAMLOG_SECONDS);
-    // 空のときに「なぜ録れていないか」を切り分けられるよう、トリガ条件の
-    // 現在値を出す。armed=1 かつ thr>0.20 なのに count=0 なら別の問題。
-    Serial.printf("        [trig条件] armed=%d  thr=%.2f (gate %.2f)  "
-                  "既トリガ=%d  recording=%d\n",
-                  last_armed ? 1 : 0, last_thr, RAMLOG_THR_GATE,
-                  armed_and_triggered ? 1 : 0, recording ? 1 : 0);
-}
 
-// ダンプ中は制御ループが数十ms〜数百ms止まる。着陸後にしか呼ばないこと
-// (handleSerial は main_tick の後に呼ばれているので、ここでブロックしても
-//  無線テレメトリと違って「今まさに飛んでいる」状態では想定していない)。
-inline void dump() {
-    if (recording) {
-        Serial.println("!! まだ記録中です (スロットルを下げるかディスアームしてから 'v')");
-        return;
-    }
-    if (count == 0) {
-        Serial.println("RamLog: 記録がありません (スロットル > "
-                       "RAMLOG_THR_GATE でアームして飛ばすと記録されます)");
-        return;
-    }
-
-    status();
-    Serial.println();
-    Serial.print("HEADER,"); Serial.println(Log::HEADER);
-    Serial.println("LOG_START");
-
-    const uint32_t start = wrapped ? head : 0;   // 最古の位置
-    for (uint32_t i = 0; i < count; ++i) {
-        // ★ 2026-09-06: ダンプのペーシング (弱め)。
-        //   dump() は約4000行(≈1.3MB)をフロー制御なしで一気に吐いていた。
-        //   PC (logger.py) が追いつかず Windows/pyserial の受信バッファが
-        //   溢れて「行が丸ごと消える」現象が出ていた (log_028/030 の "欠損"
-        //   は全てこれ。ループ停止ではない)。
-        //   ★ Serial.flush() を毎回入れると、PC 側が読んでいない状態で
-        //     無限に固まる (= 状態表示が止まる "取れなくなった")。なので
-        //     ブロックしない availableForWrite() の様子見だけにする。
-        //     根本の受信取りこぼし対策は PC 側 (logger.py の一括読み) で行う。
-        if ((i & 31) == 0) {
-            uint32_t guard = 0;
-            // 空きが戻るまで様子見。ただし最大 ~15ms で必ず抜ける
-            // (PC が全く読んでいなくても固まらない)。通常は 1ms 未満で復帰。
-            while (Serial.availableForWrite() < 400 && guard++ < 300) {
-                delayMicroseconds(50);
-            }
-        }
-
-        formatRow(Serial, buf[(start + i) % CAPACITY]);
-    }
-
-    Serial.println("LOG_STOP");
-    Serial.printf("INFO: RamLog %lu 行をダンプしました\n", (unsigned long)count);
-}
-
-} // namespace RamLog
 
 // ============================================================
 //  SelfTest  -  起動時に「どのデバイスがつながっているか」を 1 回だけ調べ、
@@ -1148,7 +732,7 @@ inline void dump() {
 // ============================================================
 //  § 4-3  s5 解析テレメトリ (IM920SL -> 地上局CSV)
 // ============================================================
-//  Log:: の 500Hz USBログは「PCを繋いだ地上テスト」でしか取れない。
+//  FlightLog::Usb の 500Hz USBログは「PCを繋いだ地上テスト」でしか取れない。
 //  実飛行では USB が無いので、POSHOLD の解析に要る信号だけを 10Hz で
 //  無線に落とし、地上局 (ground_receiver の env:xiao_s5_log) が CSV に
 //  書く。列の意味と分解能は S5Telem.h を参照。
@@ -1477,8 +1061,18 @@ static S5::Mode selectMode() {
 
     const Sw sw = sbus.Ch_state(Ch::SW_HOVER);
     if (sw == up) {
-        if (S5::USE_FLOW && g_flow_ok) return S5::MODE_POSHOLD;
-        return S5::MODE_ALTHOLD;   // フロー喪失時のフォールバック
+        // ★ 2026-09-09: g_flow_ok は起動時 flow.begin() の 1 回きりのスナップ
+        //   ショットなので、「フロー喪失時のフォールバック」と書いてあっても
+        //   実際には起動時の初期化失敗しか拾えていなかった。飛行中に PMW3901
+        //   が固まると (0,0) を返し続け、PosHold の失探検出 (|速度| が大きい)
+        //   にも掛からないまま「静止している」と誤認して機体が流れる。
+        //   suspectDead() (生カウントが FLOW_DEAD_S 秒ずっと厳密に 0) を
+        //   足して、実行時の凍結でも ALTHOLD へ落ちるようにする。
+        //   ※ 地上で完全静止していても suspectDead() は立つ。その場合は
+        //     MODE 表示が ALTHOLD になるので「フローが値を出していない」と
+        //     すぐ分かる (この機体は今それに当たる)。
+        if (S5::USE_FLOW && g_flow_ok && !flow.suspectDead()) return S5::MODE_POSHOLD;
+        return S5::MODE_ALTHOLD;   // フロー未初期化 or 実行時に凍結
     }
     if (sw == cen) return S5::MODE_ALTHOLD;
     return S5::MODE_ANGLE;
@@ -1626,11 +1220,20 @@ static void updateControl(float dt_s) {
     //    ALT_THR_AUTH を 0.20 -> 0.55 に広げた時 (log_034 の転倒対策) に、この
     //    上限も 0.80 -> 1.15 へ道連れで動いてしまい、「頭打ち」が実質無効化
     //    されていた (上のコメントが書いている保護が消えていた)。
-    //    実測ホバーは 0.42 なので、0.55 なら離陸には十分な余裕があり、
-    //    かつ「姿勢を当てられないまま全開で上がる」は防げる。
-    constexpr float POSHOLD_THR_CAP = 0.55f;
-    static_assert(POSHOLD_THR_CAP > Q::ALT_HOVER_THR,
-                  "POSHOLD_THR_CAP がホバースロットル以下だと離陸できません");
+    //  ★★ 2026-09-09: 0.55 -> 0.65。ALT_HOVER_THR を実測で 0.42 -> 0.50 に
+    //    上げた副作用で、余裕が 0.13 -> 0.05 しか無くなっていた。
+    //    LOG0054 の実測ホバーは飛行前半 0.485 / 後半 0.515 で、電池が減ると
+    //    さらに上がる。0.55 のままだと飛行後半に「上限 < 実ホバー」となり、
+    //    POSHOLD で engage 前に沈み始めてもスロットルで救えなくなる。
+    //    推力は指令の 2 乗なので 0.65 なら (0.65/0.50)^2 = 1.69 倍 = 上向き
+    //    0.69g の余裕があり、実ホバーが 0.55 まで悪化しても 0.40g 残る。
+    //    それでいて「姿勢を当てられないまま全開 (1.0)」は防げる。
+    constexpr float POSHOLD_THR_CAP = 0.65f;
+    //  ★ 単なる > ではなく「余裕 0.10 以上」を強制する。ALT_HOVER_THR を
+    //    次に触った人が、ここを黙って際どくしてしまわないように。
+    static_assert(POSHOLD_THR_CAP >= Q::ALT_HOVER_THR + 0.10f,
+                  "POSHOLD_THR_CAP はホバースロットル +0.10 以上にすること "
+                  "(離陸と電池消耗ぶんの余裕が要る)");
 
     float thr;
     if (althold.active())               thr = althold.throttle();
@@ -1972,17 +1575,26 @@ static void handleSerial() {
             break;
         case 'l':
             // 500Hz ログの開始/停止 (USB 直結時のみ)。scripts/logger.py と対で使う。
-            Log::toggle();
+            FlightLog::Usb::toggle();
             break;
         case 'v':
             // RAM ログ (実飛行中に自動記録した分) を USB へダンプする。
-            // 記録中 (スロットルがまだ RAMLOG_THR_GATE を超えている) なら
+            // 記録中 (スロットルがまだ THR_GATE を超えている) なら
             // 拒否メッセージを出すだけで安全に呼べる。
-            RamLog::dump();
+            FlightLog::Ram::dump();
             break;
         case 'y':
-            // RamLog の状態だけ見る (何行溜まっているか)。ダンプはしない。
-            RamLog::status();
+            // RAM ログの状態だけ見る (何行溜まっているか)。ダンプはしない。
+            FlightLog::Ram::status();
+            break;
+        case 'n':
+            // RAM ログの手動トリガ。armed/スロットル不問で 8 秒録る。
+            //  ★ 2026-09-09: forceTrigger() は前から定義されていたのに
+            //    switch に case が無く、'n' を押しても何も起きなかった
+            //    (関数のコメントは「'n' キーでこれを呼ぶ」と書いてあった)。
+            //  加速度Z相補フィルタのベンチ検証など、モーターを回さず
+            //  機体を手で動かして録りたいときに使う。録った後は 'v' でダンプ。
+            FlightLog::Ram::forceTrigger();
             break;
         case 'w':
             // 原因調査用: ループが異常に長くかかった回の内訳をダンプする。
@@ -2092,6 +1704,18 @@ static void printStatus(uint32_t dt_us) {
                       poshold.leanRoll(), poshold.leanPitch());
     }
 
+    // --- s5a: フローセンサの生死 (常時表示) ---
+    //  ★ 2026-09-09 追加。以前はフローの状態が POSHOLD のときしか出ず、
+    //    「フローが死んでいるので POSHOLD に入れない」状態だと画面のどこにも
+    //    出なかった (実際それで長期間気づかれていなかった)。常に出す。
+    if (S5::USE_FLOW) {
+        Serial.printf("\n[フロー] %s  生カウント(%.0f,%.0f)  0連続=%.1fs  h=%.2fm\n",
+                      !g_flow_ok        ? "FAIL(起動時に応答なし)"
+                    : flow.suspectDead()? "凍結?(生カウントが0のまま)"
+                                        : "OK  ",
+                      g_flow_raw_x, g_flow_raw_y, flow.zeroRunS(), flow.height());
+    }
+
     // --- s5c: 距離センサ + 高度ホールド ---
     if (S5::USE_RANGE) {
         Serial.printf("\n[距離:%s] %s  斜め=%.2fm  → 鉛直h=%.2fm  上昇=%+.2fm/s\n",
@@ -2180,7 +1804,8 @@ static void printStatus(uint32_t dt_us) {
     }
 
     Serial.println("\n[p]ゲイン [k]IMUキャリブ(EEPROM保存) [x]キャリブ消去 [r]PIDリセット "
-                   "[l]ログ(USB直結時) [v]RAMログdump [y]RAMログ状態 [w]停止調査ログdump "
+                   "[l]ログ(USB直結時) [n]RAMログ手動トリガ [v]RAMログdump [y]RAMログ状態 "
+                   "[w]停止調査ログdump "
                    "[z]フロー積算ゼロ "
                    "[h]フロー高度(手動) [g]高度ホールド切替 [i]I2Cスキャン [m]ドライラン切替 "
                    "[s]SD状態/単体テスト [d]起動時デバイスチェック再表示");
@@ -2273,8 +1898,8 @@ void setup() {
     // SD ログ (HW-125 / CS=9 / SPI0 を PMW3901 と共有)。飛行まるごとを
     // LOGnnnn.BIN へストリーミングし、ディスアーム後に LOGnnnn.CSV へ変換する。
     Serial.println("Init SD (HW-125, CS=9, SPI0 共有)...");
-    g_sd_ok = SdLog::begin(/*cs=*/9, sizeof(RamLog::Rec), RamLog::REC_VER,
-                           (uint16_t)RamLog::RAMLOG_HZ);
+    g_sd_ok = SdLog::begin(/*cs=*/9, sizeof(FlightLog::Rec), FlightLog::REC_VER,
+                           (uint16_t)FlightLog::LOG_HZ);
     if (g_sd_ok) {
         Serial.println("  SD OK");
     } else {
@@ -2393,51 +2018,55 @@ void loop() {
     StallLog::maybeLog(_t7 - _t0, _t1 - _t0, _t2 - _t1, _t3 - _t2,
                        _t4 - _t3, _t5 - _t4, _t6 - _t5);
 
-    // 500Hz ログ (制御の直後。この周期の指令と出力が揃った状態で落とす)
-    Log::sample(main_tick.dt_us, (int)g_mode, isArmed(),
-                S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f);
-
-    // RAM ログ: スロットル投入中だけ 500Hz で本体 RAM に記録。着陸後に
-    // 'v' で USB へダンプする (実飛行では USB が無いので、この経路だけが
-    // 姿勢ループのフル解像度を残せる)。
-    RamLog::update(main_tick.dt_us, (int)g_mode, isArmed(),
-                   S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f);
-
-    // --- SD ログ (HW-125): アーム〜ディスアームの全区間を LOGnnnn.BIN へ ---
-    //  RamLog と違い 8 秒制限なし。push() はリングへ memcpy するだけ、
-    //  service() は毎ループ有界サイズだけ書く (詳細は SdLog.h)。
-    //  ディスアームで BIN を閉じる。CSV 化は PC で scripts/bin2csv.py。
+    // --- SD ログのファイル開閉 (アーム/ディスアームのエッジ) ---------------
+    //  アーム〜ディスアームの全区間を LOGnnnn.BIN へ。RAM ログと違い 8 秒制限なし。
+    //  push() はリングへ memcpy するだけ、service() は毎ループ有界サイズだけ書く
+    //  (詳細は SdLog.h)。CSV 化は PC で scripts/bin2csv.py。
+    const bool armed_now = isArmed();
+    const float thr_now  = S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f;
     if (g_sd_ok) {
         static bool s_sd_was_armed = false;
-        static int  s_sd_div       = 0;
-        const bool sd_armed = isArmed();
-
-        if (sd_armed && !s_sd_was_armed) {          // アーム: 新規ファイル
+        if (armed_now && !s_sd_was_armed) {          // アーム: 新規ファイル
             SdLog::startFile();                      // open + preAllocate で数十ms
-            s_sd_div = 0;
             // ↑のブロックで main_tick の基準がずれる。次の ready() が
             //   dt=数十ms を返すと updateControl がその dt で積分を一気に
             //   進めてしまう (アーム直後にモーターがピクつく) ので基準を取り直す。
             main_tick.prime();
         }
-        if (sd_armed && SdLog::recording()) {
-            if (++s_sd_div >= RamLog::DIV) {         // 1000Hz → RAMLOG_HZ に間引き
-                s_sd_div = 0;
-                RamLog::Rec r;
-                RamLog::fillRec(r, main_tick.dt_us, (int)g_mode, true,
-                                S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f);
-                SdLog::push(&r, sizeof(r));
-            }
-        }
-        if (!sd_armed && s_sd_was_armed) {          // ディスアーム: BIN を閉じる
+        if (!armed_now && s_sd_was_armed) {          // ディスアーム: BIN を閉じる
             SdLog::stopFile();
             //  ★ 2026-09-09: オンボードの BIN→CSV 変換は廃止 (1万行で数十秒
             //    かかる上、共有 SPI を長時間占有する)。カードを PC に挿して
             //    scripts/bin2csv.py で変換する運用に一本化した。
         }
-        SdLog::service();                            // 毎ループ、有界の書き出し
-        s_sd_was_armed = sd_armed;
+        s_sd_was_armed = armed_now;
     }
+
+    // --- 500Hz ログ: 1 レコードを作って USB / RAM / SD の 3 つへ配る --------
+    //  ★ 2026-09-09: 以前は Log::sample() が USB 用に独自の printf を持ち、
+    //    RamLog::update() と SD 用にそれぞれ fillRec() を呼んでいた
+    //    (= 同じ 1 行ぶんの量子化を 2 回、printf 書式は 2 本)。
+    //    Rec を 1 個だけ作って配る形に統一した。書式は
+    //    FlightLog::formatRow() の 1 本だけになり、USB と SD のログは
+    //    完全に同じ内容になる (USB 側も量子化を通るようになった。
+    //    角度 0.01deg / 角速度 0.1dps / 出力 1/250 の分解能で、解析には十分)。
+    {
+        static int s_log_div = 0;
+        if (++s_log_div >= FlightLog::DIV) {
+            s_log_div = 0;
+            FlightLog::Ram::tick(armed_now, thr_now);   // トリガ状態機械 (軽い)
+            // どのシンクも動いていなければ量子化そのものを省く
+            if (FlightLog::Usb::active || FlightLog::Ram::recording ||
+                SdLog::recording()) {
+                FlightLog::Rec r;
+                fillRec(r, main_tick.dt_us, (int)g_mode, armed_now, thr_now);
+                FlightLog::Usb::sample(r);   // 'l' 中のみ。USB が詰まっていたら捨てる
+                FlightLog::Ram::push(r);     // 記録中のみ
+                SdLog::push(&r, sizeof(r));  // アーム中のみ (中で recording を見る)
+            }
+        }
+    }
+    if (g_sd_ok) SdLog::service();                   // 毎ループ、有界の書き出し
 
     // s5 解析テレメトリの送信 (TELEM_TX_HZ = 10Hz)。地上局が CSV に落とす。
     //  yaw はヘディングホールドの積分値を送る。Madgwick の6軸ヨーは
@@ -2452,5 +2081,5 @@ void loop() {
 
     // ログ中は画面表示を止める。同じUSBシリアルを奪い合うと
     // ログが落ちるうえ、logger.py 側のパースも乱れる。
-    if (!Log::active && debug_tick.ready()) printStatus(main_tick.dt_us);
+    if (!FlightLog::Usb::active && debug_tick.ready()) printStatus(main_tick.dt_us);
 }
