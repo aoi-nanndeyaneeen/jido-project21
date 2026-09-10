@@ -100,6 +100,8 @@
 #include "quad/AltHold.h"        // s5c: 高度ホールド (カスケード + engage 状態遷移)
 #include "quad/AltEstimator.h"   // s5c: 加速度Z×測距の相補フィルタ (高度・上昇速度の推定)
 #include "quad/SdLog.h"          // 飛行まるごとSDへストリーミング (HW-125, CS=9)
+#include "quad/LogLink.h"        // 同じログを UART で RP2040 ロガーへ (SPI0 を空ける)
+#include "quad/StatusLed.h"      // モード表示用 RGB LED (pin 5/6/7)
 #include "quad/FlightLog.h"      // ログ1行の定義/整形 + USBストリーム + RAMリング
 
 namespace Q = Quad;
@@ -224,6 +226,131 @@ constexpr float ANG_D_ALPHA = 0.70f;
 // 角度ループの積分項の上限 [deg/s]
 constexpr float ANG_I_LIMIT = 30.0f;
 
+// ---- 姿勢基準トリム [deg] ----
+// ★ 2026-09-10: LOG0002 (POSHOLD 113秒) で、定位置ホバー中に
+//   fh_leanp が -4.86度 に収束していた。機体は水平ドリフト 0.46m/113s
+//   (= 実質停止) なので物理的には水平のはず。にもかかわらず -4.86度 を
+//   指令し続けないと止まらない = 姿勢の「基準」自体がずれている。
+//   fh_leanr は +0.13度 で、ずれているのは pitch だけ。
+//
+//   ずれの正体は次の2つの合成で、ログからは分離できない:
+//     1. IMU が機体面と平行に付いていない
+//     2. モータ推力線が IMU 面に対して傾いている
+//   ★ 'k' の水平キャリブで直るのは 1 だけ。2 は「机に対して IMU を合わせる」
+//     操作では原理的に取れない (推力ベクトルは飛ばないと現れない)。
+//     なので出どころを問わず、飛行中の収束値で1箇所に吸収する。
+//   ★ PMW3901 の取り付け傾きは候補から外してよい。静止したカメラは
+//     どう傾いていても像の動きをゼロと見るので、静止中に DC の速度を
+//     作れない。de-rotation のずれは「ジャイロ速度に比例する誤差」に
+//     なるのであって、-4.86度 のような定数にはならない。
+//
+//   ★ これは「重力方向の補正」ではない。重力は加速度計が正しく測れていて
+//     ドリフトもしない。直しているのは機体に固定された2面 (IMU取付面 と
+//     推力が鉛直になる面) の間の固定回転で、重力側が正しいからこそ
+//     ずれが定数として出てくる。body座標の回転オフセットなので、
+//     ホバー付近だけでなくどの姿勢でも成立する。
+//     (厳密には座標回転なので定数の減算は近似だが、4.86度 では二次の
+//      効果で 0.1度 未満。無視してよい)
+//
+//   これが効くと POSHOLD 以外でも中立が中立になる。s5 の運用では大きい:
+//   ALTHOLD/ANGLE ではフロー速度Iが消えるので、今はパイロットの親指が
+//   肩代わりしている (LOG0002 mode4 の pitch_stick 平均 -0.336)。
+//
+//   ★ 追い込み手順 (1本ずつ):
+//     1. POSHOLD で無風・30秒ホバー
+//     2. ログの fh_leanp 平均を読む
+//     3. その値をここへ「加算」する (代入ではない)
+//     4. 収束するまで繰り返す。2〜3回で ±1度 に入るはず
+//   ★ 符号確認: 書き込み前後で同じ机の上の pitch_ang 表示を比べ、
+//     PITCH_TRIM_DEG のぶんだけ増えていること。減っていたら符号が逆。
+//   ★ これは基準のずれだけを直す。0.074 の定常ピッチトルク外乱
+//     (= pitch_ang_err +1.55度 の原因) は別問題で、これでは消えない。
+// ★ 2026-09-10: 追い込み 2 巡目。LOG0004 で -4.86 適用後の残差は
+//   fh_leanp = +0.824度 と読めたが、この計測は条件が汚れていた:
+//   ヨーが ±50度 で振れ回り (yaw_ang std 14.96度)、スティックも 20% の
+//   時間アクティブだった。PosHold は N/E 座標で位置を積分してヨーで機体
+//   座標へ回すので、ヨーが揺れているとリーン角の平均は意味を持たない。
+//   → -4.04 は外れ値。この行の下で -5.30 に上書きする。
+//
+// ★ 2026-09-10: 追い込み 3 巡目。スティック中央キャリブ (Receiver.h) が
+//   入って、初めて条件の揃った計測が録れた。LOG0006 (POSHOLD 47.7秒):
+//     yaw_ang std 1.67度 / heading解除 1% / stick_active 0% / fh_hold 満杯
+//   fh_leanp は前半3バケットで -1.21〜-1.27 と安定。後半 -1.42/-1.69 へ
+//   流れるが、これは電池消耗で alt_thr が 0.631->0.648 に上がり、m3 の
+//   ミキサー飽和が 4.3%->6.4% に増えて late-flight のリーン推定を汚した
+//   もの。前半30秒 (飽和がまだ軽い) の平均 -1.25 を静的オフセットとみる。
+//       -4.04 + (-1.25) = -5.29 -> -5.30
+//   これで LOG0002(≈-4.5) / LOG0006(-5.30) が一貫し、-4.04 だけが外れ値
+//   だったという読みになる。次便で fh_leanp が ±1度 に入れば収束。
+//   ★ ロールは据え置き。LOG0006 の fh_leanr は前半 -0.155 で、+0.13 との
+//     合成が -0.03。すでに ±1度 以内なのでいじらない (手順どおり1本ずつ)。
+//   ★ m3 が定常で 5% 飽和しているのは別問題。ヨー(-0.073)/ピッチ(-0.073)の
+//     定常トルク外乱がヘッドルームを食っている。モータマウントのねじれか
+//     CW/CCW ペアの特性差を物理で直す話で、トリムでは消えない。飽和が
+//     続くとリーン推定の収束先が電池残量で動くので、次はそこを先に潰す。
+//
+// ★ 2026-09-10: 追い込み 4 巡目。機体前方に重量物を移して CG を前へ
+//   寄せた (物理)。LOG0018 (POSHOLD fh_hold 23.9秒) で効果を確認:
+//     定常ピッチトルク -0.075 -> -0.0045、ピッチドループ +1.57度 -> +0.12度、
+//     m3 平均 0.80 -> 0.67、m3>0.95 が 4%台 -> 0.1%、ロールのリミット
+//     サイクルも消えた (連鎖して起きていた問題が一括で解消)。
+//   その代償に姿勢基準がまた動いた: fh_leanp = +3.60度。CG を動かした
+//   ので -5.30 で合わせた分は無効。手順どおり加算する:
+//       -5.30 + 3.60 = -1.70
+//   ★ 注意: fh_hold が 23.9秒しかなく (LOG0007 は 83秒)、5秒バケットで
+//     +2.50〜+4.27度 と ±0.9度 ばらつく。過去より推定が粗い。次便で
+//     無風・ヨー固定の POSHOLD を 60秒以上録って詰め直すこと。
+//   ★ ドループが消えたぶん fh_leanp ≈ pitch_ang (+3.60 vs +3.72) に
+//     なった。位置ループの指令がそのまま姿勢に出るので、トリムの効き
+//     は前より素直なはず。
+//   ★ ロールは +0.013 -> +0.040 とやや悪化 (重量物の左右ズレ疑い)。
+//     ヨーの定常トルク -0.064 は CG では変わらず (予想どおり) = ペラ/
+//     モータ側。ピッチが片付いた今、これが最大の残不均衡。CCW ペア
+//     (M2,M4) のペラ交換から。トリムでは消えない。
+//
+// ★ 2026-09-10: 追い込み 5 巡目。LOG0034 (POSHOLD fh_hold 77.4秒、フロー
+//   復活後の初のまともな長時間ホバー)。fh_leanp 平均 -2.278度。手順どおり:
+//       -1.70 + (-2.278) = -3.98 -> -4.00
+//   ★ ヨーが +12度 平均でドリフトしていて corr(yaw, leanp)=+0.35。汚染を
+//     避けて |yaw|<10度 の 46.4秒に絞ると fh_leanp = -2.553 -> TRIM -4.25。
+//     LOG0018/0034 の2点外挿だと -3.10。3案 (-4.00/-4.25/-3.10) の中央付近
+//     で、かつ CG 前移前の収束履歴 (和 -4.04/-4.55/-5.29) のクラスタに
+//     戻る -4.00 を採る。
+//   ★ 毎巡「加算」が 1.5〜2倍オーバーシュートする (符号は正しい)。半田
+//     打ち直し・フロー交換など物理をいじるたびに姿勢基準が動くのが主因。
+//     ハードが固まるまでは ±1度 に完全に入れるのは諦めて、飛べる範囲で可。
+//   ★ ロールは据え置き。fh_leanr は平均 +0.09 / |yaw|<10 で -0.11、どちらも
+//     std 1.6度 のノイズ内で有意でない。この便では分解できない。
+//   ★ 高度は優秀: range 誤差 -0.005±0.010m、alt_corr +0.006。触らない。
+//   ★ ヨー定常トルク -0.099 (悪化)、ミキサー飽和も後半 8% まで。CCW ペア
+//     (M2,M4) のペラ交換が最優先の残タスク。
+//
+// ★ 2026-09-10: -4.00 は焼く前に撤回。LOG0035 で判明したとおり、-4.00 の
+//   根拠だった LOG0034 は「先端 5mm 欠けたペラ + 振動 + ミキサー飽和 7%」
+//   という壊れた機体で測ったもの。ペラを新品に替えたら:
+//     ホバースロットル 0.64 -> 0.55、accz -1.16 -> -1.02、est_bias -1.51 -> -0.01、
+//     yaw_cmd -0.099 -> -0.071、飽和 7% -> 0%
+//   ここまで変わると姿勢基準も動く。LOG0035 は ANGLE なので fh_leanp が
+//   録れず、トリムは測れない。実機で回っている -1.70 に戻し、新品ペラでの
+//   POSHOLD 60秒を録ってから測り直す。
+//   ★ ロールは相変わらず +0.033 で 1/1000 も動かない = ペラではなく
+//     左右 CG かマウント。ヨーの残り -0.071 も同様にマウント/モータ差を疑う。
+//
+// ★ 2026-09-10: 追い込み 6 巡目 (確定)。新ペラで 3 便続けて fh_leanp が
+//   横ばいになった: LOG0036 +1.26 / LOG0037 +1.46 / LOG0038 +1.10
+//   (無操作の fh_hold 区間、平均 ~+1.27)。ハードがようやく固まった。
+//       -1.70 + 1.27 ≒ -0.43 -> 丸めて -0.60 (毎巡 1.5〜2倍オーバーシュート
+//   する癖を見込んで、加算値をやや割り引いた。次便で fh_leanp が ±1度 に
+//   入れば打ち止め)。
+//   ★ ロールも今回は動かせる: LOG0038 で roll_cmd が +0.031 -> -0.004 に
+//     なった (左右CGを右へ寄せた物理修正が効いた)。fh_leanr は依然 std 1度
+//     前後で騒がしいが平均 -1.0〜-1.3。ただし roll_cmd がほぼ 0 の今、
+//     fh_leanr の残りは基準ズレというより 0.29Hz 揺れの残差。トリムでは
+//     消えないので ROLL_TRIM は +0.13 のまま。
+//   ★ 高度は完璧 (誤差 -0.003±0.007m、飽和 0%、accz -1.00)。触らない。
+constexpr float ROLL_TRIM_DEG  = +0.13f;
+constexpr float PITCH_TRIM_DEG = -0.60f;
+
 } // namespace Gain
 
 // ============================================================
@@ -247,10 +374,20 @@ constexpr bool USE_RANGE = true;   // s5c: VL53L1X 測距 (高度を flow へ供
 //                                     USB 'l'。8秒制限あり
 //   ・USE_FLOW=false → USE_SD=true  : ログは SD (飛行まるごと、制限なし)
 //   どうしても両方 true にしたい (別 SPI に逃がした等) ときは下を手で書き換える。
-constexpr bool USE_SD = !USE_FLOW;
+//
+//   ★ 2026-09-10: この排他を消すための第3の選択肢が USE_LOGLINK。
+//     SD 書き込みを RP2040 (log_recorder/) に丸ごと出し、こちらは UART で
+//     レコードを投げるだけにする。SPI0 は PMW3901 専用になるので、
+//     USE_FLOW=true のままフライトまるごとのログが録れる。
+//     配線と運用は quad/LogLink.h の先頭コメントを参照。
+constexpr bool USE_LOGLINK = true;    // ← RP2040 ロガーを繋いだら true に
+constexpr bool USE_SD = !USE_FLOW && !USE_LOGLINK;
 static_assert(!(USE_FLOW && USE_SD),
               "USE_FLOW と USE_SD は同時に true にできない (SPI0 共有)。"
               "別バスに分けたなら、この static_assert を消して自己責任で。");
+static_assert(!(USE_SD && USE_LOGLINK),
+              "USE_SD と USE_LOGLINK は同時に true にできない "
+              "(同じ Rec を2箇所に流すと、どちらが正のログか分からなくなる)。");
 
 // s5c: 高度ホールド (スロットルPID)。
 //  ★ 運用は2モードのみ:
@@ -441,6 +578,8 @@ bool  g_dry_run = S5::DRY_RUN;
 
 // ---- SD ログ (HW-125, CS=9, SPI0 を PMW3901 と共有) ----
 bool  g_sd_ok              = false;   // SdLog::begin() が成功したか
+// ---- ログリンク (RP2040 ロガーへ UART 送信。SPI0 を使わない) ----
+bool  g_link_ok            = false;   // LogLink::begin() が成功したか
 
 } // anonymous namespace
 
@@ -568,7 +707,7 @@ struct Dev {
     const char* name;
     const char* bus;
     St          st;
-    char        note[40];
+    char        note[64];   // UTF-8 の日本語は 1 文字 3B。strcpy を使うので余裕をもって
 };
 
 // 並びはバス順 (I2C → SPI → UART)
@@ -577,11 +716,12 @@ Dev devs[] = {
     { "Rangefinder",  "I2C/PW",   ST_SKIP, "" },
     { "PMW3901 flow", "SPI CS10", ST_SKIP, "" },
     { "SD HW-125",    "SPI CS9",  ST_SKIP, "" },
+    { "RP2040 logger","Serial2",  ST_SKIP, "" },
     { "SBUS RX",      "Serial5",  ST_SKIP, "" },
     { "IM920",        "Serial3",  ST_SKIP, "" },
 };
 constexpr int N = sizeof(devs) / sizeof(devs[0]);
-enum { D_IMU, D_RANGE, D_FLOW, D_SD, D_SBUS, D_IM920 };
+enum { D_IMU, D_RANGE, D_FLOW, D_SD, D_LINK, D_SBUS, D_IM920 };
 
 inline const char* tag(St s) {
     switch (s) {
@@ -616,8 +756,47 @@ inline void probe() {
     }
 
     // --- SD HW-125 (SPI CS9) ---
-    devs[D_SD].st = g_sd_ok ? ST_OK : ST_FAIL;
-    strcpy(devs[D_SD].note, g_sd_ok ? "" : "VCC=5V/FAT32/配線");
+    //  ★ USE_LOGLINK / USE_FLOW のときは「オンボード SD は意図的に無し」なので
+    //    FAIL 扱いにしない (誤警報になる)。ログの実体は RP2040 logger 行を見る。
+    if (S5::USE_SD) {
+        devs[D_SD].st = g_sd_ok ? ST_OK : ST_FAIL;
+        strcpy(devs[D_SD].note, g_sd_ok ? "" : "VCC=5V/FAT32/配線");
+    } else {
+        devs[D_SD].st = ST_SKIP;
+        strcpy(devs[D_SD].note,
+               S5::USE_LOGLINK ? "RP2040 logger へ移設 (下の行)"
+                               : "USE_FLOW=true (RAM/USB ログ)");
+    }
+
+    // --- RP2040 ロガー (Serial2: RX7/TX8) ---
+    //  UART は開いただけでは相手の生死が分からない。相手が 2Hz で返す
+    //  状態フレームが届いているかで判定する (RX を配線していないと
+    //  NOSIG になるが、送信は片方向でも成立するので致命ではない)。
+    if (S5::USE_LOGLINK) {
+        if (!g_link_ok) {
+            devs[D_LINK].st = ST_FAIL;
+            strcpy(devs[D_LINK].note, "UART開けず");
+        } else {
+            // ロガーは T_STAT を 2Hz (STAT_MS=500ms) で返す。probe の時点では
+            // まだ 1 発も取り込めていないことがあるので、ここで最大 700ms 待つ
+            // (SBUS/IM920 のブロック待ちと同じ流儀。まだ飛んでいないので可)。
+            const uint32_t t0 = millis();
+            while (millis() - t0 < 700 && !LogLink::statFresh()) {
+                LogLink::service();
+                delay(5);
+            }
+            if (!LogLink::statFresh()) {
+                devs[D_LINK].st = ST_NOSIG;
+                strcpy(devs[D_LINK].note, "応答なし (RX7 未配線?)");
+            } else if (!LogLink::loggerSdOk()) {
+                devs[D_LINK].st = ST_FAIL;
+                strcpy(devs[D_LINK].note, "ロガーの SD が NG");
+            } else {
+                devs[D_LINK].st = ST_OK;
+                strcpy(devs[D_LINK].note, "ロガー SD=OK 双方向OK");
+            }
+        }
+    }
 
     // --- SBUS: ~250ms 受信機のフレームを待つ ---
     if (S5::USE_SBUS) {
@@ -629,6 +808,47 @@ inline void probe() {
         }
         if (devs[D_SBUS].st == ST_NOSIG)
             strcpy(devs[D_SBUS].note, "信号なし(受信機OFF/未接続?)");
+    }
+
+    // --- スティック中央の取り込み (§4 STICK_CENTER_*) ---
+    //  送信機のサブトリムがずれると、des[] が中央スナップ帯 (±0.04) から
+    //  外れた瞬間に 0.00 -> ±0.05 へ跳ぶ。0.05 は YAW_STICK_DEAD(0.03) も
+    //  FLOW_STICK_DEAD(0.05) も超えるので、FC は「ずっと操作中」と判定し、
+    //  ヘディングホールドと位置ホールドが丸ごと効かなくなる。
+    //  LOG0005 で実際にこれを踏んだ (pitch -0.068 / yaw -0.050 で、
+    //  ヘディングホールドが飛行の 92%、位置ホールドが 98% 解除されていた)。
+    //  ★ 握ったまま起動した位置を「中央」として焼き込むのが最悪なので、
+    //    棄却されたら 0 (従来動作) のままにして、ここで必ず警告を出す。
+    if (S5::USE_SBUS && Q::STICK_CENTER_ENABLE && devs[D_SBUS].st == ST_OK) {
+        const Sbus::CenterCal cc = sbus.calibrateCenter(
+            Q::STICK_CENTER_CAL_MS, Q::STICK_CENTER_MAX_OFS, Q::STICK_CENTER_MAX_MOVE);
+        switch (cc.st) {
+            case Sbus::CC_OK:
+                Serial.printf("  スティック中央 取込 OK: R%+.3f P%+.3f Y%+.3f "
+                              "(%d frames, 振れ %.3f)\n",
+                              cc.roll, cc.pitch, cc.yaw, cc.n, cc.worst_move);
+                snprintf(devs[D_SBUS].note, sizeof(devs[D_SBUS].note),
+                         "center R%+.3f P%+.3f Y%+.3f", cc.roll, cc.pitch, cc.yaw);
+                break;
+            case Sbus::CC_MOVING:
+                Serial.printf("  !! スティック中央 取込 棄却: 動いています "
+                              "(振れ %.3f > %.3f)。オフセット 0 のまま !!\n",
+                              cc.worst_move, Q::STICK_CENTER_MAX_MOVE);
+                strcpy(devs[D_SBUS].note, "中央取込 棄却(スティックが動いていた)");
+                break;
+            case Sbus::CC_TOOFAR:
+                Serial.printf("  !! スティック中央 取込 棄却: ずれが大きすぎます "
+                              "R%+.3f P%+.3f Y%+.3f (上限 %.2f)。"
+                              "握ったまま起動していませんか? オフセット 0 のまま !!\n",
+                              cc.roll, cc.pitch, cc.yaw, Q::STICK_CENTER_MAX_OFS);
+                strcpy(devs[D_SBUS].note, "中央取込 棄却(ずれ過大/握ったまま?)");
+                break;
+            default:   // CC_NOSIG
+                Serial.println("  !! スティック中央 取込 棄却: フレーム不足。"
+                               "オフセット 0 のまま !!");
+                strcpy(devs[D_SBUS].note, "中央取込 棄却(フレーム不足)");
+                break;
+        }
     }
 
     // --- IM920: RDID を送って ~300ms 応答を待つ ---
@@ -662,7 +882,7 @@ inline void printFull(Print& out) {
                    tag(devs[i].st), devs[i].name, devs[i].bus, devs[i].note);
     }
     out.println("  (IMU/測距/フロー/SD は起動時スナップショット。"
-                "SBUS/IM920 の現在値は下の link= 行)");
+                "SBUS/IM920/RP2040 の現在値は下の link= / LOGLINK 行)");
     out.println("=============================");
 }
 
@@ -1198,8 +1418,12 @@ static void updateControl(float dt_s) {
     roll_axis.rate_meas  = g_att.roll_rate;
     pitch_axis.rate_meas = g_att.pitch_rate;
     yaw_axis.rate_meas   = g_att.yaw_rate;
-    roll_axis.ang_meas   = g_att.roll;
-    pitch_axis.ang_meas  = g_att.pitch;
+    //  姿勢基準トリムはここで1回だけ引く (§1 Gain::*_TRIM_DEG を参照)。
+    //  ang_meas はこの1箇所でしか作られないので、角度ループ・ログ・テレメトリの
+    //  すべてが補正後の値を見ることになる。g_att 自体は触らない
+    //  (AltHold の cos 補正など「生の姿勢」が要るところを壊さないため)。
+    roll_axis.ang_meas   = g_att.roll  - Gain::ROLL_TRIM_DEG;
+    pitch_axis.ang_meas  = g_att.pitch - Gain::PITCH_TRIM_DEG;
 
     if (!armed) { stopAllMotors(); return; }
 
@@ -1236,7 +1460,26 @@ static void updateControl(float dt_s) {
     //    推力は指令の 2 乗なので 0.65 なら (0.65/0.50)^2 = 1.69 倍 = 上向き
     //    0.69g の余裕があり、実ホバーが 0.55 まで悪化しても 0.40g 残る。
     //    それでいて「姿勢を当てられないまま全開 (1.0)」は防げる。
-    constexpr float POSHOLD_THR_CAP = 0.65f;
+    //  ★★ 2026-09-10: 0.65 -> 0.80。ALT_HOVER_THR を実測で 0.50 -> 0.64 に
+    //    上げたので、0.65 のままだと余裕が 0.01 しかない = 実質「上限 = 実ホバー」。
+    //    LOG0004 では 21.9s の POSHOLD 遷移の瞬間に thr が 0.648 まで出て、
+    //    すでに上限に当たっていた。この状態で測距を失うと、engage 前に
+    //    沈み始めてもスロットルで救えない (上の 2026-09-09 で潰したはずの穴)。
+    //    実ホバーは飛行前半 0.631 / 後半 0.652 で、電池が減ればさらに上がる。
+    //    0.80 なら:
+    //      ・(0.80/0.64)^2 = 1.56 倍 = 上向き 0.56g の余裕
+    //      ・実ホバーが 0.70 まで悪化しても (0.80/0.70)^2 = 1.31 → 0.31g 残る
+    //      ・full 1.0 までまだ 0.20 あるので「姿勢を当てられないまま全開」は防げる
+    //    ★ 2026-09-09 の設計意図 (0.69g) をそのまま保つなら 0.83 になるが、
+    //      1.0 までの余白が 0.17 まで減って頭打ちの意味が薄くなるため 0.80 を採った。
+    //  ★★ 2026-09-10: 0.80 -> 0.70。新品ペラで ALT_HOVER_THR が 0.64 -> 0.55 に
+    //    下がったので、0.80 のままだと (0.80/0.55)^2 = 2.12 倍 = 上向き 1.12g。
+    //    測距を失って engage できないまま POSHOLD に入ると、この上限まで
+    //    素通しで上がれてしまう (天井衝突の再来)。0.70 なら (0.70/0.55)^2
+    //    = 1.62 倍 = 0.62g の余裕で離陸には十分、実ホバーが 0.62 まで悪化
+    //    しても (0.70/0.62)^2 = 1.27 -> 0.27g 残る。static_assert の下限
+    //    (ALT_HOVER_THR + 0.10 = 0.65) も満たす。
+    constexpr float POSHOLD_THR_CAP = 0.70f;
     //  ★ 単なる > ではなく「余裕 0.10 以上」を強制する。ALT_HOVER_THR を
     //    次に触った人が、ここを黙って際どくしてしまわないように。
     static_assert(POSHOLD_THR_CAP >= Q::ALT_HOVER_THR + 0.10f,
@@ -1629,6 +1872,12 @@ static void handleSerial() {
             // SD の状態表示。ディスアーム中は単体テスト (再init + 書込/読戻 + エラーコード) も走る。
             //  ★ USE_SD=false (USE_FLOW=true) のときは selftest が SPI0 を
             //    再初期化してフローを潰すので、状態表示だけにする。
+            if (S5::USE_LOGLINK) {
+                // ログは RP2040 側にある。こちらの SPI0 は触らない
+                // (触るとフローを潰す)。相手の状態は返信フレームで見る。
+                LogLink::status();
+                break;
+            }
             if (!S5::USE_SD) {
                 Serial.println("SD: 無効 (USE_FLOW=true)。selftest は SPI0 競合を避けてスキップ");
                 break;
@@ -1693,7 +1942,8 @@ static void printStatus(uint32_t dt_us) {
                       s5tx.busy() ? "(sending)" : "");
     }
 
-    if (g_sd_ok) SdLog::brief(Serial);
+    if (g_sd_ok)   SdLog::brief(Serial);
+    if (g_link_ok) LogLink::brief(Serial);
 
     if (g_mode == S5::MODE_ANGLE || g_mode == S5::MODE_AUTO ||
         g_mode == S5::MODE_ALTHOLD || g_mode == S5::MODE_POSHOLD) {
@@ -1829,6 +2079,8 @@ static void printStatus(uint32_t dt_us) {
 //  § 10  setup / loop
 // ============================================================
 void setup() {
+    StatusLed::begin();   // 他の初期化より先に。起動直後から状態が見えるように
+
     Serial.begin(115200);
     const uint32_t start_ms = millis();
     while (!Serial && (millis() - start_ms < 2000)) { }
@@ -1844,7 +2096,9 @@ void setup() {
     //   (SD 追加後に PMW3901 まで FAIL するのはこれが典型)。CS を分けるだけでは
     //   足りず、未初期化のあいだに Low へ落とさないことが要る。
     pinMode(10, OUTPUT); digitalWrite(10, HIGH);   // PMW3901 CS (Quad::FLOW_CS_PIN)
-    pinMode(9,  OUTPUT); digitalWrite(9,  HIGH);   // SD HW-125 CS
+    // SD HW-125 CS(9) の固定は SD を積むときだけ。USE_LOGLINK 時は 9 を
+    // StatusLed の B に使うので触らない (StatusLed::begin が上で pinMode 済み)。
+    if (S5::USE_SD) { pinMode(9, OUTPUT); digitalWrite(9, HIGH); }
 
     roll_axis.rate .set_gains(Gain::RATE_ROLL [0], Gain::RATE_ROLL [1], Gain::RATE_ROLL [2]);
     pitch_axis.rate.set_gains(Gain::RATE_PITCH[0], Gain::RATE_PITCH[1], Gain::RATE_PITCH[2]);
@@ -1925,7 +2179,33 @@ void setup() {
         }
     } else {
         g_sd_ok = false;
-        Serial.println("SD: 無効 (USE_FLOW=true のため。ログは RAM 'n'/'v' と USB 'l')");
+        Serial.println(S5::USE_LOGLINK
+            ? "SD: オンボード無効 (USE_LOGLINK=true。SD は RP2040 logger 側)"
+            : "SD: 無効 (USE_FLOW=true のため。ログは RAM 'n'/'v' と USB 'l')");
+    }
+
+    // ログリンク (RP2040 ロガー / log_recorder)。Serial2 = RX7 / TX8。
+    //  ここは SPI0 を一切使わないので、USE_FLOW=true のままフライトまるごとの
+    //  ログが録れる。相手側で LOGnnnn.BIN が出来るので、CSV 化はこれまでどおり
+    //  scripts/bin2csv.py。
+    //  ★ 2026-09-10: Serial4(16/17) から Serial2(7/8) へ移設。ピン7/8 を空ける
+    //    ため StatusLed の B を 7 -> 9 に動かしてある (quad/StatusLed.h)。
+    //  ★ 一度 Serial4(16/17) へ戻したが、16/17 は I2C バス(SDA18/SCL19)の真隣で、
+    //    2Mbaud のクロストークが IMU/測距の I2C を乱す疑いがあり Serial2 へ再々移設。
+    //    16/17 に戻すなら BAUD を落とすか、UART と I2C の間をシールドすること。
+    //  ★ 配線: Teensy TX8 -> XIAO D7/GP1(RX) / Teensy RX7 <- XIAO D6/GP0(TX) / GND 共通。
+    //  ★ Serial5=SBUS(20/21) / Serial3=IM920(14/15) と衝突しないこと。
+    if (S5::USE_LOGLINK) {
+        Serial.println("Init LOGLINK (Serial2: TX=8 RX=7, 2Mbaud)...");
+        g_link_ok = LogLink::begin(Serial2, sizeof(FlightLog::Rec), FlightLog::REC_VER,
+                                   (uint16_t)FlightLog::LOG_HZ);
+        // begin() が見るのは UART を開けたかどうかだけ。ロガーの生死は
+        // 相手からの状態フレームで判定するので、少し待って 's' 相当を出す。
+        delay(600);
+        LogLink::service();      // 溜まっている状態フレームを取り込む
+        LogLink::status();
+    } else {
+        g_link_ok = false;
     }
 
     // 起動時デバイスチェック (どのデバイスが応答するか)。結果は画面に残り、
@@ -2045,6 +2325,16 @@ void loop() {
     //  (詳細は SdLog.h)。CSV 化は PC で scripts/bin2csv.py。
     const bool armed_now = isArmed();
     const float thr_now  = S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f;
+
+    // --- モード表示 LED (pin 5/6/9) -----------------------------------
+    //  赤=DISARM  青=ARMED+ANGLE(手動)  緑=ARMED+それ以外(自動系)。
+    //  ★ コモンアノード＋共通抵抗の配線なので混色(白/黄)は出せない。
+    //    Vf 最小の赤ダイが電流を独占するため。単色3つで区別する。
+    //  digitalWrite 3本だけなので毎ループ呼んでも制御ループへの影響は無視できる。
+    if (!armed_now)                        StatusLed::red();
+    else if (g_mode == S5::MODE_ANGLE)     StatusLed::blue();
+    else                                   StatusLed::green();
+
     if (g_sd_ok) {
         static bool s_sd_was_armed = false;
         if (armed_now && !s_sd_was_armed) {          // アーム: 新規ファイル
@@ -2061,6 +2351,16 @@ void loop() {
             //    scripts/bin2csv.py で変換する運用に一本化した。
         }
         s_sd_was_armed = armed_now;
+    }
+
+    // --- ログリンクのファイル開閉 (アーム/ディスアームのエッジ) -------------
+    //  SD 版と違い open/preAllocate をこちら側でやらないので、アームで
+    //  ブロックしない (main_tick.prime() も不要)。実ファイルは RP2040 が開く。
+    if (g_link_ok) {
+        static bool s_link_was_armed = false;
+        if (armed_now && !s_link_was_armed) LogLink::startFile();
+        if (!armed_now && s_link_was_armed) LogLink::stopFile();
+        s_link_was_armed = armed_now;
     }
 
     // --- 500Hz ログ: 1 レコードを作って USB / RAM / SD の 3 つへ配る --------
@@ -2085,16 +2385,18 @@ void loop() {
             FlightLog::Ram::tick(armed_now, thr_now, ram_gate);   // トリガ状態機械 (軽い)
             // どのシンクも動いていなければ量子化そのものを省く
             if (FlightLog::Usb::active || FlightLog::Ram::recording ||
-                SdLog::recording()) {
+                SdLog::recording() || LogLink::recording()) {
                 FlightLog::Rec r;
                 fillRec(r, main_tick.dt_us, (int)g_mode, armed_now, thr_now);
                 FlightLog::Usb::sample(r);   // 'l' 中のみ。USB が詰まっていたら捨てる
                 FlightLog::Ram::push(r);     // 記録中のみ
                 SdLog::push(&r, sizeof(r));  // アーム中のみ (中で recording を見る)
+                LogLink::push(&r, sizeof(r)); // 同上。RP2040 ロガーへ
             }
         }
     }
-    if (g_sd_ok) SdLog::service();                   // 毎ループ、有界の書き出し
+    if (g_sd_ok)   SdLog::service();                 // 毎ループ、有界の書き出し
+    if (g_link_ok) LogLink::service();               // 毎ループ、有界の UART 送信
 
     // s5 解析テレメトリの送信 (TELEM_TX_HZ = 10Hz)。地上局が CSV に落とす。
     //  yaw はヘディングホールドの積分値を送る。Madgwick の6軸ヨーは
