@@ -14,7 +14,9 @@ from typing import NamedTuple
 import cv2
 
 from core.geometry import approx_camera_matrix
-from utils.config import (DIFF_THRESHOLD, MIN_AREA_PX, MAX_AREA_PX,
+from utils.config import (DETECT_MODE, BRIGHT_THRESHOLD, TRACKING_EXPOSURE,
+                         BRIGHT_MIN_AREA_PX, BRIGHT_MAX_AREA_PX,
+                         DIFF_THRESHOLD, MIN_AREA_PX, MAX_AREA_PX,
                           BLUR_KERNEL, MORPH_KERNEL, CAMERA_FPS,
                           MAX_CANDIDATES, USE_BG_SUBTRACTOR,
                           BG_HISTORY, BG_VAR_THRESHOLD, BG_LEARNING_RATE,
@@ -167,6 +169,13 @@ class CameraTracker:
             exposure = self.cap.get(cv2.CAP_PROP_EXPOSURE)
             wb       = self.cap.get(cv2.CAP_PROP_WB_TEMPERATURE)
 
+            # bright 検知モード用: 自動が選んだ値ではなく、明示した暗い値で固定する。
+            #  「画面の中でLEDだけが白飛びしている」状態を作るのが狙い。
+            if TRACKING_EXPOSURE is not None:
+                exposure = float(TRACKING_EXPOSURE)
+                print(f"  [{self.label}] 追跡用に露出を {exposure:.1f} へ落とします "
+                      f"(TRACKING_EXPOSURE)")
+
             self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, DSHOW_EXPOSURE_MANUAL)
             self.cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
             self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
@@ -245,17 +254,46 @@ class CameraTracker:
         self.prev_gray = gray_blurred
         return mask
 
+    def _bright_mask(self, gray_blurred):
+        """
+        輝度しきい値だけで前景を作る。機体に明るいLEDを載せている場合用。
+
+        背景差分と違って「動いたか」を一切見ないので、**ホバリングで完全に
+        静止していても消えない**。これが motion モードとの決定的な差。
+        露出を絞って「画面の中でLEDだけが白飛びしている」状態にして使うこと。
+        """
+        _, mask = cv2.threshold(gray_blurred, BRIGHT_THRESHOLD, 255,
+                                cv2.THRESH_BINARY)
+        return mask
+
     def detect(self, frame):
         """
-        1フレームから動体候補のリストを返す（面積の大きい順、最大 MAX_CANDIDATES 個）。
+        1フレームから候補のリストを返す（面積の大きい順、最大 MAX_CANDIDATES 個）。
 
         ここでは「どれが機体か」を決めない。1枚の画像からは決められないため。
+
+        検知方式は DETECT_MODE (detection_params.json の detect_mode):
+          motion           背景差分。従来動作
+          bright           輝度しきい値のみ。静止ホバリングでも消えない
+          bright_or_motion 両方の論理和。点滅LEDの消灯フレームを motion 側が埋める
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray_blurred = cv2.GaussianBlur(gray, self.blur_size, 0)
 
-        mask = self._foreground_mask(gray_blurred)
         self.vibration_rejected = False
+        min_area, max_area = self.min_area, self.max_area
+
+        if DETECT_MODE == "bright":
+            mask = self._bright_mask(gray_blurred)
+            min_area, max_area = BRIGHT_MIN_AREA_PX, BRIGHT_MAX_AREA_PX
+        elif DETECT_MODE == "bright_or_motion":
+            bright = self._bright_mask(gray_blurred)
+            motion = self._foreground_mask(gray_blurred)
+            mask = bright if motion is None else cv2.bitwise_or(bright, motion)
+            # 下限はLED側に合わせる (LEDは小さい)。上限は動体側の広いほうを使う。
+            min_area = BRIGHT_MIN_AREA_PX
+        else:
+            mask = self._foreground_mask(gray_blurred)
         if mask is None:
             return []
 
@@ -276,7 +314,7 @@ class CameraTracker:
         candidates = []
         for c in contours:
             area = cv2.contourArea(c)
-            if area < self.min_area or area > self.max_area:
+            if area < min_area or area > max_area:
                 continue
             M = cv2.moments(c)
             if M["m00"] == 0:

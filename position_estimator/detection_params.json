@@ -5,16 +5,13 @@
     "以前は両者に別々の数値がハードコードされていてずれていた (DIFF_THRESHOLD 15 vs 10 など)。",
     "RPi側だけ調整したい場合は RPi 上のこのファイルを編集すればコード変更不要。"
   ],
-
   "diff_threshold": 12,
   "min_area_px": 40,
   "max_area_px": 20000,
   "blur_kernel": 5,
   "morph_kernel": 5,
-
   "_comment_candidates": "Phase B で使用。各カメラが1フレームに返す候補の最大数。",
   "max_candidates": 8,
-
   "_comment_bg": [
     "背景差分 (MOG2) の設定。前フレーム差分から移行。",
     "learning_rate をほぼ 0 にして、キャリブ直後の背景を固定する。",
@@ -24,10 +21,42 @@
   "bg_history": 500,
   "bg_var_threshold": 24.0,
   "bg_learning_rate": 0.0005,
-
   "_comment_vibration": [
     "前景画素が画面全体のこの割合を超えたフレームは丸ごと破棄する。",
     "三脚の揺れ・照明の急変・自動露出の追従で全画面が反応した場合の保険。"
   ],
-  "vibration_reject_ratio": 0.06
+  "vibration_reject_ratio": 0.06,
+  "_comment_mode": [
+    "検知の方式。機体に明るいLEDを載せているなら bright 系にする。",
+    "  motion          : 従来。背景差分(MOG2)で「動いたもの」を拾う。",
+    "                    静止ホバリング中は背景に吸収されて消えることがある。",
+    "  bright          : 輝度がしきい値を超えた画素だけを拾う。露出を絞って",
+    "                    「暗い画面の中で LED だけが白飛びする」状態にして使う。",
+    "                    人が暗がりで光点を見つけるのと同じ理屈。最も確実。",
+    "  bright_or_motion: 両方の論理和。LEDが点滅していて消灯フレームがある場合、",
+    "                    消灯の瞬間は motion 側(点滅そのものが変化)が拾う。",
+    "                    点滅LEDならこれが一番穴が無い。",
+    "",
+    "★ bright 系を使うときは露出を固定して十分暗くすること。",
+    "  明るいままだと白い壁・反射・照明もしきい値を超えて候補だらけになる。",
+    "  目安: その場面を見て「LED以外に白飛びしている物が無い」露出。",
+    "",
+    "★ 既定を bright_or_motion にしてある。合成画像での実測 (60fps, 60秒):",
+    "    motion           静止ホバリング 0-10秒 36.5% / 20秒以降 0.0%",
+    "    bright           静止ホバリング 60秒間ずっと 100%",
+    "    bright_or_motion 同 100%。さらに点滅の消灯フレームも埋まる",
+    "  motion 単独は bg_learning_rate=0.0005 でも数十秒で背景に吸収され、",
+    "  静止した機体を完全に見失う。ホバリングを追う用途では使えない。"
+  ],
+  "detect_mode": "bright_or_motion",
+  "_comment_bright": [
+    "bright 系のパラメータ。",
+    "bright_threshold: この輝度(0-255)を超えた画素を前景にする。230前後から。",
+    "  下げすぎると照明や反射を拾い、上げすぎると遠いLEDが消える。",
+    "bright_min_area_px: LEDは小さく写る。motion 用の min_area_px(40)のままだと",
+    "  遠方のLEDが面積不足で全部落ちるので、専用に小さい値を持つ。"
+  ],
+  "bright_threshold": 230,
+  "bright_min_area_px": 4,
+  "bright_max_area_px": 4000
 }
