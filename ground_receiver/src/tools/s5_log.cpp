@@ -45,6 +45,7 @@
 // ============================================================
 #include <Arduino.h>
 #include "S5Telem.h"
+#include "S5Cmd.h"      // PC -> 機体 の上りコマンド (GUIDED)
 
 // ------------------------------------------------------------
 //  ボードごとの UART 設定
@@ -66,6 +67,7 @@ static const char CSV_HEADER[] =
     "rx_ms,t_ms,seq,lost,rssi,frame,"
     "mode,alt_state,armed,flow_ok,range_ok,range_valid,"
     "alt_en,alt_act,pos_hold,airborne,dry_run,sat,tx_drop,"
+    "guided,cmd_fresh,landed,"
     "thr,bad,"
     "roll,pitch,yaw,"
     "range_h,range_raw,alt_hold,climb,alt_vzt,alt_corr,alt_thr,"
@@ -110,6 +112,37 @@ static uint8_t  prev_seq = 0;
 static String rx_line;
 
 // ------------------------------------------------------------
+//  上りコマンド (PC -> ここ -> IM920 -> 機体)
+// ------------------------------------------------------------
+//  PC (position_estimator) が USB へ 1 行ずつ投げてくる:
+//      CMD,<req>,<vx_mmps>,<vy_mmps>,<alt_cm>,<yaw_rate_cdps>,<flags>
+//  ここは最新値を mailbox に持ち、CMD_TX_INTERVAL_MS ごとにだけ
+//  実際に無線へ流す。PC はカメラのフレームレートで送ってきてよい。
+//
+//  ★ 下りテレメトリが 15Hz で UART を 55% 使っている。上りは 5Hz に
+//    抑えること (S5Cmd.h の帯域メモ)。ここを速くすると下りが落ちる。
+//
+//  ★ PC が黙ったら送信も止める。機体側は「コマンドが来ない」= リンク断
+//    として その場ホールド -> 自動着陸 に落ちる。地上局が落ちたのに
+//    最後の指令を送り続けるほうが危ない。
+static S5C::Tx        cmd_tx(&Serial1);
+static S5C::CmdFrame  cmd_box{};      // 最新の指令 (mailbox)
+static bool     cmd_have      = false;
+static uint32_t cmd_last_pc_ms = 0;   // PC から最後に行が来た時刻
+static uint32_t cmd_last_tx_ms = 0;
+static uint32_t n_cmd_lines = 0, n_cmd_tx = 0, n_cmd_bad = 0;
+static uint8_t  cmd_seq = 0;
+
+constexpr uint32_t CMD_TX_INTERVAL_MS = 200;   // 5Hz
+// PC からこの時間なにも来なければ送信を止める (機体はフェイルセーフへ)
+constexpr uint32_t CMD_PC_TIMEOUT_MS  = 1500;
+
+// USB から読みかけの行 (単発キーと "CMD,..." 行を同じストリームで扱う)
+static char usb_line[96];
+static size_t usb_n = 0;
+
+
+// ------------------------------------------------------------
 //  ユーティリティ
 // ------------------------------------------------------------
 static int hexVal(char c) {
@@ -123,8 +156,9 @@ static const char* modeName(uint8_t m) {
     switch (m) {
         case 0: return "RATE";
         case 1: return "ANGLE";
-        case 2: return "AUTO";
+        case 2: return "GUIDED";
         case 3: return "POSHOLD";
+        case 4: return "ALTHOLD";
     }
     return "?";
 }
@@ -212,6 +246,7 @@ static void emitData(uint32_t rx_ms, uint32_t t_ms, uint8_t seq, int fresh) {
         "DATA,%lu,%lu,%u,%lu,%d,%d,"
         "%u,%u,%d,%d,%d,%d,"
         "%d,%d,%d,%d,%d,%d,%d,"
+        "%d,%d,%d,"
         "%.3f,%u,"
         "%.2f,%.2f,%.1f,"
         "%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,"
@@ -229,6 +264,7 @@ static void emitData(uint32_t rx_ms, uint32_t t_ms, uint8_t seq, int fresh) {
         flg(f, S5T::F_ALT_EN), flg(f, S5T::F_ALT_ACT),
         flg(f, S5T::F_POS_HOLD), flg(f, S5T::F_AIRBORNE),
         flg(f, S5T::F_DRY_RUN), flg(f, S5T::F_SAT), flg(f, S5T::F_TX_DROP),
+        flg(f, S5T::F_GUIDED), flg(f, S5T::F_CMD_FRESH), flg(f, S5T::F_LANDED),
         a.thr / 250.0f, (unsigned)b.bad,
         a.roll_cd / S5T::SC_CDEG, a.pitch_cd / S5T::SC_CDEG,
         a.yaw_dd / S5T::SC_DDEG,
@@ -266,6 +302,10 @@ static void printStatus() {
                   (unsigned long)(live ? age : 0), last_rssi);
     Serial.printf("IM920 生受信: %lu bytes / %lu 行\n",
                   (unsigned long)n_rx_bytes, (unsigned long)n_rx_lines);
+    Serial.printf("上りCMD: PC行=%lu 送信=%lu 不正=%lu  %s\n",
+                  (unsigned long)n_cmd_lines, (unsigned long)n_cmd_tx,
+                  (unsigned long)n_cmd_bad,
+                  cmd_have ? "(送信中)" : "(PC からの指令なし)");
     Serial.printf("stats: A=%lu B=%lu C=%lu P=%lu  lost=%lu  badcs=%lu badlen=%lu",
                   (unsigned long)n_alt, (unsigned long)n_pos, (unsigned long)n_att,
                   (unsigned long)n_param, (unsigned long)n_lost,
@@ -385,6 +425,9 @@ static void printHelp() {
     Serial.println("#   d : IM920 の生の行をそのまま表示 (リンクの切り分け用)");
     Serial.println("#   z : 統計クリア");
     Serial.println("#   h : このヘルプ");
+    Serial.println("#   CMD,req,vx_mmps,vy_mmps,alt_cm,yawrate[,flags] : 上りコマンド");
+    Serial.println("#       req 0=IDLE 1=HOLD 2=TAKEOFF 3=GUIDED 4=LAND 5=ABORT");
+    Serial.println("#       5Hz に間引いて無線へ流す。1.5秒来なければ送信停止");
     Serial.printf ("#   ver=%u  A=%u B=%u P=%u byte (+checksum4 = %u, IM920sL上限 %u)\n",
                    (unsigned)S5T::VERSION,
                    (unsigned)sizeof(S5T::AltFrame), (unsigned)sizeof(S5T::PosFrame),
@@ -520,6 +563,65 @@ static void handleLine(String& line) {
 }
 
 // ------------------------------------------------------------
+//  上りコマンド行のパース
+//    CMD,<req>,<vx_mmps>,<vy_mmps>,<alt_cm>,<yaw_rate_cdps>,<flags>
+//  ★ 欠けているフィールドは 0 として扱わず、行ごと捨てる。数値が 1 個
+//    ずれただけで「目標高度」が「速度」になる。黙って飛ばすほうが危ない。
+// ------------------------------------------------------------
+static void handleCmdLine(char* line) {
+    n_cmd_lines++;
+    long v[6];
+    int  n = 0;
+    char* p = line + 4;              // "CMD," の次から
+    while (n < 6 && *p) {
+        char* end = nullptr;
+        v[n] = strtol(p, &end, 10);
+        if (end == p) break;          // 数字が無い
+        n++;
+        p = end;
+        if (*p == ',') p++;
+        else break;
+    }
+    if (n < 5) {                      // flags は省略可
+        n_cmd_bad++;
+        Serial.printf("# CMD 行が短い (%d 個)。CMD,req,vx,vy,alt,yawrate[,flags]\n", n);
+        return;
+    }
+
+    cmd_box.magic         = S5C::MAGIC;
+    cmd_box.ver           = S5C::VERSION;
+    cmd_box.req           = (uint8_t)v[0];
+    cmd_box.vx_mmps       = (int16_t)constrain(v[1], -32768, 32767);
+    cmd_box.vy_mmps       = (int16_t)constrain(v[2], -32768, 32767);
+    cmd_box.alt_cm        = (int16_t)constrain(v[3], -32768, 32767);
+    cmd_box.yaw_rate_cdps = (int16_t)constrain(v[4], -32768, 32767);
+    cmd_box.flags         = (uint16_t)((n >= 6) ? v[5] : 0);
+    cmd_have       = true;
+    cmd_last_pc_ms = millis();
+}
+
+// mailbox を一定間隔で無線へ流す。PC が黙ったら止める。
+static void serviceCmdTx() {
+    cmd_tx.service();                 // 送りかけを吐き出す (非ブロッキング)
+    if (!cmd_have) return;
+
+    const uint32_t now = millis();
+    if (now - cmd_last_pc_ms > CMD_PC_TIMEOUT_MS) {
+        if (cmd_have) {
+            cmd_have = false;
+            Serial.println("# PC からの CMD が途切れました。上り送信を停止します "
+                           "(機体はホールド -> 自動着陸へ)");
+        }
+        return;
+    }
+    if (now - cmd_last_tx_ms < CMD_TX_INTERVAL_MS) return;
+    cmd_last_tx_ms = now;
+
+    cmd_box.seq = cmd_seq++;
+    if (cmd_tx.send(cmd_box)) n_cmd_tx++;
+}
+
+// ------------------------------------------------------------
 //  キー入力
 // ------------------------------------------------------------
 //  ★ どのキーにも必ず1行返す。無反応だと「キーが届いていない」のか
@@ -609,8 +711,28 @@ void loop() {
         }
     }
 
-    // --- キー入力 ---
-    while (Serial.available()) handleKey((char)Serial.read());
+    // --- USB 入力 ---
+    //  ★ 既存の1文字キー ("1"/"0"/"l"...) と、複数文字の "CMD,..." 行を
+    //    同じストリームで受ける。
+    //    先頭が 'C' のときだけ行として溜め、それ以外は従来どおり即キー扱い。
+    //    ('C' を使うキーは今も将来も作らないこと)
+    while (Serial.available()) {
+        const char c = (char)Serial.read();
+        if (usb_n == 0 && c != 'C') { handleKey(c); continue; }
+        if (c == '\r') continue;
+        if (c == '\n') {
+            usb_line[usb_n] = '\0';
+            if (usb_n >= 4 && strncmp(usb_line, "CMD,", 4) == 0) handleCmdLine(usb_line);
+            else if (usb_n) { n_cmd_bad++; Serial.printf("# 未知の行: %s\n", usb_line); }
+            usb_n = 0;
+            continue;
+        }
+        if (usb_n < sizeof(usb_line) - 1) usb_line[usb_n++] = c;
+        else { usb_n = 0; n_cmd_bad++; }
+    }
+
+    // --- 上りコマンドの送信 (5Hz に間引く) ---
+    serviceCmdTx();
 
     const uint32_t now = millis();
 

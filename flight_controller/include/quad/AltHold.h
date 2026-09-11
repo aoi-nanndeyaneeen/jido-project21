@@ -64,7 +64,35 @@ public:
         _thr_applied    = 0.0f;
         _dt_since_fresh = 0.0f;
         _rate_pid.reset();
+        clearCommandedTarget();
     }
+
+    // ------------------------------------------------------------
+    //  外部から目標高度を指令する (地上局ガイド飛行 / 自動離陸・着陸)
+    // ------------------------------------------------------------
+    //  ★ 自動離陸・自動着陸の「実体」はこれ一本。別のモードを足すのではなく、
+    //    既に飛べている高度ホールドの目標を毎ループ少しずつ動かすだけにする。
+    //    こうすると離陸も着陸も巡航も、通っている制御経路は完全に同じになり、
+    //    「離陸のときだけ挙動が違う」という切り分け不能なバグが原理的に出ない。
+    //
+    //  ★ 目標は必ずスルーレート制限を通す。地上局が目標高度をいきなり
+    //    0.5m -> 1.5m と飛ばしても、機体側では m_per_s [m/s] でしか動かない。
+    //    パケット1個の化けで機体が突き上がるのを構造的に防ぐ。
+    //
+    //    target_m : 目標対地高度 [m]
+    //    m_per_s  : 目標を動かしてよい速さ [m/s] (離陸 0.3 / 着陸 0.2 程度)
+    void commandTarget(float target_m, float m_per_s) {
+        _cmd_target_m = target_m;
+        _cmd_slew     = (m_per_s > 0.0f) ? m_per_s : 0.0f;
+        _cmd_on       = (target_m > 0.0f);
+    }
+    void clearCommandedTarget() {
+        _cmd_on       = false;
+        _cmd_target_m = 0.0f;
+        _cmd_slew     = 0.0f;
+    }
+    bool  commanded()       const { return _cmd_on; }
+    float commandTargetM()  const { return _cmd_target_m; }
 
     // ------------------------------------------------------------
     //  update()  — RANGE_LOOP_HZ で毎回呼ぶ (fresh でなくても呼ぶこと)
@@ -127,7 +155,12 @@ public:
 
         // --- 2) inactive → active の初期化 ---------------------------
         if (!isEngaged()) {
-            _hold_m   = (ALT_TARGET_M > 0.0f) ? ALT_TARGET_M : h_m;
+            // ★ 地上局から目標が来ているならそれを最優先。
+            //   ただし engage の瞬間だけは「今の高度」から始める。いきなり
+            //   目標へ飛ばすと、離陸前の engage で機体が一気に突き上がる。
+            //   目標へは下の 3-2) がスルーレートで寄せていく。
+            _hold_m   = _cmd_on ? h_m
+                      : ((ALT_TARGET_M > 0.0f) ? ALT_TARGET_M : h_m);
             _engage_h = h_m;              // 離陸判定の地面基準
             _dt_since_fresh = 0.0f;       // engage 前の積算は捨てる
             // engage した時点で既に十分高ければ、地上ではなく空中で
@@ -141,8 +174,20 @@ public:
         //   PosHold はこれを見て、地上にいる間の積分ワインドアップを避ける。
         if (!_airborne && h_m > _engage_h + ALT_AIRBORNE_RISE_M) _airborne = true;
 
+        // --- 3-2) 指令目標へスルーレートで寄せる (自動離陸 / 自動着陸) ---
+        //   地上局が REQ_TAKEOFF / REQ_LAND を出している間、_hold_m はここで
+        //   _cmd_slew [m/s] ずつしか動かない。地上局が落ちても _hold_m は
+        //   最後の値で止まるだけなので、その場ホバーに落ち着く。
+        if (_cmd_on && dt_s > 0.0f) {
+            const float step = (_cmd_slew > 0.0f) ? _cmd_slew * dt_s : 1e9f;
+            const float d    = _cmd_target_m - _hold_m;
+            _hold_m += constrain(d, -step, step);
+        }
+
         // --- 4) 目標上昇速度 -----------------------------------------
-        if (ALT_STICK_VZ_ENABLE) {
+        //   ★ 地上局が目標高度を握っている間はスティック昇降を無効にする。
+        //     両方が _hold_m を書くと、どちらが目標なのか分からなくなる。
+        if (ALT_STICK_VZ_ENABLE && !_cmd_on) {
             const float dev = thr_stick - ALT_HOVER_THR;
             if (fabsf(dev) > ALT_STICK_DEAD) {
                 _vz_tar = dev * ALT_STICK_VZ;
@@ -277,6 +322,11 @@ private:
     bool     _airborne = false;
     float    _thr_applied    = 0.0f;  // ミキサーが実際に使ったスロットル (ログ/診断)
     float    _dt_since_fresh = 0.0f;  // 前回 fresh からの経過 [s] (PID の真の dt)
+
+    // 地上局からの目標高度指令 (commandTarget)。_cmd_on=false なら従来動作。
+    bool     _cmd_on       = false;
+    float    _cmd_target_m = 0.0f;
+    float    _cmd_slew     = 0.0f;    // [m/s]
 };
 
 } // namespace Quad

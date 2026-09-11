@@ -49,6 +49,30 @@ public:
         reset();
     }
 
+    // ------------------------------------------------------------
+    //  外部からの目標速度指令 (地上局ガイド飛行)
+    // ------------------------------------------------------------
+    //  ★ 地上局は「スティック」ではなく「機体座標の目標速度 [m/s]」を送る。
+    //    スティック経路 (sx * FLOW_STICK_VEL) を通すと、地上局が意図した
+    //    速度が FLOW_STICK_VEL のチューニングに巻き込まれて変わってしまう。
+    //    m/s をそのまま渡せる口を分けておく。
+    //
+    //  ★ 指令が不感帯以下 (= 止まれ) のときは、スティックを離したのと
+    //    まったく同じ「その場の地面位置を保持」に落ちる。地上局からの
+    //    指令が途切れたら 0 を入れるだけでホールドになるのはこの性質。
+    //
+    //    vx : 前 + [m/s]   vy : 右 + [m/s]
+    void setVelCommand(float vx, float vy) {
+        _ext_vx = vx;
+        _ext_vy = vy;
+        _ext_on = true;
+    }
+    void clearVelCommand() {
+        _ext_on = false;
+        _ext_vx = _ext_vy = 0.0f;
+    }
+    bool velCommanded() const { return _ext_on; }
+
     // アーム/モード切替でクリアする (drone_s5 の resetControllers から)
     void reset() {
         _vx_ctl = _vy_ctl = 0.0f;
@@ -60,6 +84,7 @@ public:
         _bad_count = 0;
         _vx_pid.reset();
         _vy_pid.reset();
+        clearVelCommand();
     }
 
     // ------------------------------------------------------------
@@ -103,13 +128,28 @@ public:
         _pos_n += vn * dt_s;
         _pos_e += ve * dt_s;
 
-        // --- スティック → 目標速度 (触っている間は速度指令、離すと位置ホールド) ---
-        const bool stick_active = (fabsf(sx) > FLOW_STICK_DEAD) ||
-                                  (fabsf(sy) > FLOW_STICK_DEAD);
-        if (stick_active) {
+        // --- スティック(または地上局指令) → 目標速度 ---
+        //   触っている間は速度指令、離す (= 指令 0) と位置ホールド。
+        //   ★ 地上局指令が入っているときはスティックより優先する。GUIDED 中は
+        //     drone_s5 側がスティックを 0 にして渡すので競合はしないが、
+        //     ここでも優先順位を明示しておく。
+        bool  stick_active;
+        float tar_x, tar_y;
+        if (_ext_on) {
+            stick_active = (fabsf(_ext_vx) > FLOW_VEL_CMD_DEAD) ||
+                           (fabsf(_ext_vy) > FLOW_VEL_CMD_DEAD);
+            tar_x = constrain(_ext_vx, -FLOW_STICK_VEL, FLOW_STICK_VEL);
+            tar_y = constrain(_ext_vy, -FLOW_STICK_VEL, FLOW_STICK_VEL);
+        } else {
+            stick_active = (fabsf(sx) > FLOW_STICK_DEAD) ||
+                           (fabsf(sy) > FLOW_STICK_DEAD);
             // スティックは機体座標のまま (パイロットの前後左右 = 機首基準)
-            _vx_tar = FLOW_STICK_SIGN_X * sx * FLOW_STICK_VEL;
-            _vy_tar = FLOW_STICK_SIGN_Y * sy * FLOW_STICK_VEL;
+            tar_x = FLOW_STICK_SIGN_X * sx * FLOW_STICK_VEL;
+            tar_y = FLOW_STICK_SIGN_Y * sy * FLOW_STICK_VEL;
+        }
+        if (stick_active) {
+            _vx_tar = tar_x;
+            _vy_tar = tar_y;
             _hold_n = _pos_n;          // 保持基準を今の地面位置へ張り付け
             _hold_e = _pos_e;
             _holding = false;
@@ -180,6 +220,10 @@ private:
         _vy_pid.reset();
         _bad_count = 0;
     }
+
+    // 地上局からの目標速度指令 (setVelCommand)。_ext_on=false なら従来動作。
+    bool  _ext_on = false;
+    float _ext_vx = 0.0f, _ext_vy = 0.0f;
 
     Pid   _vx_pid, _vy_pid;      // 速度ループ (機体座標 x=前 / y=右)
     float _pos_kp     = FLOW_POS_KP;
