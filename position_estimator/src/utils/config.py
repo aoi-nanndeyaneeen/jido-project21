@@ -47,6 +47,22 @@ CAMERA_FOCUS_VALUE = 0      # 0 = 無限遠 (C920の場合)
 # 会場の明るさに自動で合わせつつ、競技中は変動しない。当日の操作は不要。
 LOCK_EXPOSURE_AFTER_CALIB = True
 
+# ---- 追跡用の露出 (bright 検知モードで使う) --------------------------------
+# 機体のLEDだけを白飛びさせるため、キャリブレーション完了後に露出を
+# 「自動が選んだ値」ではなく、明示した暗い値へ落とす。
+#
+#   None  : 従来どおり。自動露出が選んだ値でそのまま固定する
+#   数値  : その値を CAP_PROP_EXPOSURE に設定する
+#
+# ★ 値の意味はドライバ依存。Windows の DirectShow(UVC) では
+#   概ね 2 のべき乗の負値で、-6 が約 1/64 秒、小さいほど暗い。
+#   当日その場で -4 から下げていき、「LED以外に白飛びが無い」ところで止める。
+#   暗くしすぎると LED が小さく写って bright_min_area_px を割る。
+#
+# ★ キャリブレーション (5点クリック) は明るい状態で先に済ませること。
+#   暗くすると隅や支柱が見えなくなってクリックできない。
+TRACKING_EXPOSURE = None
+
 # α6400 は USB 出力だと OpenCV から露出制御できない場合が多い。
 # その場合はカメラ本体を M モード + MF に設定しておくこと（準備時間は増えない）。
 
@@ -328,6 +344,58 @@ YAW_ENTRY_MODE_ENABLED = True
 YAW_ENTRY_MAX_DVY_BODY = 0.4   # |dvy_body| がこれ未満なら「ほぼ純前進」とみなす [m/s]
 
 # ==========================================
+# 地上局リンク（機体との IM920 経由の双方向通信）
+# ==========================================
+# core/s5_link.py が XIAO RP2040 (ground_receiver の env:xiao_s5_log) を開く。
+#
+# ★ ground_receiver/tools/s5_logger.py を同時に起動しないこと。
+#   USB シリアルは1プロセスしか開けない。テレメトリの CSV 保存は
+#   S5Link 側がやる（logs/s5_link_*.csv）。
+GROUND_LINK_ENABLED = True
+GROUND_LINK_PORT    = None    # None = VID:PID (2E8A:000A) で自動検出
+
+# ==========================================
+# ウェイポイント飛行ミッション
+# ==========================================
+# フィールド座標 [m]（x=右, y=奥, z=上。中央が原点）。
+# ★ FIELD_PROFILE と必ず整合させること。small (1.4m x 1.4m) のまま
+#   large 用の座標を入れると、離陸した瞬間にジオフェンスへ突っ込む。
+#
+# 高さは「対地高度」として機体へ送る。床が平らである前提。
+# ★ flight_controller の Quad::ALT_TARGET_M と同じ値にしておくこと。
+#   GUIDED から抜けた瞬間 (スイッチ操作・リンク断・スティック介入) に
+#   機体は POSHOLD へ落ち、そこでは ALT_TARGET_M を保持高度にする。
+#   値が違うと、抜けた瞬間にその差だけ勝手に昇降する。
+MISSION_TAKEOFF_ALT_M = 0.50   # 離陸してまず保持する高度 [m]
+
+# 起動直後に選ばれる既定ミッション。1辺 MISSION_SQUARE_M の正方形を1周して帰投。
+# ★ 到達判定半径 (core/mission.py ARRIVE_R_M) より十分大きくすること。
+#   1辺が到達半径と同程度だと、離陸した瞬間に全WPが「到達済み」になり、
+#   一度も移動しないまま帰投 -> 着陸してしまう (シミュレーションで確認済み)。
+MISSION_SQUARE_M = 0.80
+
+# ---- ミッション中の機首方位をどこから取るか ----------------------------
+#  "fixed"  : カメラのヨー推定が収束していない間は YAW_INITIAL_ALIGN_DEG を
+#             「正しい機首方位」として使う。収束したらカメラ側を優先する。
+#             ★ 運用: 機首をフィールド奥(+y)へ向けて置いてアームし、
+#               ミッション中は機首を回さない。これが前提。
+#  "camera" : カメラのヨー推定が収束するまで水平移動しない (最も安全)。
+#
+#  ★ "camera" のままだと、ヨー推定は「機体が 1m/s 以上で動いている窓」が
+#    無いと収束しない (YAW_MIN_DV_CAMERA)。つまり
+#      動かない -> ヨーが決まらない -> 動かせない
+#    のデッドロックになり、ウェイポイント飛行が永久に始まらない。
+#    最初の正方形飛行は "fixed" で通し、ヨーの自動補正はそのあと。
+MISSION_YAW_MODE = "fixed"
+
+MISSION_WAYPOINTS = [
+    ( MISSION_SQUARE_M / 2, -MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
+    ( MISSION_SQUARE_M / 2,  MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
+    (-MISSION_SQUARE_M / 2,  MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
+    (-MISSION_SQUARE_M / 2, -MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
+]
+
+# ==========================================
 # ダミー飛行（カメラ未検出フォールバック）
 # ==========================================
 DUMMY_FALLBACK_FRAMES = 30    # 何フレーム連続未検出でダミーに切り替えるか
@@ -376,6 +444,11 @@ _DEFAULT_DETECTION = {
     "bg_var_threshold": 24.0,
     "bg_learning_rate": 0.0005,
     "vibration_reject_ratio": 0.06,
+    # 検知方式: "motion" / "bright" / "bright_or_motion"
+    "detect_mode": "motion",
+    "bright_threshold": 230,
+    "bright_min_area_px": 4,
+    "bright_max_area_px": 4000,
 }
 
 
@@ -409,6 +482,12 @@ BG_HISTORY             = DETECTION["bg_history"]
 BG_VAR_THRESHOLD       = DETECTION["bg_var_threshold"]
 BG_LEARNING_RATE       = DETECTION["bg_learning_rate"]
 VIBRATION_REJECT_RATIO = DETECTION["vibration_reject_ratio"]
+
+# 明るいLEDを狙う検知モード (detection_params.json の _comment_mode を参照)
+DETECT_MODE        = DETECTION["detect_mode"]
+BRIGHT_THRESHOLD   = DETECTION["bright_threshold"]
+BRIGHT_MIN_AREA_PX = DETECTION["bright_min_area_px"]
+BRIGHT_MAX_AREA_PX = DETECTION["bright_max_area_px"]
 
 # ==========================================
 # 画像空間ジャンプフィルタ（Phase B で3Dゲートに置き換え予定）

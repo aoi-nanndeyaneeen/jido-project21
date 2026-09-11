@@ -14,12 +14,17 @@ from collections import deque
 
 from utils.config import (DISP_W, DISP_H, VELOCITY_W, VELOCITY_H,
                           YAW_ENABLED, YAW_INITIAL_ALIGN_DEG,
-                          YAW_SEND_HZ, YAW_SEND_INITIAL_ALIGN)
+                          YAW_SEND_HZ, YAW_SEND_INITIAL_ALIGN,
+                          GROUND_LINK_ENABLED, GROUND_LINK_PORT,
+                          MISSION_WAYPOINTS, MISSION_TAKEOFF_ALT_M,
+                          MISSION_YAW_MODE, LOG_DIR)
 from core.tracker import camera_thread_func
 from core.controller import AltitudeController
 from core.geometry import accel_to_angles
 from core.yaw_estimator import YawEstimator
 from core.autopilot import SquarePatrol, HoverHold, WaypointMission, RCCommand
+from core.s5_link import S5Link
+from core.mission import WaypointMission as Mission, Phase as MissionPhase
 from utils.logger import PerformanceLogger
 from ui.dashboard import Dashboard
 from ui.view_velocity import ViewVelocity
@@ -57,6 +62,8 @@ def run_main_loop(cam1, cam2,
     print("   ALL SYSTEMS GO  -  STEREO TRACKING STARTED")
     print("=" * 56)
     print()
+    print("  [M]     ★ミッション開始 (自動離陸 -> ウェイポイント -> 帰投 -> 自動着陸)")
+    print("  [X]     ミッション中断 (その場から自動着陸)")
     print("  [B]     背景リセット (両カメラ)")
     print("  [H]     ホバリングモード")
     print("  [W]     waypoint飛行モード (今後実装予定 → 現状はホバリングにフォールバック)")
@@ -64,7 +71,8 @@ def run_main_loop(cam1, cam2,
     print("  [Q]     終了")
     print()
 
-    shared = {"do_bg_reset": False, "quit": False, "mode_request": None}
+    shared = {"do_bg_reset": False, "quit": False, "mode_request": None,
+              "mission_request": None}
 
     # ── ウィンドウ作成 ──────────────────────────────────────
     cv2.namedWindow("Camera 1", cv2.WINDOW_NORMAL)
@@ -95,6 +103,12 @@ def run_main_loop(cam1, cam2,
                 elif key == b'c':
                     print("[KEY] C → 本番(競技)モード要求")
                     shared["mode_request"] = "competition"
+                elif key == b'm':
+                    print("[KEY] M → ミッション開始要求")
+                    shared["mission_request"] = "start"
+                elif key == b'x':
+                    print("[KEY] X → ミッション中断要求")
+                    shared["mission_request"] = "abort"
             time.sleep(0.05)
 
     threading.Thread(target=keyboard_thread, daemon=True).start()
@@ -118,6 +132,27 @@ def run_main_loop(cam1, cam2,
     patrol         = HoverHold()
     view_rc        = ViewRC()
 
+    # ── 地上局リンク (機体へ指令を送る唯一の経路) ───────────────
+    #  ★ ここが None のままだと、機体は一切動かない (見ているだけ)。
+    #    s5_logger.py を同時起動していると開けないので、その旨を出す。
+    link = None
+    mission = None
+    if GROUND_LINK_ENABLED:
+        print()
+        print("[INIT] 地上局 (XIAO / xiao_s5_log) へ接続中...")
+        link = S5Link(port=GROUND_LINK_PORT, log_dir=LOG_DIR)
+        if link.ok:
+            mission = Mission(link, MISSION_WAYPOINTS)
+            mission.TAKEOFF_ALT_M = MISSION_TAKEOFF_ALT_M
+            print(f"  [OK] ミッション準備完了。[M] で開始します")
+            for i, wp in enumerate(MISSION_WAYPOINTS):
+                print(f"       WP{i}: ({wp[0]:+.2f}, {wp[1]:+.2f}, {wp[2]:.2f})")
+        else:
+            link = None
+            print("  [SKIP] 地上局に繋がりません。追跡の表示のみで続行します")
+    else:
+        print("[INIT] GROUND_LINK_ENABLED=False のため機体へは何も送りません")
+
     cv2.namedWindow("RC Command", cv2.WINDOW_NORMAL)
     cv2.imshow("RC Command", np.zeros((ViewRC.H, ViewRC.W, 3), dtype=np.uint8))
     cv2.waitKey(1)
@@ -128,6 +163,9 @@ def run_main_loop(cam1, cam2,
     cv2.namedWindow("Velocity", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Velocity", VELOCITY_W, VELOCITY_H)
     cv2.moveWindow("Velocity", 0, 0)
+
+    # 「初期アラインメントで飛んでいます」の警告を1回だけ出すための箱
+    _warned_fixed_yaw = [False]
 
     _pos_hist = deque(maxlen=6)
     _last_cmd = RCCommand()
@@ -222,6 +260,46 @@ def run_main_loop(cam1, cam2,
                                           heading_rad=yaw_rad,
                                           is_dummy=in_dummy)
 
+            # ── ウェイポイントミッション ────────────────────
+            #  ★ 順番が大事: 先にキー要求を処理し、そのあと update() する。
+            #    同じフレームで「開始 -> 1回目の指令」まで進むので、
+            #    キーを押してから機体が反応するまでの遅れが 1 フレームで済む。
+            if mission is not None:
+                req = shared.get("mission_request")
+                if req is not None:
+                    shared["mission_request"] = None
+                    if req == "start":
+                        mission.start()
+                    elif req == "abort":
+                        mission.abort("キー操作")
+
+                #  カメラが機体を捉えているか。
+                #  ★ in_dummy (仮想円軌道へのフォールバック中) は「捉えていない」。
+                #    ここを True にすると、架空の位置で位置ループを閉じることになる。
+                pos_valid = bool(tracking_ok) and not in_dummy and P is not None
+
+                #  ── ミッションに渡す機首方位 ──────────────────
+                #  カメラのヨー推定が収束していればそれが最優先。
+                #  収束していないときに何を使うかが MISSION_YAW_MODE。
+                #    "fixed"  : 初期アラインメント値を使って飛ぶ
+                #               (機首をフィールド奥へ向けて置いた前提)
+                #    "camera" : 使わない = 水平移動しない (安全側)
+                #  ★ ここを "camera" のままにすると、ヨー推定は機体が
+                #    動いていないと収束しないため、永久に動き出さない。
+                m_yaw, m_yaw_valid = yaw_rad, (yaw_rad is not None)
+                if not m_yaw_valid and MISSION_YAW_MODE == "fixed":
+                    m_yaw = math.radians(YAW_INITIAL_ALIGN_DEG)
+                    m_yaw_valid = True
+                    if not _warned_fixed_yaw[0]:
+                        _warned_fixed_yaw[0] = True
+                        print(f"[Mission] ヨー推定が未収束のため、初期アラインメント "
+                              f"{YAW_INITIAL_ALIGN_DEG:+.1f}deg を機首方位として使います。"
+                              f"機首をフィールド奥(+y)へ向けたまま飛ばしてください")
+
+                mission.update(pos=P, yaw_rad=m_yaw,
+                               pos_valid=pos_valid,
+                               yaw_valid=m_yaw_valid)
+
             # ── 自律制御コマンドをground_receiver経由でドローンへ送信 ──
             if alt_sensor is not None:
                 alt_sensor.send_autopilot_command(_last_cmd)
@@ -273,6 +351,8 @@ def run_main_loop(cam1, cam2,
             }
             display_perf_log.write("display", display_values)
             if time.time() - display_perf_time >= 2.0:
+                if mission is not None and mission.phase is not MissionPhase.IDLE:
+                    print(f"[Mission] {mission.status_line()}")
                 print("[PERF] display "
                       f"total={display_values['Display_ms']:.1f}ms "
                       f"rc={rc_ms:.1f}ms velocity={velocity_ms:.1f}ms "
@@ -295,6 +375,21 @@ def run_main_loop(cam1, cam2,
             threading.Thread(target=ask_target, daemon=True).start()
 
     # ── 終了処理 ──────────────────────────────────────────
+    #  ★ リンクを閉じる前に必ずミッションを止める。close() が ABORT を
+    #    送るので機体は自動着陸へ落ちるが、飛行中に Q を押した場合は
+    #    それでも「降りてくるまで見ていること」。
+    if mission is not None and mission.phase not in (MissionPhase.IDLE,
+                                                     MissionPhase.DONE):
+        print("[Mission] 終了要求 → 自動着陸を指示します。着地を見届けてください")
+        mission.abort("プログラム終了")
+        for _ in range(200):                 # 最大 20 秒だけ着陸に付き合う
+            mission.update()
+            if mission.phase is MissionPhase.DONE:
+                break
+            time.sleep(0.1)
+    if link is not None:
+        link.close()
+
     patrol.close()
     if alt_sensor is not None:
         alt_sensor.stop()
