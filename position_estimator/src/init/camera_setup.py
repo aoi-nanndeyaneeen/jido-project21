@@ -23,9 +23,6 @@ class _DummyCam2:
     def read_and_detect(self):
         return None, [], 0.0
 
-    def read_and_track(self):
-        return None, None
-
     def draw_candidates(self, frame, candidates, best_index=None):
         pass
 

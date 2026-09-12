@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 HOST, PORT     = "0.0.0.0", 5555
 CAMERA_ID      = 0
@@ -50,6 +51,10 @@ _DEFAULT_PARAMS = {
     "bg_var_threshold": 24.0,
     "bg_learning_rate": 0.0005,
     "vibration_reject_ratio": 0.06,
+    "static_bright_mask": True,
+    "static_mask_learn_frames": 120,
+    "static_mask_ratio": 0.9,
+    "static_mask_dilate_px": 7,
 }
 
 
@@ -95,6 +100,10 @@ class Detector:
         if P["use_background_subtractor"]:
             self.bg = self._make_bg()
 
+        self.static_mask = None       # 学習完了後の除外マスク (255=除外)
+        self._static_acc = None
+        self._static_frames = 0
+
     def _make_bg(self):
         return cv2.createBackgroundSubtractorMOG2(
             history=P["bg_history"],
@@ -106,12 +115,50 @@ class Detector:
         self.prev_gray = None
         if self.bg is not None:
             self.bg = self._make_bg()
+        self.static_mask = None
+        self._static_acc = None
+        self._static_frames = 0
 
     def _bright_mask(self, gray_blurred):
         """輝度しきい値だけの前景。静止ホバリング中でも消えない (PC側 camera.py と同じ)。"""
         _, m = cv2.threshold(gray_blurred, P["bright_threshold"], 255,
                              cv2.THRESH_BINARY)
+        if P.get("static_bright_mask", True):
+            m = self._subtract_static(m)
         return m
+
+    def _subtract_static(self, bright_mask):
+        """
+        「ずっと明るいまま動かない画素」を覚えて差し引く (PC側 StaticBrightMask と同じ)。
+
+        窓・白い反射・照明は時間的に不変なので構造物として除外する。
+        ★ 学習中は機体を画角に入れないこと。静止した機体が写っていると
+          そのLEDごと覚えてしまう。覚え直しは CALIB/リセットで。
+        """
+        n = P["static_mask_learn_frames"]
+        if self._static_frames >= n:
+            if self.static_mask is None:
+                return bright_mask
+            return cv2.bitwise_and(bright_mask, cv2.bitwise_not(self.static_mask))
+
+        if self._static_acc is None:
+            self._static_acc = np.zeros(bright_mask.shape, dtype=np.uint16)
+        self._static_acc += (bright_mask > 0)
+        self._static_frames += 1
+        if self._static_frames < n:
+            return bright_mask
+
+        mask = ((self._static_acc >= int(n * P["static_mask_ratio"])) * 255).astype(np.uint8)
+        d = P["static_mask_dilate_px"]
+        if d > 0:
+            mask = cv2.dilate(mask, cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (d, d)))
+        self.static_mask = mask
+        self._static_acc = None
+        coverage = cv2.countNonZero(mask) / float(mask.size)
+        print(f"[RPi] 静的輝点マスクを学習完了 ({n}フレーム, "
+              f"画面の{coverage * 100:.1f}%を除外)")
+        return bright_mask
 
     def _mask(self, gray_blurred):
         if self.bg is not None:

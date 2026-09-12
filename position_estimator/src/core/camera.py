@@ -12,6 +12,7 @@ import threading
 from typing import NamedTuple
 
 import cv2
+import numpy as np
 
 from core.geometry import approx_camera_matrix
 from utils.config import (DETECT_MODE, BRIGHT_THRESHOLD, TRACKING_EXPOSURE,
@@ -21,6 +22,8 @@ from utils.config import (DETECT_MODE, BRIGHT_THRESHOLD, TRACKING_EXPOSURE,
                           MAX_CANDIDATES, USE_BG_SUBTRACTOR,
                           BG_HISTORY, BG_VAR_THRESHOLD, BG_LEARNING_RATE,
                           VIBRATION_REJECT_RATIO,
+                          STATIC_BRIGHT_MASK, STATIC_MASK_LEARN_FRAMES,
+                          STATIC_MASK_RATIO, STATIC_MASK_DILATE_PX,
                           CAMERA_AUTOFOCUS, CAMERA_FOCUS_VALUE,
                           USE_MEASURED_INTRINSICS,
                           FALLBACK_HFOV_DEG, FALLBACK_HFOV_DEFAULT)
@@ -40,6 +43,69 @@ class Candidate(NamedTuple):
 # DirectShow の自動露出プロパティは 0.75=自動 / 0.25=手動 という慣習
 DSHOW_EXPOSURE_AUTO   = 0.75
 DSHOW_EXPOSURE_MANUAL = 0.25
+
+
+class StaticBrightMask:
+    """
+    「ずっと明るいまま動かない画素」を覚えて bright マスクから引く。
+
+    窓・白い反射・照明は時間的に不変なので、学習フレームの大半で明るかった
+    画素を構造物として記録し、以降の検知から除外する。機体のLEDは
+    ホバリング中でも数px揺れるため、比率しきい値で残る。
+
+    ★ 学習中は機体を画角に入れないこと（または消灯しておくこと）。
+      静止した機体が写っていると、そのLEDごと構造物として覚えてしまう。
+      照明が変わったときや覚え間違えたときは [B] キーで再学習できる。
+    """
+
+    def __init__(self, label: str):
+        self.label = label
+        self._acc = None
+        self._frames = 0
+        self.mask = None      # 学習完了後の除外マスク (255=除外)
+
+    @property
+    def learned_frames(self) -> int:
+        return self._frames
+
+    def apply(self, bright_mask):
+        """学習を進めつつ、学習済みなら静的画素を除いたマスクを返す。"""
+        if self._frames < STATIC_MASK_LEARN_FRAMES:
+            self._learn(bright_mask)
+            return bright_mask
+        if self.mask is None:
+            return bright_mask
+        return cv2.bitwise_and(bright_mask, cv2.bitwise_not(self.mask))
+
+    def _learn(self, bright_mask):
+        if self._acc is None:
+            self._acc = np.zeros(bright_mask.shape, dtype=np.uint16)
+        self._acc += (bright_mask > 0)
+        self._frames += 1
+        if self._frames < STATIC_MASK_LEARN_FRAMES:
+            return
+
+        hits = int(STATIC_MASK_LEARN_FRAMES * STATIC_MASK_RATIO)
+        mask = ((self._acc >= hits) * 255).astype(np.uint8)
+        if STATIC_MASK_DILATE_PX > 0:
+            k = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (STATIC_MASK_DILATE_PX, STATIC_MASK_DILATE_PX))
+            mask = cv2.dilate(mask, k)
+        self.mask = mask
+        self._acc = None
+
+        coverage = cv2.countNonZero(mask) / float(mask.size)
+        print(f"  [{self.label}] 静的輝点マスクを学習完了 "
+              f"({STATIC_MASK_LEARN_FRAMES}フレーム, 画面の{coverage * 100:.1f}%を除外)")
+        if coverage > 0.20:
+            print(f"  [{self.label}] [WARN] 除外領域が広すぎます。露出が明るすぎるか、"
+                  "学習中に機体が写っていた可能性があります。[B]キーで再学習してください。")
+
+    def reset(self):
+        self._acc = None
+        self._frames = 0
+        self.mask = None
 
 
 class CameraTracker:
@@ -82,6 +148,8 @@ class CameraTracker:
         self._bg = None
         if USE_BG_SUBTRACTOR:
             self._bg = self._make_bg_subtractor()
+
+        self._static_bright = StaticBrightMask(label) if STATIC_BRIGHT_MASK else None
 
         self.exposure_locked = False
         self.last_frame_time = 0.0
@@ -261,9 +329,14 @@ class CameraTracker:
         背景差分と違って「動いたか」を一切見ないので、**ホバリングで完全に
         静止していても消えない**。これが motion モードとの決定的な差。
         露出を絞って「画面の中でLEDだけが白飛びしている」状態にして使うこと。
+
+        窓や白い反射も同じように光るため、StaticBrightMask で
+        「ずっと明るいまま動かない画素」を差し引く。
         """
         _, mask = cv2.threshold(gray_blurred, BRIGHT_THRESHOLD, 255,
                                 cv2.THRESH_BINARY)
+        if self._static_bright is not None:
+            mask = self._static_bright.apply(mask)
         return mask
 
     def detect(self, frame):
@@ -346,6 +419,13 @@ class CameraTracker:
         if self.vibration_rejected:
             cv2.putText(frame, "FRAME REJECTED (vibration/lighting)", (10, 66),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 140, 255), 2)
+        elif self._static_bright is not None and self._static_bright.mask is None:
+            # 学習中は機体を画角に入れてはいけないので、はっきり出す
+            cv2.putText(frame,
+                        f"LEARNING STATIC BRIGHT "
+                        f"{self._static_bright.learned_frames}/{STATIC_MASK_LEARN_FRAMES}"
+                        " - keep drone out of view",
+                        (10, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
     def read_and_detect(self):
         """
@@ -385,25 +465,12 @@ class CameraTracker:
         self.last_candidates = candidates
         return frame, candidates, ts
 
-    def read_and_track(self):
-        """
-        後方互換API。候補のうち最大面積のものを1点だけ返す。
-
-        ※ Phase B で tracker 側を read_and_detect() に切り替えたら削除する。
-        """
-        frame, candidates, _ = self.read_and_detect()
-        if frame is None:
-            return None, None
-
-        best_index = 0 if candidates else None
-        self.draw_candidates(frame, candidates, best_index)
-        center_uv = (candidates[0].u, candidates[0].v) if candidates else None
-        return frame, center_uv
-
     def reset_background(self):
         self.prev_gray = None
         if self._bg is not None:
             self._bg = self._make_bg_subtractor()
+        if self._static_bright is not None:
+            self._static_bright.reset()
 
     def start_latest_reader(self):
         """Continuously capture frames so processing always uses the newest one."""

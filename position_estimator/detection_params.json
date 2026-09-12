@@ -10,8 +10,13 @@
   "max_area_px": 20000,
   "blur_kernel": 5,
   "morph_kernel": 5,
-  "_comment_candidates": "Phase B で使用。各カメラが1フレームに返す候補の最大数。",
-  "max_candidates": 8,
+  "_comment_candidates": [
+    "各カメラが1フレームに返す候補の最大数。面積の大きい順に切られる。",
+    "★ 窓の反射のように機体より大きく写る明点が多い環境では、少なすぎると",
+    "  切り捨てで機体そのものが候補から落ちる。tracker 側は全ペアを",
+    "  三角測量して選ぶので (O(n^2) だが n=16 でも 256 組) 多めでよい。"
+  ],
+  "max_candidates": 16,
   "_comment_bg": [
     "背景差分 (MOG2) の設定。前フレーム差分から移行。",
     "learning_rate をほぼ 0 にして、キャリブ直後の背景を固定する。",
@@ -58,5 +63,22 @@
   ],
   "bright_threshold": 230,
   "bright_min_area_px": 4,
-  "bright_max_area_px": 4000
+  "bright_max_area_px": 4000,
+  "_comment_static_mask": [
+    "静的輝点マスク。窓・白い反射・照明は時間的に不変なので、",
+    "起動後 static_mask_learn_frames フレームのうち static_mask_ratio 以上で",
+    "明るかった画素を構造物として覚え、以降の bright 検知から除外する。",
+    "",
+    "★ 学習中は機体を画角に入れないこと（または消灯しておくこと）。",
+    "  静止した機体が写っているとLEDごと構造物として覚えてしまう。",
+    "  画面に LEARNING STATIC BRIGHT n/N と出ている間が学習中。",
+    "  覚え間違えたとき・照明が変わったときは [B] キーで再学習できる。",
+    "",
+    "static_mask_dilate_px: 覚えた領域を少し太らせる量。三脚の微振動で",
+    "  窓の輪郭が数px揺れるぶんを吸収する。大きくしすぎると機体も消える。"
+  ],
+  "static_bright_mask": true,
+  "static_mask_learn_frames": 120,
+  "static_mask_ratio": 0.9,
+  "static_mask_dilate_px": 7
 }

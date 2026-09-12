@@ -39,7 +39,7 @@ import math
 import time
 from enum import Enum
 
-from utils.config import FIELD_W, FIELD_D
+from utils.config import FIELD_W, FIELD_D, MISSION_TAKEOFF_ALT_M
 from core.s5_link import (REQ_ABORT, REQ_GUIDED, REQ_HOLD, REQ_LAND,
                           REQ_TAKEOFF, CF_ARMED_OK, CF_POS_VALID, CF_YAW_VALID,
                           CF_ALT_ABS)
@@ -103,7 +103,12 @@ class WaypointMission:
     DWELL_S      = 2.0     # 到達後ここで静止する時間 [s]
 
     # 離陸
-    TAKEOFF_ALT_M   = 1.00  # 離陸後にいったん保持する高度 [m]
+    # ★ 2026-09-12: ここが config.MISSION_TAKEOFF_ALT_M と独立に 1.00 で
+    #   ハードコードされていたため、機体側 ALT_TARGET_M(0.50m) とずれていた。
+    #   WAYPOINT_BRINGUP.md §4-5 の警告どおり、ずれたままだと GUIDED を
+    #   抜けた瞬間(スイッチ操作・リンク断・スティック介入)にその差だけ
+    #   勝手に昇降する。config 側と必ず一致させること。
+    TAKEOFF_ALT_M   = MISSION_TAKEOFF_ALT_M  # 離陸後にいったん保持する高度 [m]
     TAKEOFF_TOL_M   = 0.15  # この差まで来たら離陸完了
     TAKEOFF_TIMEOUT_S = 20.0
 

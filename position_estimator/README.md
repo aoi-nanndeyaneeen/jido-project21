@@ -16,10 +16,10 @@
                     ▼
          [core/tracker.py] 別スレッドで実行
                     │
-        ① PixelJumpFilter（画像空間で誤検知除去）
-        ② 三角測量 (core/geometry.py)
-        ③ residual フィルタ（3D空間の外れ値除去）
-        ④ 30フレーム未検出でダミー円軌道にフォールバック
+        ① 両カメラの候補リストの全ペアを三角測量 (core/geometry.py)
+        ② residual・3Dゲート・前回位置からの到達可能性でふるい、
+           最も辻褄の合う1組を機体として採用（窓の反射はここで落ちる）
+        ③ 30フレーム未検出でダミー円軌道にフォールバック
                     │
                     ▼
          [core/autopilot.py] SquarePatrol
@@ -174,11 +174,17 @@ python tools/calibrate_intrinsics.py --label Camera1 --source 1 --cols 7 --rows 
 
 前景が画面全体の `vibration_reject_ratio` を超えたフレームは丸ごと破棄します（三脚の揺れ・照明の急変・自動露出の追従対策）。
 
+**静的輝点マスク** — `bright` 系モードでは窓・白い反射・照明も LED と同じように光ります。これらは時間的に不変なので、起動後 `static_mask_learn_frames` フレームのうち `static_mask_ratio` 以上で明るかった画素を構造物として覚え、以降の検知から除外します。
+
+> ⚠ **学習中は機体を画角に入れないこと**（または LED を消しておくこと）。静止した機体が写っていると LED ごと構造物として覚えてしまい、以後その機体が検知できなくなります。画面に `LEARNING STATIC BRIGHT n/N` と出ている間が学習中です。覚え間違えたとき・照明が変わったときは **[B] キー**で再学習できます（現状 RPi 側カメラには [B] が伝わらないため、RPi 運用時はサーバを再起動してください）。
+
 ### 選択（2カメラの幾何整合）
 
 どれが機体かは**2台の幾何整合**で決めます。審査員席はフィールド外にあるため、正しくペアリングされれば `GATE_X/Y/Z` の範囲外として自動的に落ち、誤ったペアリングは2本のレイが空間で交わらないため `MAX_RESIDUAL_M` で落ちます。
 
-> 現在 `tracker.py` は移行期のため、暫定的に `PixelJumpFilter`（画像空間での速度制限）を使っています。Phase B で上記の3Dゲートに置き換えます。
+`core/tracker.py` の `PairSelector` が全候補ペア（最大 `max_candidates` × `max_candidates` 組）を三角測量し、`MAX_RESIDUAL_M` / `GATE_X/Y/Z` / 前回位置からの到達可能距離（`TRACK_MAX_SPEED_MPS`）を全て満たすもののうち residual 最小の1組を採用します。`TRACK_COAST_SEC` を超えて見失った場合は基準位置を捨て、自由に再取得します。
+
+> `MAX_RESIDUAL_M` は**フィールド寸法より小さい値**にしてください。1.8m四方の室内で 5.0m のままだと、窓の反射と機体を組ませたペアまで通ってしまい、ゲートとして機能しません（`MAX_RESIDUAL_BY_PROFILE` でプロファイル別に設定）。
 
 ## ✅ キャリブレーション品質の検証
 

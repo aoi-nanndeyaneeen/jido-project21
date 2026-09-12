@@ -3,9 +3,11 @@ tracker.py
 2カメラ対応のカメラスレッド・ログ記録を担当。
 
 位置推定:
-    1) 各カメラの画像座標(u,v)についてPixelJumpFilterで急激なジャンプ（誤検知）を棄却
-    2) 残った有効な検知のみで両カメラの視線ベクトルの最近接点を3D位置とする
-    3) residual（2本のレイの最近接距離）が MAX_RESIDUAL_M を超える場合は外れ値として破棄
+    1) 各カメラから「候補リスト」を受け取る（1枚では機体かどうか決められない）
+    2) 全ペアを三角測量し、residual・3Dゲート・前回位置からの到達可能性を満たす
+       ものだけ残して、最も辻褄の合う1組を機体として採用する
+    3) 窓の反射や審査員席のような「片方のカメラにしか整合しない明点」は、
+       ペアを組んだ瞬間に residual が跳ね上がるか、フィールド外に落ちて棄却される
     4) DUMMY_FALLBACK_FRAMES フレーム連続で未検出の場合、DummyFlight に切り替え
 """
 
@@ -24,56 +26,73 @@ from utils.config      import (MAX_RESIDUAL_M,
                                 DUMMY_ORBIT_RADIUS,
                                 DUMMY_ORBIT_ALT,
                                 DUMMY_ORBIT_PERIOD,
-                                PIXEL_SPEED_LIMIT_PX_S,
-                                JUMP_RECOVERY_FRAMES)
+                                GATE_X, GATE_Y, GATE_Z,
+                                TRACK_COAST_SEC,
+                                TRACK_MAX_SPEED_MPS)
 
 
-class PixelJumpFilter:
+def _in_gate(P) -> bool:
+    """三角測量した点が物理的にありえる空間内かどうか。"""
+    return (GATE_X[0] <= P[0] <= GATE_X[1] and
+            GATE_Y[0] <= P[1] <= GATE_Y[1] and
+            GATE_Z[0] <= P[2] <= GATE_Z[1])
+
+
+class PairSelector:
     """
-    画像座標(u,v)の急激なジャンプ（誤検知）を画像空間で棄却するフィルタ。
+    2カメラの候補リストから「機体である1組」を幾何整合で選ぶ。
 
-    固定ピクセル数ではなく px/秒 の速度で判定するため、
-    フレームレートが変動しても（カメラ1とカメラ2で異なっても）機能する。
-    ただし何フレームも連続して同じ「新しい場所」に検知され続けた場合は
-    本当に対象が移動した／再取得したとみなして受理する。
+    面積最大の候補を無条件に採る方式だと、窓の反射のように機体より大きく
+    写る明点に必ず負ける。ここでは全ペアを三角測量して
+      ・residual (2本のレイの最近接距離) が小さい
+      ・3Dゲート内 (フィールド上空) にある
+      ・前回位置から到達可能な距離にある
+    を満たすものだけを残す。片方のカメラにしか無い誤検知は、どの候補と
+    組ませても上の条件を同時には満たせないため自動的に落ちる。
     """
-    def __init__(self, speed_limit_px_s: float, recovery_frames: int):
-        self.speed_limit = speed_limit_px_s
-        self.recovery_frames = recovery_frames
-        self.last_uv = None
-        self.last_t  = None
-        self.reject_streak = 0
 
-    def filter(self, uv):
+    def __init__(self):
+        self.last_P = None
+        self.last_t = 0.0
+
+    def select(self, cands1, cands2, calib1, calib2):
+        """
+        Returns:
+            (P, residual, index1, index2) — 採用できるペアが無ければ全て None
+        """
         now = time.time()
+        if self.last_P is not None and now - self.last_t > TRACK_COAST_SEC:
+            # 見失って時間が経った。次は自由に再取得させる
+            self.last_P = None
 
-        if uv is None:
-            # 未検出はジャンプ判定と無関係。連続棄却カウントは維持する
-            return None
+        rays1 = [calib1.ray(c.u, c.v) for c in cands1]
+        rays2 = [calib2.ray(c.u, c.v) for c in cands2]
 
-        if self.last_uv is None or self.last_t is None:
-            self.last_uv, self.last_t = uv, now
-            return uv
+        # 到達可能半径。前回位置がある場合のみ効かせる
+        reach = None
+        if self.last_P is not None:
+            reach = TRACK_MAX_SPEED_MPS * max(now - self.last_t, 1e-3) + 0.5
 
-        dt = max(now - self.last_t, 1e-3)
-        dist = float(np.hypot(uv[0] - self.last_uv[0], uv[1] - self.last_uv[1]))
-        allowed = self.speed_limit * dt
+        best = (None, None, None, None)
+        best_res = float("inf")
+        for i, (O1, D1) in enumerate(rays1):
+            for j, (O2, D2) in enumerate(rays2):
+                P, res = intersect_rays(O1, D1, O2, D2)
+                if P is None or res > MAX_RESIDUAL_M or not _in_gate(P):
+                    continue
+                if reach is not None and np.linalg.norm(P - self.last_P) > reach:
+                    continue
+                if res < best_res:
+                    best_res = res
+                    best = (P, res, i, j)
 
-        if dist <= allowed:
-            self.last_uv, self.last_t = uv, now
-            self.reject_streak = 0
-            return uv
+        if best[0] is not None:
+            self.last_P, self.last_t = best[0], now
+        return best
 
-        # 許容速度を超えるジャンプ → ノイズを疑う
-        self.reject_streak += 1
-        if self.reject_streak >= self.recovery_frames:
-            # 同じ新しい場所に連続して出現＝本当の移動として受理
-            self.last_uv, self.last_t = uv, now
-            self.reject_streak = 0
-            return uv
-
-        # 棄却（前回位置は更新しない＝次回も同じ基準で判定）
-        return None
+    def reset(self):
+        self.last_P = None
+        self.last_t = 0.0
 
 
 def camera_thread_func(cam1, cam2,
@@ -90,8 +109,7 @@ def camera_thread_func(cam1, cam2,
     perf_log = PerformanceLogger(log_path.with_name(log_path.stem + "_perf.csv"))
     dummy = DummyFlight(DUMMY_ORBIT_RADIUS, DUMMY_ORBIT_ALT, DUMMY_ORBIT_PERIOD)
 
-    jf1 = PixelJumpFilter(PIXEL_SPEED_LIMIT_PX_S, JUMP_RECOVERY_FRAMES)
-    jf2 = PixelJumpFilter(PIXEL_SPEED_LIMIT_PX_S, JUMP_RECOVERY_FRAMES)
+    selector = PairSelector()
 
     no_detect_count = 0
     in_dummy_mode   = False
@@ -110,63 +128,49 @@ def camera_thread_func(cam1, cam2,
                 loop_start = time.perf_counter()
                 # ── 両カメラからフレームを取得 ──────────────────
                 cam1_start = time.perf_counter()
-                frame1, uv1_raw = cam1.read_and_track()
+                frame1, cands1, _ = cam1.read_and_detect()
                 cam1_ms = (time.perf_counter() - cam1_start) * 1000.0
                 cam2_start = time.perf_counter()
-                frame2, uv2_raw = cam2.read_and_track()
+                frame2, cands2, _ = cam2.read_and_detect()
                 cam2_ms = (time.perf_counter() - cam2_start) * 1000.0
 
-                if frame1 is None:
+                # ── 候補ペアの幾何整合で機体を1組選ぶ（Phase B） ──
+                P_vec, residual, idx1, idx2 = selector.select(
+                    cands1, cands2, calib1, calib2)
+
+                if frame1 is not None:
+                    cam1.draw_candidates(frame1, cands1, idx1)
+                else:
                     frame1 = np.zeros((720, 1280, 3), dtype=np.uint8)
                     cv2.putText(frame1, "Camera 1 - NO SIGNAL",
                                 (350, 360), cv2.FONT_HERSHEY_SIMPLEX,
                                 1.5, (80, 80, 80), 2)
-                if frame2 is None:
+                if frame2 is not None:
+                    cam2.draw_candidates(frame2, cands2, idx2)
+                else:
                     frame2 = np.zeros((720, 1280, 3), dtype=np.uint8)
                     cv2.putText(frame2, "Camera 2 - NO SIGNAL",
                                 (350, 360), cv2.FONT_HERSHEY_SIMPLEX,
                                 1.5, (80, 80, 80), 2)
 
-                # ── 画像空間ジャンプフィルタ（誤検知除去） ──────
-                uv1 = jf1.filter(uv1_raw)
-                uv2 = jf2.filter(uv2_raw)
+                uv1 = (cands1[idx1].u, cands1[idx1].v) if idx1 is not None else None
+                uv2 = (cands2[idx2].u, cands2[idx2].v) if idx2 is not None else None
 
-                jump_rejected = (uv1_raw is not None and uv1 is None) or \
-                                (uv2_raw is not None and uv2 is None)
+                # 候補はあるのにペアが成立しなかった＝窓の反射などを弾いた状態
+                pair_rejected = (P_vec is None
+                                 and bool(cands1) and bool(cands2))
 
-                # ── 3D位置推定 ──────────────────────────────────
-                P_vec    = None
-                residual = None
-                status_label = ""
-                status_color = (128, 128, 128)
-
-                if uv1 is not None and uv2 is not None:
-                    _, D1 = calib1.ray(uv1[0], uv1[1])
-                    _, D2 = calib2.ray(uv2[0], uv2[1])
-                    P_raw, res = intersect_rays(O1_fixed, D1, O2_fixed, D2)
-
-                    if P_raw is None:
-                        status_label = "RAYS PARALLEL"
-                        status_color = (0, 0, 255)
-                    elif res > MAX_RESIDUAL_M:
-                        status_label = f"HIGH RESIDUAL {res:.2f}m (>{MAX_RESIDUAL_M:.1f})"
-                        status_color = (0, 140, 255)
-                    else:
-                        P_vec    = P_raw
-                        residual = res
-                        status_label = (f"X:{P_vec[0]:.2f} Y:{P_vec[1]:.2f} "
-                                        f"Z:{P_vec[2]:.2f}m  err:{res:.3f}m")
-                        status_color = (0, 255, 255)
-
-                elif uv1 is None and uv2 is None:
-                    status_label = "JUMP REJECTED" if jump_rejected else "NO TARGET"
-                    status_color = (0, 100, 255) if jump_rejected else (128, 128, 128)
-                elif uv1 is None:
-                    status_label = "Camera1 missing/rejected"
-                    status_color = (0, 165, 255)
+                if P_vec is not None:
+                    status_label = (f"X:{P_vec[0]:.2f} Y:{P_vec[1]:.2f} "
+                                    f"Z:{P_vec[2]:.2f}m  err:{residual:.3f}m")
+                    status_color = (0, 255, 255)
+                elif pair_rejected:
+                    status_label = (f"NO CONSISTENT PAIR "
+                                    f"(cand {len(cands1)}/{len(cands2)})")
+                    status_color = (0, 140, 255)
                 else:
-                    status_label = "Camera2 missing/rejected"
-                    status_color = (0, 165, 255)
+                    status_label = f"NO TARGET (cand {len(cands1)}/{len(cands2)})"
+                    status_color = (128, 128, 128)
 
                 # ── ダミーへのフォールバック ─────────────────────
                 if P_vec is not None:
@@ -210,9 +214,9 @@ def camera_thread_func(cam1, cam2,
                     log.write(
                         P_vec, current_z,
                         residual if residual is not None else -1.0,
-                        uv1_raw is not None,
-                        uv2_raw is not None,
-                        jump_rejected
+                        bool(cands1),
+                        bool(cands2),
+                        pair_rejected
                     )
                 else:
                     current_z = float(P_vec[2]) if P_vec is not None else 0.0
@@ -227,7 +231,7 @@ def camera_thread_func(cam1, cam2,
                     shared["do_bg_reset"] = False
                     cam1.reset_background()
                     cam2.reset_background()
-                    jf1.last_uv = jf2.last_uv = None   # ジャンプ判定もリセット
+                    selector.reset()   # 追従の基準位置もリセット
                     print("[Tracker] Background reset")
 
                 # ── plot_data 更新 ────────────────────────────────
@@ -244,8 +248,7 @@ def camera_thread_func(cam1, cam2,
                     # 嘘のヨーが出るため、明示的に伝える
                     plot_data["in_dummy"]      = in_dummy_mode
                     plot_data["tracking_ok"]   = (P_vec is not None
-                                                  and not in_dummy_mode
-                                                  and not jump_rejected)
+                                                  and not in_dummy_mode)
                     plot_data["frame_time"]    = time.time()
                     plot_data["frame1"]    = frame1.copy()
                     plot_data["frame2"]    = frame2.copy() if frame2 is not None else None

@@ -212,18 +212,6 @@ class RemoteCamera:
             cv2.putText(frame, "FRAME REJECTED", (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
 
-    def read_and_track(self):
-        """
-        後方互換API。候補のうち最大面積のものを1点だけ返す。
-
-        ※ Phase B で tracker 側を read_and_detect() に切り替えたら削除する。
-        """
-        frame, candidates, _ = self.read_and_detect()
-        best_index = 0 if candidates else None
-        self.draw_candidates(frame, candidates, best_index)
-        center_uv = (candidates[0].u, candidates[0].v) if candidates else None
-        return frame, center_uv
-
     def get_intrinsics(self):
         """
         内部パラメータ (K, dist) を返す。

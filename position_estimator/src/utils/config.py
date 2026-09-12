@@ -82,10 +82,11 @@ SERIAL_BAUD    = 115200
 #   y = 奥行方向 (-FIELD_D/2 〜 +FIELD_D/2)
 #   z = 高さ（上が正）
 # カメラ2台は手前側 (y = -FIELD_D/2 の辺) の2隅に設置する。
-FIELD_PROFILE = "small"            # "small" または "large"
+FIELD_PROFILE = "middle"           # "small" / "middle" / "large"
 FIELD_PROFILES = {
-    "small": (1.4, 1.4),           # 一時運用: 1.4m x 1.4m
-    "large": (26.0, 42.0),         # 通常運用: 26m x 42m
+    "small":  (1.4, 1.4),           # 一時運用: 1.4m x 1.4m
+    "middle": (1.8, 2.6),           # 横1.8m x 奥行2.6m
+    "large":  (26.0, 42.0),         # 通常運用: 26m x 42m
 }
 FIELD_W, FIELD_D = FIELD_PROFILES[FIELD_PROFILE]
 
@@ -159,6 +160,13 @@ FIELD_POINT_COORDS = {
         [ 0.7,  0.7, 0.0],
         [-0.7,  0.7, 0.0],
         [-0.7,  0.7, 0.2],
+    ],
+    "middle": [
+        [-0.9, -1.3, 0.0],
+        [ 0.9, -1.3, 0.0],
+        [ 0.9,  1.3, 0.0],
+        [-0.9,  1.3, 0.0],
+        [-0.9,  1.3, 0.82],
     ],
     "large": [
         [-13.0, -21.0, 0.0],
@@ -239,10 +247,15 @@ FALLBACK_HFOV_DEFAULT = 78.0
 # 位置推定フィルタ
 # ==========================================
 # 2本のレイの最近接距離がこの値を超えたら外れ値として破棄 [m]
-# ★ 現在の 5.0 は内部パラメータが概算値だったため緩めてある。
-#    チェッカーボード実測後は 1.0〜1.5 まで絞れるはず。
-#    キャリブ完了時に表示される三角測量誤差を見て決めること。
-MAX_RESIDUAL_M = 5.0
+# ★ これは「誤検知ペアを弾く主力のゲート」。フィールドより大きい値にすると
+#    窓の反射と機体を組ませたペアまで通ってしまい、ゲートとして機能しない。
+#    キャリブ完了時に表示される三角測量誤差より少し大きい値にすること。
+MAX_RESIDUAL_BY_PROFILE = {
+    "small":  0.40,
+    "middle": 0.60,
+    "large":  2.00,
+}
+MAX_RESIDUAL_M = MAX_RESIDUAL_BY_PROFILE[FIELD_PROFILE]
 
 # ==========================================
 # 3D空間ゲート (Phase B)
@@ -250,10 +263,14 @@ MAX_RESIDUAL_M = 5.0
 # 三角測量した候補ペアが物理的にありえる位置にあるかを判定する。
 # 審査員席はフィールド外(y > FIELD_D/2)にあるため、正しくペアリングされれば
 # ここで自動的に落ちる。誤ったペアリングは residual が跳ね上がって落ちる。
-GATE_MARGIN_M = 2.0                      # フィールド境界の外側にとる余裕 [m]
+# 余裕はフィールド寸法に比例させる。1.8m四方の室内で±2mも余裕をとると
+# 窓や壁がゲート内に入ってしまい、ゲートとして機能しない。
+GATE_MARGIN_M = min(2.0, max(0.3, 0.3 * min(FIELD_W, FIELD_D)))
 GATE_X = (-_HW - GATE_MARGIN_M, _HW + GATE_MARGIN_M)
 GATE_Y = (-_HD - GATE_MARGIN_M, _HD + GATE_MARGIN_M)
-GATE_Z = (0.5, 10.0)                     # 高度 [m]。上昇旋回で4mを超える想定
+# 高度 [m]。下限は MISSION_TAKEOFF_ALT_M より必ず低くすること
+# （0.5m ホバリングを 0.5m 下限で切ると機体そのものが弾かれる）。
+GATE_Z = (0.15, 10.0) if FIELD_PROFILE != "large" else (0.5, 10.0)
 
 # ==========================================
 # 高度センサ (機体の下向き距離センサ)
@@ -388,12 +405,16 @@ MISSION_SQUARE_M = 0.80
 #    最初の正方形飛行は "fixed" で通し、ヨーの自動補正はそのあと。
 MISSION_YAW_MODE = "fixed"
 
-MISSION_WAYPOINTS = [
-    ( MISSION_SQUARE_M / 2, -MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
-    ( MISSION_SQUARE_M / 2,  MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
-    (-MISSION_SQUARE_M / 2,  MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
-    (-MISSION_SQUARE_M / 2, -MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
-]
+MISSION_WAYPOINTS = [(0.3, 0.0, MISSION_TAKEOFF_ALT_M)]   # Phase 5: 右へ 0.3m だけ
+# Phase 4 (WP なし。離陸 -> 帰投 -> 着陸だけ) に戻すときはこちら:
+# MISSION_WAYPOINTS = []
+# 正方形(Phase 6〜)に戻すときはこちら:
+# MISSION_WAYPOINTS = [
+#     ( MISSION_SQUARE_M / 2, -MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
+#     ( MISSION_SQUARE_M / 2,  MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
+#     (-MISSION_SQUARE_M / 2,  MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
+#     (-MISSION_SQUARE_M / 2, -MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
+# ]
 
 # ==========================================
 # ダミー飛行（カメラ未検出フォールバック）
@@ -449,6 +470,10 @@ _DEFAULT_DETECTION = {
     "bright_threshold": 230,
     "bright_min_area_px": 4,
     "bright_max_area_px": 4000,
+    "static_bright_mask": True,
+    "static_mask_learn_frames": 120,
+    "static_mask_ratio": 0.9,
+    "static_mask_dilate_px": 7,
 }
 
 
@@ -489,8 +514,9 @@ BRIGHT_THRESHOLD   = DETECTION["bright_threshold"]
 BRIGHT_MIN_AREA_PX = DETECTION["bright_min_area_px"]
 BRIGHT_MAX_AREA_PX = DETECTION["bright_max_area_px"]
 
-# ==========================================
-# 画像空間ジャンプフィルタ（Phase B で3Dゲートに置き換え予定）
-# ==========================================
-PIXEL_SPEED_LIMIT_PX_S = 1500   # 画像内で許容する最大移動速度 [px/s]
-JUMP_RECOVERY_FRAMES   = 5      # 何フレーム連続で外れたら「本当の移動」と認めるか
+# 静的輝点マスク: 窓・白い反射・照明のように「ずっと明るいまま動かない」画素を
+# 学習して bright マスクから引く。学習中は機体を画角に入れないこと。
+STATIC_BRIGHT_MASK       = DETECTION["static_bright_mask"]
+STATIC_MASK_LEARN_FRAMES = DETECTION["static_mask_learn_frames"]
+STATIC_MASK_RATIO        = DETECTION["static_mask_ratio"]
+STATIC_MASK_DILATE_PX    = DETECTION["static_mask_dilate_px"]
