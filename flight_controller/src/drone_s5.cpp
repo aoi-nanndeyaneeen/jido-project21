@@ -91,6 +91,7 @@
 #include "sensor/Rangefinder.h"  // 測距 (QuadConfig の RANGE_BACKEND で ToF/SONAR 切替)
 #include "Telemetry.h"    // IM920SL (地上局との送受信)
 #include "S5Telem.h"     // s5 解析用テレメトリ (POSHOLD を地上局でCSV化)
+#include "S5Cmd.h"       // 地上局 -> 機体 の上りコマンド (GUIDED)
 
 #include "quad/QuadConfig.h"
 #include "quad/QuadPID.h"
@@ -449,7 +450,13 @@ constexpr float I_ENABLE_THR = 0.15f;
 //  ★ A(高度)/B(水平) を交互に送るので、各フレームは実質 7.5Hz。
 //     0.3〜2Hz の高度・位置ループを見るには足りる。
 //  地上局の欠落率が上がるようなら 12 -> 10 と下げる。
-constexpr int TELEM_TX_HZ = 15;
+//  ★ 2026-09-11: GUIDED (上りコマンド 5Hz) を足したので 15 -> 12 に下げた。
+//    上り 18バイト = 43文字 = 22ms を 5Hz で足すと UART 占有率は
+//    55% + 11% = 66%。さらに IM920 は半二重なので、送信中は受信できない。
+//    15Hz のままだと上りが弾かれ、機体から見て「地上局が黙った」= 
+//    その場ホールドに落ちる現象が散発する。下りは 12Hz でも A/B/C の
+//    各フレームが 3〜6Hz 出るので、0.3〜2Hz の解析には足りる。
+constexpr int TELEM_TX_HZ = Quad::GUIDED_ENABLE ? 12 : 15;
 
 // ゲイン一覧 (S5T::Param) を送る周期 [秒]。
 //  シリアル 'p' メニューで飛行中にゲインを変えられるので、CSV だけ見て
@@ -498,6 +505,11 @@ FlightTelemetry telemetry(&Serial3);
 // こちらは begin() を呼ばない (同じポートを二重に開かない)。
 // ★ 送信は必ず非ブロッキング。s5tx.service() を毎ループ回すこと。
 S5T::Tx s5tx(&Serial3);
+
+// 地上局からの上りコマンド受信 (GUIDED)。送信と同じ Serial3。
+// ★ Telemetry.h の telemetry.receive() と同じポートを二重に読ませない。
+//   GUIDED_ENABLE=true のときは loop() が s5rx.poll() 側だけを呼ぶ。
+S5C::Rx s5rx(&Serial3);
 
 // PMW3901 オプティカルフロー。CS ピンは QuadConfig.h の FLOW_CS_PIN。
 // グローバル SPI (Teensy 4.0: SCK=13 MOSI=11 MISO=12) を使う。
@@ -597,6 +609,33 @@ uint32_t g_thr_used_n   = 0;
 bool  g_dry_run = S5::DRY_RUN;
 
 // ---- SD ログ (HW-125, CS=9, SPI0 を PMW3901 と共有) ----
+// ---- 地上局ガイド飛行 (GUIDED) の状態 -----------------------------
+//  詳細は include/S5Cmd.h の先頭と QuadConfig.h § 9。
+//  ここに置いてある値は「地上局の要求を機体が噛み砕いた結果」であって、
+//  受信した生のコマンドではない。生は s5rx.last()。
+enum GuidedPhase : uint8_t {
+    GP_OFF = 0,     // 使っていない (SW_AUTO が下 / 条件を満たさない)
+    GP_HOLD,        // その場ホールド (水平 0。高度は最後の目標を保持)
+    GP_TAKEOFF,     // 目標高度まで自動上昇中。水平 0
+    GP_CRUISE,      // 地上局の速度指令に従って移動中
+    GP_LAND,        // 自動着陸中。水平 0
+    GP_LANDED,      // 接地を検知して出力を切った (ディスアームするまで保持)
+};
+GuidedPhase g_gp = GP_OFF;
+
+bool  g_guided_engaged = false;  // GUIDED に入っているか (selectMode が見る)
+float g_guided_vx      = 0.0f;   // 機体座標の目標速度 前+ [m/s]
+float g_guided_vy      = 0.0f;   // 同 右+ [m/s]
+float g_guided_alt_m   = 0.0f;   // 目標対地高度 [m] (0 = 指令なし)
+float g_guided_slew    = 0.0f;   // 目標高度を動かしてよい速さ [m/s]
+
+// 着陸の判定用
+uint32_t g_land_start_ms = 0;    // 降下を始めた時刻 (タイムアウト用)
+uint32_t g_touch_since_ms = 0;   // 接地高度を下回り続けている開始時刻 (0=未満たず)
+
+// GUIDED から抜けた理由。画面とテレメトリで「なぜ切れたか」を追う。
+const char* g_guided_why = "";
+
 bool  g_sd_ok              = false;   // SdLog::begin() が成功したか
 // ---- ログリンク (RP2040 ロガーへ UART 送信。SPI0 を使わない) ----
 bool  g_link_ok            = false;   // LogLink::begin() が成功したか
@@ -1015,6 +1054,12 @@ inline void fillHeader(S5T::Header& h, uint8_t type) {
     if (g_dry_run)              f |= S5T::F_DRY_RUN;
     if (g_mix.sat)              f |= S5T::F_SAT;
     if (tx_drop_flag)         { f |= S5T::F_TX_DROP; tx_drop_flag = false; }
+    // ★ VERSION 5: 地上局ガイド飛行の状態。地上局はこれを見て
+    //   「離陸が終わったか」「まだ自分の指令で飛んでいるか」を判断する。
+    if (g_guided_engaged)     f |= S5T::F_GUIDED;
+    if (Q::GUIDED_ENABLE && s5rx.fresh(Q::GUIDED_STALE_HOLD_MS))
+                              f |= S5T::F_CMD_FRESH;
+    if (g_gp == GP_LANDED)    f |= S5T::F_LANDED;
     h.flags = f;
 
     // 28バイトに uint32 の millis は載らないので 10ms 単位。
@@ -1284,7 +1329,7 @@ static void resetControllers() {
 
 static const char* modeName(S5::Mode m) {
     switch (m) {
-        case S5::MODE_AUTO:     return "AUTO   (地上局)";
+        case S5::MODE_AUTO:     return "GUIDED (地上局ガイド)";
         case S5::MODE_POSHOLD:  return "POSHOLD(フロー位置保持)";
         case S5::MODE_ALTHOLD:  return "ALTHOLD(高度保持のみ)";
         case S5::MODE_ANGLE:    return "ANGLE  (水平維持)";
@@ -1306,6 +1351,11 @@ static const char* modeName(S5::Mode m) {
 // ------------------------------------------------------------
 static S5::Mode selectMode() {
     if (!S5::USE_SBUS) return S5::MODE_ANGLE;
+
+    // ★ GUIDED (地上局ガイド飛行) は SW_HOVER=up かつ SW_AUTO=up のときだけ。
+    //   入る資格の判定は全部 updateGuided() 側にあり、ここは結果を読むだけ。
+    //   資格を失った瞬間に g_guided_engaged が落ちて POSHOLD へ戻る。
+    if (g_guided_engaged) return S5::MODE_AUTO;
 
     const Sw sw = sbus.Ch_state(Ch::SW_HOVER);
     if (sw == up) {
@@ -1355,14 +1405,25 @@ static void updateFlowHold(float dt_s) {
     const bool airborne = !Q::FLOW_REQUIRE_AIRBORNE || !can_detect_takeoff
                         || althold.airborne();
 
-    const bool  active = isArmed() && (g_mode == S5::MODE_POSHOLD)
+    const bool  active = isArmed()
+                      && (g_mode == S5::MODE_POSHOLD || g_mode == S5::MODE_AUTO)
                       && (thr > Q::FLOW_ENABLE_THR)
                       && airborne
                       && S5::USE_FLOW && g_flow_ok;
 
-    // スティックは機体座標のまま渡す (パイロットの前後左右 = 機首基準)
-    const float sx = Q::STICK_SIGN_PITCH * sbus.des[Ch::PITCH];
-    const float sy = Q::STICK_SIGN_ROLL  * sbus.des[Ch::ROLL];
+    // ★ GUIDED 中は目標速度を地上局から [m/s] で直接もらう。スティックは渡さない
+    //   (updateGuided() がスティック操作を検出したら GUIDED 自体を降りるので、
+    //    ここで両方を混ぜる必要はない)。
+    //   指令が不感帯以下なら PosHold 側が「その場の地面位置を保持」に落ちる。
+    float sx = 0.0f, sy = 0.0f;
+    if (g_mode == S5::MODE_AUTO) {
+        poshold.setVelCommand(g_guided_vx, g_guided_vy);
+    } else {
+        poshold.clearVelCommand();
+        // スティックは機体座標のまま渡す (パイロットの前後左右 = 機首基準)
+        sx = Q::STICK_SIGN_PITCH * sbus.des[Ch::PITCH];
+        sy = Q::STICK_SIGN_ROLL  * sbus.des[Ch::ROLL];
+    }
 
     // s5d: 位置積分を地面固定フレームで行うため、ヘディングを渡す。
     //  g_yaw_est はアーム時を 0 とした相対方位 (§ 7-2 が積分している)。
@@ -1397,16 +1458,187 @@ static void updateAltHold(float dt_s) {
     const bool  use_est = Q::ALT_USE_ACC_FUSION && altest.valid();
     const float climb   = use_est ? altest.climbMps() : g_climb_mps;
 
+    // ★ GUIDED 中は目標高度も地上局から。自動離陸・自動着陸はこの目標を
+    //   スルーレート付きで動かしているだけで、専用の制御経路は無い。
+    if (g_mode == S5::MODE_AUTO && g_guided_alt_m > 0.0f)
+        althold.commandTarget(g_guided_alt_m, g_guided_slew);
+    else
+        althold.clearCommandedTarget();
+
     althold.update(dt_s,
                    g_alt_hold_enable && S5::USE_RANGE,
                    isArmed(),
-                   g_mode == S5::MODE_POSHOLD || g_mode == S5::MODE_ALTHOLD,
+                   g_mode == S5::MODE_POSHOLD || g_mode == S5::MODE_ALTHOLD
+                       || g_mode == S5::MODE_AUTO,
                    g_range_valid,
                    g_range_fresh,
                    g_range_h_m,
                    climb,
                    thr,
                    thr_applied);
+}
+
+// ------------------------------------------------------------
+//  § 6-4  地上局ガイド飛行 (GUIDED)  — 自動離陸 / ウェイポイント / 自動着陸
+//
+//   毎ループ呼ぶ (軽い。millis() の比較と代入だけ)。
+//
+//   ここがやるのは翻訳だけ:
+//       地上局の要求 (S5C::CmdFrame)  ->  g_guided_vx/vy   (PosHold へ)
+//                                         g_guided_alt_m   (AltHold へ)
+//   制御そのものは一切しない。GUIDED 中に通る制御経路は POSHOLD と
+//   完全に同一で、違うのは「目標速度と目標高度を誰が決めるか」だけ。
+//
+//   ★ 安全の骨組み (ここを崩さないこと)
+//     1. スロットルスティックは常にパイロットのもの。GUIDED でも
+//        FLOW_ENABLE_THR / ALT_ENABLE_THR (15%) を下回れば全部手放す。
+//        = スロットルを落とすだけで、いつでも即座に手動へ戻せる。
+//     2. SW_HOVER を下げれば ANGLE (完全手動)。これが最終の bail-out。
+//     3. SW_AUTO を下げれば POSHOLD (その場ホールド)。地上局だけ切れる。
+//     4. ロール/ピッチスティックを動かせば GUIDED から自動で抜ける。
+//        「自動が変な方向へ行き始めた」ときに、スイッチを探さずに戻せる。
+//     5. リンクが切れたら 1秒でその場ホールド、4秒で自動着陸。
+//        指令が消えて暴走する経路は存在しない (指令 0 = ホールド)。
+// ------------------------------------------------------------
+static void guidedDisengage(const char* why) {
+    if (g_guided_engaged) {
+        g_guided_engaged = false;
+        g_guided_why     = why;
+        Serial.printf("\n>>> GUIDED 解除: %s\n", why);
+    }
+    g_gp            = GP_OFF;
+    g_guided_vx     = 0.0f;
+    g_guided_vy     = 0.0f;
+    g_guided_alt_m  = 0.0f;
+    g_guided_slew   = 0.0f;
+    g_touch_since_ms = 0;
+}
+
+static void updateGuided() {
+    if (!Q::GUIDED_ENABLE) { g_guided_engaged = false; g_gp = GP_OFF; return; }
+
+    const uint32_t now = millis();
+
+    // --- 0) 入る資格があるか (毎ループ全部見る) ----------------------
+    if (!isArmed())                     { guidedDisengage("ディスアーム");        return; }
+    if (!S5::USE_SBUS)                  { guidedDisengage("SBUS 無効");           return; }
+    if (sbus.Ch_state(Ch::SW_AUTO) != up)  { guidedDisengage("SW_AUTO が下");     return; }
+    if (sbus.Ch_state(Ch::SW_HOVER) != up) { guidedDisengage("SW_HOVER が下");    return; }
+    if (!S5::USE_FLOW || !g_flow_ok || flow.suspectDead())
+                                        { guidedDisengage("フローが死んでいる"); return; }
+    if (!S5::USE_RANGE || !g_range_ok)  { guidedDisengage("測距が無い");           return; }
+
+    // パイロットがスティックを触ったら自動を降りる (スイッチを探さずに戻せる)
+    if (fabsf(sbus.des[Ch::ROLL])  > Q::FLOW_STICK_DEAD ||
+        fabsf(sbus.des[Ch::PITCH]) > Q::FLOW_STICK_DEAD) {
+        guidedDisengage("スティック操作を検出");
+        return;
+    }
+
+    // 着陸完了は、ディスアームするまで保持する (上の !isArmed で解ける)
+    if (g_gp == GP_LANDED) { g_guided_vx = g_guided_vy = 0.0f; return; }
+
+    const S5C::CmdFrame& c   = s5rx.last();
+    const uint32_t       age = s5rx.ageMs();
+    const bool fresh_hold = (age < Q::GUIDED_STALE_HOLD_MS);
+    const bool fresh_land = (age < Q::GUIDED_STALE_LAND_MS);
+
+    // --- 1) 初回エンゲージ ------------------------------------------
+    //   「新鮮な、意味のある指令」が1つ届くまでは入らない。地上局が
+    //   起動していないのに SW_AUTO を上げてしまっても何も起きない。
+    if (!g_guided_engaged) {
+        if (!fresh_hold) return;
+        if (c.req == S5C::REQ_IDLE || c.req == S5C::REQ_ABORT) return;
+        g_guided_engaged = true;
+        g_guided_why     = "";
+        // 入った瞬間は必ずホールドから。高度目標は「今の高度」。
+        g_gp           = GP_HOLD;
+        g_guided_alt_m = (g_range_valid && g_range_h_m > 0.05f)
+                       ? g_range_h_m : Q::ALT_TARGET_M;
+        g_guided_slew  = Q::GUIDED_CRUISE_SLEW_MPS;
+        g_guided_vx = g_guided_vy = 0.0f;
+        g_touch_since_ms = 0;
+        Serial.printf("\n>>> GUIDED 開始 (目標高度 %.2f m から保持)\n", g_guided_alt_m);
+    }
+
+    // --- 2) リンク断のフェイルセーフ (要求より先に見る) ---------------
+    if (!fresh_land) {
+        if (g_gp != GP_LAND) {
+            Serial.printf("\n!! 地上局リンク断 %lu ms -> 自動着陸\n", (unsigned long)age);
+            g_gp            = GP_LAND;
+            g_land_start_ms = now;
+            g_touch_since_ms = 0;
+        }
+    } else if (!fresh_hold) {
+        // 瞬断。水平だけ止めて、高度目標はそのまま保持する。
+        g_guided_vx = g_guided_vy = 0.0f;
+        if (g_gp == GP_CRUISE) g_gp = GP_HOLD;
+    } else {
+        // --- 3) 新鮮な指令に従う -------------------------------------
+        const float cmd_alt = (c.alt_cm > 0) ? (float)c.alt_cm / S5C::SC_CM : 0.0f;
+        switch (c.req) {
+            case S5C::REQ_TAKEOFF:
+                if (g_gp != GP_TAKEOFF) { g_gp = GP_TAKEOFF; }
+                g_guided_vx = g_guided_vy = 0.0f;
+                if (cmd_alt > 0.0f) g_guided_alt_m = cmd_alt;
+                g_guided_slew = Q::GUIDED_TAKEOFF_SLEW_MPS;
+                break;
+
+            case S5C::REQ_GUIDED:
+                g_gp = GP_CRUISE;
+                g_guided_vx = constrain((float)c.vx_mmps / S5C::SC_MMPS,
+                                        -Q::GUIDED_MAX_VEL, Q::GUIDED_MAX_VEL);
+                g_guided_vy = constrain((float)c.vy_mmps / S5C::SC_MMPS,
+                                        -Q::GUIDED_MAX_VEL, Q::GUIDED_MAX_VEL);
+                if (cmd_alt > 0.0f) g_guided_alt_m = cmd_alt;
+                g_guided_slew = Q::GUIDED_CRUISE_SLEW_MPS;
+                break;
+
+            case S5C::REQ_LAND:
+                if (g_gp != GP_LAND) {
+                    g_gp            = GP_LAND;
+                    g_land_start_ms = now;
+                    g_touch_since_ms = 0;
+                    Serial.println("\n>>> GUIDED 自動着陸を開始");
+                }
+                break;
+
+            case S5C::REQ_HOLD:
+            case S5C::REQ_ABORT:
+            case S5C::REQ_IDLE:
+            default:
+                if (g_gp == GP_CRUISE || g_gp == GP_TAKEOFF) g_gp = GP_HOLD;
+                g_guided_vx = g_guided_vy = 0.0f;
+                g_guided_slew = Q::GUIDED_CRUISE_SLEW_MPS;
+                break;
+        }
+    }
+
+    // --- 4) 着陸フェーズの面倒を見る --------------------------------
+    if (g_gp == GP_LAND) {
+        g_guided_vx = g_guided_vy = 0.0f;      // 降りる間は必ず水平ホールド
+        g_guided_alt_m = Q::GUIDED_LAND_FLOOR_M;
+        g_guided_slew  = Q::GUIDED_LAND_SLEW_MPS;
+
+        // 接地判定: 規定高度を下回った状態が続いたら着いたとみなす。
+        //  ★ 一瞬の測距の化けで切らないよう、必ず継続時間を見る。
+        if (g_range_valid && g_range_h_m > 0.0f && g_range_h_m < Q::GUIDED_LAND_TOUCH_M) {
+            if (g_touch_since_ms == 0) g_touch_since_ms = now;
+        } else {
+            g_touch_since_ms = 0;
+        }
+        const bool touched = (g_touch_since_ms != 0) &&
+                             (now - g_touch_since_ms >= Q::GUIDED_LAND_TOUCH_MS);
+        const bool timeout = (g_land_start_ms != 0) &&
+                             (now - g_land_start_ms >= Q::GUIDED_LAND_TIMEOUT_MS);
+        if (touched || timeout) {
+            g_gp = GP_LANDED;
+            g_guided_vx = g_guided_vy = 0.0f;
+            Serial.printf("\n>>> 着陸完了 (%s)。出力を切りました。"
+                          "THR_CUT でディスアームしてください\n",
+                          touched ? "接地検知" : "タイムアウト");
+        }
+    }
 }
 
 // ============================================================
@@ -1446,6 +1678,11 @@ static void updateControl(float dt_s) {
     pitch_axis.ang_meas  = g_att.pitch - Gain::PITCH_TRIM_DEG;
 
     if (!armed) { stopAllMotors(); return; }
+
+    // ★ 自動着陸が完了したら、ディスアームされるまで出力を切ったままにする。
+    //   接地したあとも高度ループが「まだ 5cm 届いていない」と押し続けると、
+    //   機体が地面を蹴って転がる。ここで止めるのが一番確実。
+    if (g_gp == GP_LANDED) { stopAllMotors(); return; }
 
     // s5c: 高度ホールドが active なら、ミキサーへ渡すスロットルを
     //  ホバースロットル±PID補正 (althold.throttle()) に差し替える。
@@ -1508,7 +1745,8 @@ static void updateControl(float dt_s) {
 
     float thr;
     if (althold.active())               thr = althold.throttle();
-    else if (g_mode == S5::MODE_POSHOLD) thr = constrain(thr_stick, 0.0f, POSHOLD_THR_CAP);
+    else if (g_mode == S5::MODE_POSHOLD || g_mode == S5::MODE_AUTO)
+                                         thr = constrain(thr_stick, 0.0f, POSHOLD_THR_CAP);
     else                                 thr = thr_stick;
     const bool  integrate = (thr > S5::I_ENABLE_THR);
 
@@ -1527,16 +1765,16 @@ static void updateControl(float dt_s) {
     //    このコード全体の安全上の不変条件として崩さない。
     //    g.ap_throttle はあえて使わない。
     // ------------------------------------------------------------
-    if (g_mode == S5::MODE_AUTO) {
-        const GroundData& g = telemetry.lastGroundData();
-        roll_axis.stick  = constrain(g.ap_roll,  -1.0f, 1.0f);
-        pitch_axis.stick = constrain(g.ap_pitch, -1.0f, 1.0f);
-        yaw_axis.stick   = constrain(g.ap_yaw,   -1.0f, 1.0f);
-    } else {
-        roll_axis.stick  = Q::STICK_SIGN_ROLL  * sbus.des[Ch::ROLL];
-        pitch_axis.stick = Q::STICK_SIGN_PITCH * sbus.des[Ch::PITCH];
-        yaw_axis.stick   = Q::STICK_SIGN_YAW   * sbus.des[Ch::YAW];
-    }
+    //  ★ 2026-09-11: 旧 GroundData (ap_roll/ap_pitch/ap_yaw) 経路を撤去した。
+    //    GroundData は 42+4=46 バイトで IM920sL の 32 バイト上限を超えており、
+    //    ap_roll 以降は一度も機体に届いていなかった (Config.h の注意書き参照)。
+    //    地上局からの指令は GUIDED で「目標速度・目標高度」として受ける。
+    //    つまり自律制御専用の姿勢指令経路はもう存在しない。
+    //    GUIDED 中もロール/ピッチの目標角は PosHold が出す (下の角度ループ)。
+    //    ヨーだけはスティックを生かしてあるので、自動飛行中でも機首は振れる。
+    roll_axis.stick  = Q::STICK_SIGN_ROLL  * sbus.des[Ch::ROLL];
+    pitch_axis.stick = Q::STICK_SIGN_PITCH * sbus.des[Ch::PITCH];
+    yaw_axis.stick   = Q::STICK_SIGN_YAW   * sbus.des[Ch::YAW];
 
     // ------------------------------------------------------------
     //  外側ループ: 角度 → 目標角速度   (ANGLE / AUTO / ALTHOLD / POSHOLD, 200Hz)
@@ -1544,9 +1782,9 @@ static void updateControl(float dt_s) {
     if (g_mode == S5::MODE_ANGLE || g_mode == S5::MODE_AUTO ||
         g_mode == S5::MODE_ALTHOLD || g_mode == S5::MODE_POSHOLD) {
 
-        if (g_mode == S5::MODE_POSHOLD) {
+        if (g_mode == S5::MODE_POSHOLD || g_mode == S5::MODE_AUTO) {
             // 目標角は updateFlowHold() が FLOW_LOOP_HZ で計算済み (すでにクランプ済み)。
-            // スティックはそこで「目標速度」として使っている。
+            // スティック (GUIDED では地上局の速度指令) はそこで「目標速度」として使っている。
             roll_axis.ang_tar  = poshold.leanRoll();
             pitch_axis.ang_tar = poshold.leanPitch();
         } else {
@@ -1946,20 +2184,48 @@ static void printStatus(uint32_t dt_us) {
                   (unsigned long)dt_us, 1000000.0f / (float)dt_us,
                   isArmed() ? "ARMED" : "DISARMED",
                   sbus.isSafe() ? "OK" : "LOST");
-    Serial.printf("MODE = %s   (SW_HOVER: down=ANGLE / cen=ALTHOLD / up=POSHOLD)\n",
-                  modeName(g_mode));
+    Serial.printf("MODE = %s   (SW_HOVER: down=ANGLE / cen=ALTHOLD / up=POSHOLD%s)\n",
+                  modeName(g_mode),
+                  Q::GUIDED_ENABLE ? " / +SW_AUTO up=GUIDED" : "");
     SelfTest::printCompact(Serial);   // 起動時に何がつながっていたか (画面に残す)
 
     if (S5::USE_IM920) {
-        const GroundData& g = telemetry.lastGroundData();
-        Serial.printf("IM920 link=%s   AP: roll=%+.3f pitch=%+.3f yaw=%+.3f (thr=%+.3f 未使用)\n",
-                      telemetry.groundLinkFresh() ? "FRESH" : "STALE",
-                      g.ap_roll, g.ap_pitch, g.ap_yaw, g.ap_throttle);
         // s5 解析テレメトリの送信状況。drop が増え続けるなら
         // S5::TELEM_TX_HZ が UART の帯域(19200bps) に対して速すぎる。
         Serial.printf("TELEM tx=%lu drop=%lu %s\n",
                       (unsigned long)s5tx.sent(), (unsigned long)s5tx.dropped(),
                       s5tx.busy() ? "(sending)" : "");
+
+        // ---- 上りコマンド (GUIDED) --------------------------------
+        //  ★ ベンチで「地上局のコマンドが届いているか」を確認する唯一の場所。
+        //    good が増えないなら無線かパケット定義。badver なら S5Cmd.h が
+        //    機体側と地上側でずれている。badcs が増えるなら電波が弱い。
+        if (Q::GUIDED_ENABLE) {
+            Serial.printf("CMD   rx: good=%lu lost=%lu badcs=%lu badlen=%lu badver=%lu  "
+                          "RSSI=%d %s\n",
+                          (unsigned long)s5rx.nGood(),  (unsigned long)s5rx.nLost(),
+                          (unsigned long)s5rx.nBadCs(), (unsigned long)s5rx.nBadLen(),
+                          (unsigned long)s5rx.nBadVer(), s5rx.rssi(),
+                          s5rx.everReceived() ? "" : "(まだ1つも受信していません)");
+            if (s5rx.everReceived()) {
+                const S5C::CmdFrame& c = s5rx.last();
+                Serial.printf("         %lu ms前  req=%-7s vx=%+.3f vy=%+.3f alt=%.2f m "
+                              "flags=0x%04X\n",
+                              (unsigned long)s5rx.ageMs(), S5C::reqName(c.req),
+                              (float)c.vx_mmps / S5C::SC_MMPS,
+                              (float)c.vy_mmps / S5C::SC_MMPS,
+                              (float)c.alt_cm  / S5C::SC_CM,
+                              (unsigned)c.flags);
+            }
+            static const char* PH[] = { "OFF", "HOLD", "TAKEOFF", "CRUISE", "LAND", "LANDED" };
+            Serial.printf("GUIDED %s  phase=%-7s  目標 vx=%+.3f vy=%+.3f alt=%.2f m "
+                          "(slew %.2f m/s)%s%s\n",
+                          g_guided_engaged ? "ENGAGED" : "----   ",
+                          PH[(int)g_gp], g_guided_vx, g_guided_vy,
+                          g_guided_alt_m, g_guided_slew,
+                          (!g_guided_engaged && g_guided_why[0]) ? "  直前の解除理由: " : "",
+                          (!g_guided_engaged && g_guided_why[0]) ? g_guided_why : "");
+        }
     }
 
     if (g_sd_ok)   SdLog::brief(Serial);
@@ -2333,10 +2599,18 @@ void loop() {
     }
     const uint32_t _t4 = micros();
 
-    // 地上局からの受信。groundLinkFresh() の判定に使うので制御より前に読む。
-    // (PIDゲインのリモート調整やリモートリセットは行わない。receive() は
-    //  GroundData を取り込んで鮮度を更新するだけ)
-    if (S5::USE_IM920 && telem_rx_tick.ready()) telemetry.receive();
+    // 地上局からの受信。制御より前に読む。
+    //  ★ GUIDED_ENABLE=true では S5C::Rx だけが Serial3 を読む。
+    //    Telemetry.h の telemetry.receive() と二重に読ませると、片方が先に
+    //    バイトを抜いてもう片方が永久に行を組み立てられなくなる。
+    //    旧 GroundData 経路は 32 バイト上限を超えていて元から機能していない
+    //    (Config.h の注意書き) ので、GUIDED 側に一本化する。
+    if (S5::USE_IM920 && telem_rx_tick.ready()) {
+        if (Q::GUIDED_ENABLE) s5rx.poll();
+        else                  telemetry.receive();
+    }
+    // 地上局の要求を「目標速度 / 目標高度」へ翻訳する (制御はしない)。
+    updateGuided();
     const uint32_t _t5 = micros();
 
     updateControl(dt_s);

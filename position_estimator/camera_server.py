@@ -35,6 +35,10 @@ DSHOW_EXPOSURE_MANUAL = 0.25
 
 # ── 検知パラメータ（PC側と共有）────────────────────────────────
 _DEFAULT_PARAMS = {
+    "detect_mode": "motion",
+    "bright_threshold": 230,
+    "bright_min_area_px": 4,
+    "bright_max_area_px": 4000,
     "diff_threshold": 12,
     "min_area_px": 40,
     "max_area_px": 20000,
@@ -103,6 +107,12 @@ class Detector:
         if self.bg is not None:
             self.bg = self._make_bg()
 
+    def _bright_mask(self, gray_blurred):
+        """輝度しきい値だけの前景。静止ホバリング中でも消えない (PC側 camera.py と同じ)。"""
+        _, m = cv2.threshold(gray_blurred, P["bright_threshold"], 255,
+                             cv2.THRESH_BINARY)
+        return m
+
     def _mask(self, gray_blurred):
         if self.bg is not None:
             m = self.bg.apply(gray_blurred, learningRate=P["bg_learning_rate"])
@@ -122,8 +132,20 @@ class Detector:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, self.blur, 0)
 
-        mask = self._mask(gray)
         self.vibration_rejected = False
+        mode = P.get("detect_mode", "motion")
+        min_area, max_area = P["min_area_px"], P["max_area_px"]
+
+        if mode == "bright":
+            mask = self._bright_mask(gray)
+            min_area, max_area = P["bright_min_area_px"], P["bright_max_area_px"]
+        elif mode == "bright_or_motion":
+            bright = self._bright_mask(gray)
+            motion = self._mask(gray)
+            mask = bright if motion is None else cv2.bitwise_or(bright, motion)
+            min_area = P["bright_min_area_px"]
+        else:
+            mask = self._mask(gray)
         if mask is None:
             return []
 
@@ -140,7 +162,7 @@ class Detector:
         out = []
         for c in contours:
             area = cv2.contourArea(c)
-            if area < P["min_area_px"] or area > P["max_area_px"]:
+            if area < min_area or area > max_area:
                 continue
             M = cv2.moments(c)
             if M["m00"] == 0:

@@ -61,7 +61,7 @@
 namespace S5T {
 
 // 構造体を変えたら必ずインクリメントすること (地上局が不一致を検出する)
-constexpr uint8_t VERSION = 4;
+constexpr uint8_t VERSION = 5;
 
 // IM920sL の実効ペイロード上限 [byte]。これを超えると黙って切られる。
 constexpr size_t IM920SL_MAX_PAYLOAD = 32;
@@ -95,6 +95,10 @@ enum Flag : uint16_t {
     F_DRY_RUN     = 1u << 8,   // ESC へ 0 しか出していない
     F_SAT         = 1u << 9,   // ミキサーがどこかで飽和した
     F_TX_DROP     = 1u << 10,  // 送信バッファが空かず直前に1回捨てた
+    // ★ VERSION 5 で追加 (地上局ガイド飛行 / S5Cmd.h)
+    F_GUIDED      = 1u << 11,  // 地上局コマンドで飛んでいる (MODE_AUTO)
+    F_CMD_FRESH   = 1u << 12,  // 上りコマンドが規定時間内に届いている
+    F_LANDED      = 1u << 13,  // 自動着陸が完了して出力を切った
 };
 
 // mode と alt_state を 1 バイトに詰める (上位=alt_state 下位=mode)
