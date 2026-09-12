@@ -296,10 +296,51 @@ constexpr float FLOW_ASSUMED_HEIGHT_M = 1.0f;
 //   いるため、この乱れは発振・飽和の原因にもなり得る。20Hz (50ms周期) にして
 //   ブロック頻度を1/2.5に減らす。位置ホールドは0.3〜2Hz帯の応答なので実用上は
 //   問題ない見込み。根本対応 (ライブラリの delayMicroseconds を削る) は別途検討。
-constexpr int FLOW_LOOP_HZ = 20;
+// ★ 2026-09-10: 20 -> 100。根本対応した = OpticalFlow.h に PMW3901 の
+//   モーションバースト読み出しを実装 (FLOW_USE_BURST)。1 回 ~1ms -> ~80us。
+//   100Hz でも 8ms/秒 = 0.8% 負荷。位置ループの更新が 50ms -> 10ms 周期に
+//   なり、フロー速度推定の遅れが ~20ms 縮む (0.33Hz で ~15度 の位相余裕)。
+//   LOG0038 に残っていた 0.33Hz 揺れの本命対策。
+//   ★ 副作用: PosHold の速度 LPF (FLOW_VEL_MEAS_ALPHA=0.4) は per-call の
+//     EMA なので、更新が 5 倍速い = 時定数 75ms -> 15ms に激減 (平滑化が減る
+//     = ノイズが通りやすい)。まず 100Hz で飛ばして flow_vx/vy のノイズを見て、
+//     荒ければ FLOW_VEL_MEAS_ALPHA を 0.15〜0.2 に下げる。
+//   ★ 戻すなら FLOW_USE_BURST=false かつ FLOW_LOOP_HZ=20 の両方。
+// バースト読み出しを使うか (false = 旧 readMotionCount、1 回 ~1ms ブロック)。
+// ★ 初回は地上で raw_x/raw_y が手の動き / 机上を滑らせた向きに正しく追従する
+//   のを必ず確認してから飛ぶこと (バースト手順ミス = フローがゴミ = 墜落)。
+// ★ 2026-09-10: LOG0040 で判明 — 100Hz + burst で「読み出し=制御」だと、
+//   静かなホバーの微小ドリフト (~0.1m/s) の 10ms 窓ぶんが < 1 ピクセル →
+//   raw が (0,0) に量子化 → suspectDead() 発火 → POSHOLD 拒否。
+//   burst 読み出し自体はベンチ (log_024) で符号・軸・timing OK だった。
+// ★ 2026-09-11: 読み出しレートと制御レートを分離 (fable 方針)。
+//   FLOW_LOOP_HZ=100 で読み+de-rotation サンプルを取り、FLOW_CTRL_HZ=25 の
+//   窓 (4 読みぶん ≈ 40ms) で「de-rotate 済み変位」を積算してから PosHold へ
+//   1 回渡す。窓積算でピクセル分解能が戻り (0.05〜0.15m/s ドリフトで
+//   5〜15 カウント/窓)、かつ 20Hz より ~20ms 遅れが減る。
+//   de-rotation はサンプルごとに引いてから積算する (窓内の姿勢変化を捉える。
+//   積分したジャイロ白色ノイズは √(T·dt) で増えるので細切れの方が低ノイズ)。
+//   死判定は SQUAL ベース (FLOW_SQUAL_MIN) に変更 + 窓合計 (0,0) の保険。
+//   ★ 戻すなら FLOW_USE_BURST=false + FLOW_LOOP_HZ=20 + FLOW_CTRL_HZ=20。
+// バースト読み出しを使うか (false = 旧 readMotionCount、1 回 ~1ms ブロック)。
+constexpr bool FLOW_USE_BURST = true;
+constexpr int FLOW_LOOP_HZ = 100;           // センサ読み + de-rotation サンプルのレート
 static_assert(RATE_LOOP_HZ % FLOW_LOOP_HZ == 0,
               "FLOW_LOOP_HZ は RATE_LOOP_HZ の約数にしてください");
 constexpr int FLOW_LOOP_DIV = RATE_LOOP_HZ / FLOW_LOOP_HZ;
+
+// PosHold (速度/位置ループ) を回すレート [Hz]。FLOW_LOOP_HZ を割り切ること。
+// FLOW_LOOP_HZ と同じ値にすると「読み出し=制御」= 旧挙動 (積算なし)。
+constexpr int FLOW_CTRL_HZ  = 25;
+static_assert(FLOW_LOOP_HZ % FLOW_CTRL_HZ == 0,
+              "FLOW_CTRL_HZ は FLOW_LOOP_HZ の約数にしてください");
+constexpr int FLOW_CTRL_DIV = FLOW_LOOP_HZ / FLOW_CTRL_HZ;   // 何読みで 1 制御窓か
+
+// SQUAL (PMW3901 表面品質、0..~150) がこれ未満のサンプルは「追える模様なし」
+// として窓積算に入れない。この状態が FLOW_DEAD_S 続いたら suspectDead()。
+// ★ 実機の SQUAL 実測がまだ無いので保守的に 20。次便のログ (printStatus の
+//   flow 行) で通常ホバー時の値を見て調整すること。
+constexpr uint8_t FLOW_SQUAL_MIN = 20;
 
 // ============================================================
 //  § 7-2  s5b : フロー速度・位置ホールド
@@ -316,6 +357,21 @@ constexpr int FLOW_LOOP_DIV = RATE_LOOP_HZ / FLOW_LOOP_HZ;
 
 // 速度ループ: (目標速度 - 実測速度[m/s]) → 目標リーン角[deg]
 //   kp=6 なら「1 m/s ずれていたら 6度 傾けて戻す」
+// ★ 2026-09-11: 6.0 -> 4.0。0.31Hz リミットサイクルの本命対策。
+//   LOG0046 の再システム同定で判明: FLOW_POS_KP を 1.0->0.7->0.6 と下げても
+//   一巡ゲイン |L(0.31Hz)| が 0.55 のまま動かなかった。理由は等価PIDで
+//   Kd_eff = FLOW_VEL_KP (FLOW_POS_KP に依存しない) で、0.31Hz は D支配帯域
+//   だから。FLOW_POS_KP を下げると P は下がるが Td=1/FLOW_POS_KP が伸びて
+//   D支配帯では相殺 → |L| 不変。LOG0038/0042/0045 が全部同じ数字だったのは
+//   これ。0.31Hz の |L| を下げるには FLOW_VEL_KP を触るしかない。
+//       6.0 -> 4.0 で |L| 0.55 -> ~0.37 (余裕 ~9dB)。Td (=1/FLOW_POS_KP) は
+//   変わらないので位相形状はそのまま、ゲインだけ純粋に下がる。
+//   ★ 代償: 速度ループ全体が柔らかくなる = 外乱 (押された時) の復帰が遅い。
+//     無風の定点ホバーなら実害は小さいはず。荒れたら FLOW_VEL_KD を足す
+//     (0.31Hz だけ減衰を足せて DC剛性は維持) が次の手。
+//   ★ 姿勢/レートループは無罪 (LOG0037/0046 独立で lean->roll_ang:
+//     ゲイン ~0.93 / 位相 -4〜-5度 = 揺れの周波数で既に透明)。
+//     ループ速度を上げても 0.31Hz に対して余裕が 640〜3200倍あり無意味。
 constexpr float FLOW_VEL_KP      = 6.0f;
 constexpr float FLOW_VEL_KI      = 2.0f;    // 定常風・機体の取り付け傾きを吸収
 constexpr float FLOW_VEL_KD      = 0.0f;
@@ -388,8 +444,12 @@ constexpr float FLOW_LEAN_SIGN_PITCH = -1.0f;
 constexpr float FLOW_STICK_SIGN_X = -1.0f;  // pitch stick → 前後 目標速度
 constexpr float FLOW_STICK_SIGN_Y = +1.0f;  // roll  stick → 左右 目標速度
 
-// 制御に使う速度の LPF (0=なし, 1に近いほど強い)
-constexpr float FLOW_VEL_MEAS_ALPHA = 0.4f;
+// 制御に使う速度の LPF (0=なし, 1に近いほど強い)。per-call EMA なので
+// 時定数は PosHold の呼び出しレート (FLOW_CTRL_HZ) に依存する。
+// ★ 2026-09-11: 0.4 -> 0.3。FLOW_CTRL_HZ=25 で τ ≈ 93ms、旧 20Hz/0.4 の
+//   τ ≈ 75ms とほぼ同等に保つ。窓積算で既に平滑化されているので過度に
+//   上げない。
+constexpr float FLOW_VEL_MEAS_ALPHA = 0.3f;
 
 // |速度| がこれを超えたら異常値。0.5秒続いたらリーン0(水平)に固めて失探とみなす [m/s]
 //  ★ これは「暴走」しか捕まえられない。固まったセンサは 0 を返すので下を参照。

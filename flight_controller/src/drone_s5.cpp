@@ -348,7 +348,27 @@ constexpr float ANG_I_LIMIT = 30.0f;
 //     fh_leanr の残りは基準ズレというより 0.29Hz 揺れの残差。トリムでは
 //     消えないので ROLL_TRIM は +0.13 のまま。
 //   ★ 高度は完璧 (誤差 -0.003±0.007m、飽和 0%、accz -1.00)。触らない。
-constexpr float ROLL_TRIM_DEG  = +0.13f;
+//
+// ★ 2026-09-11: ロールの姿勢基準ずれを確定。上で「基準ズレではなく揺れの
+//   残差」と書いたのは誤り。LOG0045 (clean fh_hold 98秒連続、舵1回) の
+//   3点セットが決め手:
+//       fh_leanr  = -0.98 度   (位置ホールドが -1度 左バンクを保てと指令)
+//       roll_cmd  ≈  0         (その姿勢の維持にトルクは要らない)
+//       flow_vy   ≈  0 (+0.0015 m/s)  (機体は流れていない)
+//   「-1度 左バンクなのに流れずトルクも不要」= その -1度 が実際には水平。
+//   定常外乱トルク (CG/モータ) でもフロー Y バイアスでもなく、IMU のロール
+//   推定が水平を -1度 と誤認しているだけ。ピッチで直したのと同じ現象。
+//   fh_leanr は全便で符号一定・-1.0〜-1.8度 (LOG0042 -1.54 / 0043 -1.78 /
+//   0044 -1.31 / 0045 -0.98)。手順どおり加算:
+//       +0.13 + (-0.98) = -0.85 -> オーバーシュート癖を見込んで -0.70
+//   ★ 揺れへの効き筋: fh_leanr を作っているのは FLOW_VEL_KI(=2.0)。基準が
+//     ずれていると「水平」指令で機体が流れ、KI が -1度 まで巻いて相殺し、
+//     その動作点で hunting する。LOG0045 の20秒バケットで fh_leanr が
+//     -1.05 -> -0.80 -> -0.99 と揺らぐのに同期して roll_ang sd が
+//     0.44 -> 1.02 -> 回復。基準を潰せば KI が巻く必要がなくなり、
+//     hunting 由来の 0.33Hz 成分が減るはず。
+//   ★ 次便で fh_leanr が ±0.5度 に入れば基準確定。入らなければもう1巡。
+constexpr float ROLL_TRIM_DEG  = -0.70f;
 constexpr float PITCH_TRIM_DEG = -0.60f;
 
 } // namespace Gain
@@ -1973,11 +1993,14 @@ static void printStatus(uint32_t dt_us) {
     //    「フローが死んでいるので POSHOLD に入れない」状態だと画面のどこにも
     //    出なかった (実際それで長期間気づかれていなかった)。常に出す。
     if (S5::USE_FLOW) {
-        Serial.printf("\n[フロー] %s  生カウント(%.0f,%.0f)  0連続=%.1fs  h=%.2fm\n",
+        Serial.printf("\n[フロー] %s  窓カウント(%.0f,%.0f)  SQUAL=%u(床%u)  "
+                      "0連続=%.1fs 低品質=%.1fs  h=%.2fm  (読%dHz/制御%dHz)\n",
                       !g_flow_ok        ? "FAIL(起動時に応答なし)"
-                    : flow.suspectDead()? "凍結?(生カウントが0のまま)"
+                    : flow.suspectDead()? "凍結? (SQUAL床下 or 窓カウント0が継続)"
                                         : "OK  ",
-                      g_flow_raw_x, g_flow_raw_y, flow.zeroRunS(), flow.height());
+                      g_flow_raw_x, g_flow_raw_y, flow.squal(), (unsigned)Q::FLOW_SQUAL_MIN,
+                      flow.zeroRunS(), flow.lowQualS(), flow.height(),
+                      Q::FLOW_LOOP_HZ, Q::FLOW_CTRL_HZ);
     }
 
     // --- s5c: 距離センサ + 高度ホールド ---
@@ -2054,10 +2077,10 @@ static void printStatus(uint32_t dt_us) {
     //     raw は振れるが derot(x,y) が ~0 のままなら OK。
     //     raw と逆向きに振れる → FLOW_DEROT_SIGN_* を反転。
     if (S5::USE_FLOW) {
-        Serial.printf("\n[フロー] %s  h=%.2fm  raw(x,y)=%+6.1f %+6.1f  "
-                      "derot(x,y)=%+6.1f %+6.1f\n",
+        Serial.printf("\n[フロー] %s  h=%.2fm  窓raw(x,y)=%+6.1f %+6.1f  "
+                      "derot(x,y)=%+6.1f %+6.1f  SQUAL=%u\n",
                       g_flow_ok ? "OK  " : "FAIL", flow.height(),
-                      g_flow_raw_x, g_flow_raw_y, g_flow_dx, g_flow_dy);
+                      g_flow_raw_x, g_flow_raw_y, g_flow_dx, g_flow_dy, flow.squal());
         Serial.printf("         v=%+6.2f %+6.2f m/s (LPF %+6.2f %+6.2f)   [z]ゼロ\n",
                       g_flow_vx, g_flow_vy, g_flow_vx_f, g_flow_vy_f);
         Serial.printf("         積算 raw=(%+9.0f,%+9.0f)  derot=(%+9.0f,%+9.0f)  "
@@ -2248,25 +2271,30 @@ void loop() {
     //  読んで機体座標化 + de-rotation + 対地速度換算 → updateFlowHold() で
     //  s5b の速度・位置ホールドを計算 (POSHOLD 以外では出力せず基準を保持)。
     //  de-rotation にはレートループと同じジャイロ値 (g_att) を渡して位相を揃える。
+    //  ★ 2026-09-11: flow.update() は flow_tick (FLOW_LOOP_HZ=読み出しレート) で
+    //    毎回呼ぶが、実際に制御を進めるのは窓が締まった回 (consumeFresh) だけ。
+    //    FLOW_CTRL_DIV==1 なら毎回締まる = 旧挙動。
     if (S5::USE_FLOW && g_flow_ok && flow_tick.ready()) {
-        const float flow_dt_s = (float)flow_tick.dt_us * 1e-6f;
-        flow.update(flow_dt_s, g_att.roll_rate, g_att.pitch_rate);
-        g_flow_raw_x = flow.raw_x;   g_flow_raw_y = flow.raw_y;
-        g_flow_dx    = flow.derot_x; g_flow_dy    = flow.derot_y;
-        g_flow_vx    = flow.vx;      g_flow_vy    = flow.vy;
+        flow.update((float)flow_tick.dt_us * 1e-6f, g_att.roll_rate, g_att.pitch_rate);
+        if (flow.consumeFresh()) {
+            const float flow_dt_s = flow.lastDt();   // = 窓の積算秒数
+            g_flow_raw_x = flow.raw_x;   g_flow_raw_y = flow.raw_y;
+            g_flow_dx    = flow.derot_x; g_flow_dy    = flow.derot_y;
+            g_flow_vx    = flow.vx;      g_flow_vy    = flow.vy;
 
-        // キャリブレーション用の積算 (生px / de-rot後px / 推定変位[m])
-        g_flow_acc_raw_x += flow.raw_x;          g_flow_acc_raw_y += flow.raw_y;
-        g_flow_acc_px_x  += flow.derot_x;        g_flow_acc_px_y  += flow.derot_y;
-        g_flow_acc_m_x   += flow.vx * flow_dt_s; g_flow_acc_m_y   += flow.vy * flow_dt_s;
+            // キャリブレーション用の積算 (生px / de-rot後px / 推定変位[m])
+            g_flow_acc_raw_x += flow.raw_x;          g_flow_acc_raw_y += flow.raw_y;
+            g_flow_acc_px_x  += flow.derot_x;        g_flow_acc_px_y  += flow.derot_y;
+            g_flow_acc_m_x   += flow.vx * flow_dt_s; g_flow_acc_m_y   += flow.vy * flow_dt_s;
 
-        // 表示用の軽い LPF (生値は g_flow_vx/vy とログに残す)
-        constexpr float A = 0.2f;
-        g_flow_vx_f += A * (flow.vx - g_flow_vx_f);
-        g_flow_vy_f += A * (flow.vy - g_flow_vy_f);
+            // 表示用の軽い LPF (生値は g_flow_vx/vy とログに残す)
+            constexpr float A = 0.2f;
+            g_flow_vx_f += A * (flow.vx - g_flow_vx_f);
+            g_flow_vy_f += A * (flow.vy - g_flow_vy_f);
 
-        // s5b: 速度・位置ホールド
-        updateFlowHold(flow_dt_s);
+            // s5b: 速度・位置ホールド
+            updateFlowHold(flow_dt_s);
+        }
     }
     const uint32_t _t3 = micros();
 
@@ -2327,13 +2355,22 @@ void loop() {
     const float thr_now  = S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f;
 
     // --- モード表示 LED (pin 5/6/9) -----------------------------------
-    //  赤=DISARM  青=ARMED+ANGLE(手動)  緑=ARMED+それ以外(自動系)。
+    //  赤=DISARM  青(点灯)=ARMED+ANGLE(手動)  緑(点滅)=ARMED+POSHOLD/ALTHOLD(自動系)  緑(点灯)=ARMED+その他。
     //  ★ コモンアノード＋共通抵抗の配線なので混色(白/黄)は出せない。
     //    Vf 最小の赤ダイが電流を独占するため。単色3つで区別する。
     //  digitalWrite 3本だけなので毎ループ呼んでも制御ループへの影響は無視できる。
-    if (!armed_now)                        StatusLed::red();
-    else if (g_mode == S5::MODE_ANGLE)     StatusLed::blue();
-    else                                   StatusLed::green();
+    const bool auto_flight_mode = (g_mode == S5::MODE_POSHOLD || g_mode == S5::MODE_ALTHOLD);
+    if (!armed_now) {
+        StatusLed::red();
+    } else if (auto_flight_mode) {
+        const bool blink_on = (millis() / 250) % 2 == 0;   // 2Hz 点滅
+        if (blink_on) StatusLed::green();
+        else          StatusLed::off();
+    } else if (g_mode == S5::MODE_ANGLE) {
+        StatusLed::blue();
+    } else {
+        StatusLed::green();
+    }
 
     if (g_sd_ok) {
         static bool s_sd_was_armed = false;

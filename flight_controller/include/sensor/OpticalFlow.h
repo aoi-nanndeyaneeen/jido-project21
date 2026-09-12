@@ -29,7 +29,7 @@
 class OpticalFlow {
 public:
     explicit OpticalFlow(uint8_t cs_pin = (uint8_t)Quad::FLOW_CS_PIN)
-        : _sensor(cs_pin) {}
+        : _cs(cs_pin), _sensor(cs_pin) {}
 
     // 戻り値 false = PMW3901 が応答しない (配線 / SPI / 電源を確認)
     bool begin() {
@@ -47,68 +47,86 @@ public:
     float height() const { return _height_m; }
 
     // ------------------------------------------------------------
-    //  update()
+    //  update()  — FLOW_LOOP_HZ (読み出しレート) で毎回呼ぶ
     //    dt_s                : 前回 update() からの経過 [s]
     //    gyro_roll_rate_dps  : 機体 X軸まわり角速度 [deg/s]  (FRD: 右バンク +)
     //    gyro_pitch_rate_dps : 機体 Y軸まわり角速度 [deg/s]  (FRD: 機首上げ +)
     //
+    //  ★ 2026-09-11: 読み出しと制御を分離。毎回センサを読んで
+    //    「de-rotate 済み変位」を _acc_* に積算し、FLOW_CTRL_DIV 読みごとに
+    //    1 回だけ窓を締めて vx/vy を作る (そのとき _fresh=true)。
+    //    呼び出し側は consumeFresh() が true の回だけ PosHold を回す。
+    //    FLOW_CTRL_DIV==1 なら毎回窓が締まる = 旧挙動。
     //  ジャイロは BodyFrame.h の Attitude.roll_rate / pitch_rate をそのまま渡す。
-    //  レートループが使っているのと同じ値なので位相が揃う。
     // ------------------------------------------------------------
     void update(float dt_s, float gyro_roll_rate_dps, float gyro_pitch_rate_dps) {
         if (!_ok_init || dt_s <= 0.0f) return;
 
         int16_t dx = 0, dy = 0;
-        _sensor.readMotionCount(&dx, &dy);
+        if (Quad::FLOW_USE_BURST) { readMotionBurst(_cs, &dx, &dy, &_squal); }
+        else                      { _sensor.readMotionCount(&dx, &dy); _squal = 255; }
 
-        // --- 1) 生カウント → 機体座標 (FRD) ---
-        float fx = (float)dx;
-        float fy = (float)dy;
+        // 生カウント → 機体座標 (FRD)
+        float fx = (float)dx, fy = (float)dy;
         if (Quad::FLOW_SWAP_XY) { const float t = fx; fx = fy; fy = t; }
         fx *= Quad::FLOW_SIGN_X;
         fy *= Quad::FLOW_SIGN_Y;
 
-        raw_x = fx;
-        raw_y = fy;
-
-        // --- 1b) 生存検出 ------------------------------------------------
-        //  ★ 2026-09-09 追加。PMW3901 が飛行中に固まると readMotionCount() は
-        //    (0,0) を返し続けるが、これは「完全に静止している」のと区別が
-        //    つかないため、PosHold の失探検出 (|速度| >= FLOW_VEL_SANE) には
-        //    絶対に引っかからない。位置制御は「機体は止まっている」と信じて
-        //    一切補正せず、機体は流れていく。測距の凍結と同じ失敗パターン。
-        //
-        //  判定: 生カウントが「ぴったり (0,0)」の状態が続いた時間を数える。
-        //    モーターが回っている機体は必ず振動しているので、生きたセンサが
-        //    数百サンプル連続で厳密に 0 を返すことは実質ありえない。
-        //    逆に地上で完全静止しているときも 0 が続くので、これを
-        //    「異常」と断ずるかどうかの判断は呼び出し側に任せる
-        //    (このクラスは時間を数えるだけ)。
-        if (dx == 0 && dy == 0) _zero_run_s += dt_s;
-        else                    _zero_run_s = 0.0f;
-
-        // --- 2) de-rotation ---
-        //  pitch レート → flow_x に乗る / roll レート → flow_y に乗る
-        //  見かけ流量 [px] = PX_PER_RAD * 角速度[rad/s] * dt
-        float dfx = fx, dfy = fy;
-        if (Quad::FLOW_DEROTATE) {
-            const float gr = gyro_roll_rate_dps  * DEG2RAD;
-            const float gp = gyro_pitch_rate_dps * DEG2RAD;
-            dfx += Quad::FLOW_DEROT_SIGN_X * Quad::FLOW_PX_PER_RAD * gp * dt_s;
-            dfy += Quad::FLOW_DEROT_SIGN_Y * Quad::FLOW_PX_PER_RAD * gr * dt_s;
+        // --- SQUAL 床下のサンプルは窓に入れない (追える模様が無い = ゼロを混ぜる害) ---
+        const bool lowq = Quad::FLOW_USE_BURST && (_squal < Quad::FLOW_SQUAL_MIN);
+        if (lowq) {
+            _lowqual_s += dt_s;
+        } else {
+            _lowqual_s = 0.0f;
+            _acc_raw_x += fx;
+            _acc_raw_y += fy;
+            // de-rotation はサンプルごとに引いてから積算する。
+            //  見かけ流量 [px] = PX_PER_RAD * 角速度[rad/s] * dt。窓内で姿勢が
+            //  変わっても各サンプルの dt/ジャイロで正しく打ち消せる。
+            if (Quad::FLOW_DEROTATE) {
+                const float gr = gyro_roll_rate_dps  * DEG2RAD;
+                const float gp = gyro_pitch_rate_dps * DEG2RAD;
+                _acc_gyro_x += Quad::FLOW_DEROT_SIGN_X * Quad::FLOW_PX_PER_RAD * gp * dt_s;
+                _acc_gyro_y += Quad::FLOW_DEROT_SIGN_Y * Quad::FLOW_PX_PER_RAD * gr * dt_s;
+            }
+            _acc_dt += dt_s;
         }
-        derot_x = dfx;
-        derot_y = dfy;
 
-        // --- 3) 対地速度 [m/s] ---
-        //  omega_apparent = (flow_px / dt) / PX_PER_RAD     [rad/s]
-        //  v              = omega_apparent * height         [m/s]
-        const float k = _height_m / (Quad::FLOW_PX_PER_RAD * dt_s);
-        vx = dfx * k;
-        vy = dfy * k;
+        // --- 窓がまだ埋まっていなければここまで ---
+        if (++_read_ctr < Quad::FLOW_CTRL_DIV) return;
+        _read_ctr = 0;
 
-        _last_dt = dt_s;
-        _fresh   = true;
+        const float T = _acc_dt;
+        if (T <= 0.0f) {
+            // 窓が丸ごと lowq だった: 速度 0 として制御へ (機体が動いても
+            //  補正しない = 危険だが、SQUAL が戻るまでの短時間の話。
+            //  _lowqual_s が FLOW_DEAD_S を超えたら suspectDead で POSHOLD 解除)。
+            raw_x = raw_y = derot_x = derot_y = vx = vy = 0.0f;
+            _last_dt = (float)Quad::FLOW_CTRL_DIV * dt_s;
+            _acc_raw_x = _acc_raw_y = _acc_gyro_x = _acc_gyro_y = _acc_dt = 0.0f;
+            _zero_run_s += _last_dt;
+            _fresh = true;
+            return;
+        }
+
+        raw_x   = _acc_raw_x;
+        raw_y   = _acc_raw_y;
+        derot_x = _acc_raw_x + _acc_gyro_x;    // de-rotation 済み変位 [px]
+        derot_y = _acc_raw_y + _acc_gyro_y;
+
+        // 対地速度 [m/s] = (変位[px] / T) / PX_PER_RAD * height
+        const float k = _height_m / (Quad::FLOW_PX_PER_RAD * T);
+        vx = derot_x * k;
+        vy = derot_y * k;
+
+        // 窓合計が (0,0) に丸まった = センサ凍結の疑い。SQUAL 判定の保険
+        //  (burst 前の readMotionCount 経路ではこちらだけが効く)。
+        if (lroundf(raw_x) == 0 && lroundf(raw_y) == 0) _zero_run_s += T;
+        else                                            _zero_run_s = 0.0f;
+
+        _last_dt = T;
+        _acc_raw_x = _acc_raw_y = _acc_gyro_x = _acc_gyro_y = _acc_dt = 0.0f;
+        _fresh = true;
     }
 
     // 直近 update() の結果 -----------------------------------------
@@ -125,16 +143,64 @@ public:
     //  地上で静止していても伸びるので、これ単体では異常を意味しない。
     float zeroRunS() const { return _zero_run_s; }
 
-    // Quad::FLOW_DEAD_S を超えて 0 が続いたか。飛行中なら「固まった」とみなせる。
-    bool  suspectDead() const { return _zero_run_s >= Quad::FLOW_DEAD_S; }
+    // Quad::FLOW_DEAD_S を超えて「模様なし」が続いたか。飛行中なら固まったとみなす。
+    //  burst: SQUAL 床下が続く / または窓合計 (0,0) が続く のどちらか。
+    //  非burst: 窓合計 (0,0) が続く のみ (SQUAL は 255 固定なので効かない)。
+    bool  suspectDead() const {
+        return _zero_run_s >= Quad::FLOW_DEAD_S
+            || (Quad::FLOW_USE_BURST && _lowqual_s >= Quad::FLOW_DEAD_S);
+    }
+
+    // 直近の窓積算に使った秒数 (= 制御 dt)。窓 dt。
+    float lowQualS() const { return _lowqual_s; }
+
+    // 直近バースト読みの表面品質 (SQUAL)。低い = フローが当てにならない。
+    // FLOW_USE_BURST=false のときは 0 のまま。
+    uint8_t squal() const { return _squal; }
 
 private:
     static constexpr float DEG2RAD = 0.01745329252f;
 
+    // --- PMW3901 モーションバースト読み出し -------------------------------
+    //  ライブラリの readMotionCount() は registerRead を5回、各 200us の
+    //  delayMicroseconds を挟むので 1 回 ~1ms ブロックする。FLOW_LOOP_HZ を
+    //  上げるとレートループ (1kHz) を潰すため 20Hz に抑えられていた。
+    //  バーストは 1 トランザクションで 12 バイトをバイト間ディレイ無しで
+    //  読むので ~80us。手順 (データシート §MOTION Burst):
+    //    CS LOW → 0x16 送信 → tSRAD 待ち → 12 バイト連続読み → CS HIGH。
+    //  CS はバースト中トグルしないこと。SPI 設定はライブラリと同一
+    //  (4MHz / MSBFIRST / MODE3)。
+    //    buf[0]=Motion buf[1]=Observation
+    //    buf[2..3]=DeltaX_L,H  buf[4..5]=DeltaY_L,H  buf[6]=SQUAL ...
+    static void readMotionBurst(uint8_t cs, int16_t* dx, int16_t* dy,
+                                uint8_t* squal) {
+        uint8_t buf[12];
+        SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE3));
+        digitalWrite(cs, LOW);
+        delayMicroseconds(50);
+        SPI.transfer(0x16);            // Motion_Burst レジスタ
+        delayMicroseconds(50);         // tSRAD (データシート 35us、余裕をみて 50)
+        for (int i = 0; i < 12; ++i) buf[i] = SPI.transfer(0);
+        digitalWrite(cs, HIGH);
+        SPI.endTransaction();
+        *dx = (int16_t)(((uint16_t)buf[3] << 8) | buf[2]);
+        *dy = (int16_t)(((uint16_t)buf[5] << 8) | buf[4]);
+        *squal = buf[6];
+    }
+
+    uint8_t _cs;
+    uint8_t _squal = 0;
     Bitcraze_PMW3901 _sensor;
     bool  _ok_init    = false;
     float _height_m   = 1.0f;
     float _last_dt    = 0.0f;
     bool  _fresh      = false;
-    float _zero_run_s = 0.0f;   // 生カウントが (0,0) のまま続いた時間 [s]
+    float _zero_run_s = 0.0f;   // 窓合計が (0,0) のまま続いた時間 [s]
+    float _lowqual_s  = 0.0f;   // SQUAL 床下が続いた時間 [s]
+
+    // 制御窓の積算 (FLOW_CTRL_DIV 読みぶん)
+    float    _acc_raw_x  = 0.0f, _acc_raw_y  = 0.0f;   // 生カウント合計 [px]
+    float    _acc_gyro_x = 0.0f, _acc_gyro_y = 0.0f;   // de-rotation 補正合計 [px]
+    float    _acc_dt     = 0.0f;                       // 窓の経過 [s]
+    uint16_t _read_ctr   = 0;                          // 窓内の読み回数
 };

@@ -88,7 +88,7 @@ public:
         // --- 失探検出: |速度| が上限に張り付き続けたら水平指令に固める ---
         if (fabsf(vx) >= FLOW_VEL_SANE || fabsf(vy) >= FLOW_VEL_SANE) _bad_count++;
         else                                                          _bad_count = 0;
-        if (_bad_count > (FLOW_LOOP_HZ / 2)) {          // 0.5 秒
+        if (_bad_count > (FLOW_CTRL_HZ / 2)) {          // 0.5 秒 (update は FLOW_CTRL_HZ で呼ばれる)
             _lean_roll = _lean_pitch = 0.0f;
             _vx_pid.reset();
             _vy_pid.reset();
