@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 //  FlightLog.h  -  飛行ログの「1行の定義」と 3 つの吐き出し先
 //                  (drone_s5.cpp 専用)
 // ============================================================
@@ -21,12 +21,14 @@
 //    HEADER     … 列名。唯一の一覧
 //    formatRow  … Rec -> CSV 1 行。唯一のフォーマッタ
 //    Usb::      … 'l' で USB へ 500Hz ストリーム (scripts/logger.py が受ける)
-//    Ram::      … スロットル投入をトリガに本体RAMへ 500Hz 記録、着陸後 'v' でダンプ
 //    (SD への書き出しは quad/SdLog.h。Rec をそのまま byte 列として流す)
 //
+//  ★ 2026-09-12: 本体RAMへの飛行中バッファリング (Ram::、'n'/'v'/'y' キー) は
+//    廃止した。GUIDED 診断列を足すたびに RAM2 の空きと綱引きになるのが
+//    煩わしく、SD ログ (quad/SdLog.h) で時間無制限に代替できるため。
+//
 //  呼び出し側 (drone_s5.cpp) は 500Hz で Rec を 1 個だけ作り、
-//  それを Usb / Ram / SdLog の 3 つへ配る。以前は RAM 用と SD 用で
-//  fillRec() を 2 回呼んでいたので、そのぶんも減っている。
+//  それを Usb / SdLog / LogLink へ配る。
 //
 //  ★ 列を足すときに触るのは Rec / HEADER / formatRow / fillRec(呼び出し側) と
 //    scripts/bin2csv.py の 5 箇所。printf は 1 本になったので 6 -> 5。
@@ -60,13 +62,18 @@ enum RFlag : uint16_t {
     RF_ALT_EN   = 1u << 3,
     RF_ALT_ACT  = 1u << 4,
     RF_HOLDING  = 1u << 5,   // poshold.holding()
+    // 2026-09-12: GUIDED 診断用 (地上局からの上り指令 / スイッチ生値)。
+    RF_GUIDED_ENGAGED = 1u << 6,  // g_guided_engaged
+    RF_SW_AUTO_UP     = 1u << 7,  // Ch::SW_AUTO == up
 };
 
 // ★ Rec の列を足す/型を変えたら +1 する。SdLog の BIN ヘッダに書き込まれ、
 //   scripts/bin2csv.py が古い BIN を弾くのに使う。
 // v2 (2026-09-09): accx/accy/accz の量子化スケールを SC_1E4 -> 1000 に変更
 //   (±8g 化で値域が広がり ±3.27g で頭打ちしていた)。列の並び・サイズは不変。
-constexpr uint8_t REC_VER = 2;
+// v3 (2026-09-12): GUIDED 診断用に cmd_req/cmd_age_ms/cmd_vx_mmps/cmd_vy_mmps/
+//   cmd_alt_cm を末尾に追加。flags に RF_GUIDED_ENGAGED/RF_SW_AUTO_UP を追加。
+constexpr uint8_t REC_VER = 3;
 
 struct __attribute__((packed)) Rec {
     uint32_t t_ms;
@@ -106,10 +113,18 @@ struct __attribute__((packed)) Rec {
     int16_t  est_h;                                 // mm
     int16_t  est_vz;                                // mm/s
     int16_t  est_bias;                              // m/s^2 x1e3
+    // 2026-09-12: GUIDED 診断用。地上局からの最後の上り指令とその鮮度。
+    //   ★ SW_HOVER は mode 列 (POSHOLD=up+フロー正常, ALTHOLD=up+フロー死 or cen,
+    //     ANGLE=down) から逆算できるが、SW_AUTO の生値は他に出ていないので
+    //     flags の RF_SW_AUTO_UP を見ること。
+    uint8_t  cmd_req;                               // S5C::Req (last() の値)
+    uint16_t cmd_age_ms;                             // s5rx.ageMs() (65535 で頭打ち)
+    int16_t  cmd_vx_mmps, cmd_vy_mmps;               // 最後に受けた指令の目標速度
+    int16_t  cmd_alt_cm;                             // 同 目標高度
 };
 // ★ この値が変わる = SD の BIN 形式が変わった。REC_VER を +1 し、
 //   scripts/bin2csv.py の _FIELDS / REC_VER も合わせること。
-static_assert(sizeof(Rec) == 116, "FlightLog::Rec のサイズが変わった。上のコメント参照");
+static_assert(sizeof(Rec) == 125, "FlightLog::Rec のサイズが変わった。上のコメント参照");
 
 // ---- 列名 (唯一の一覧) ----------------------------------------------------
 //  scripts/logger.py が "HEADER," の後ろをそのまま CSV の1行目に使い、
@@ -142,7 +157,10 @@ constexpr char HEADER[] =
     // --- 2026-09-07: 加速度Z×測距の相補フィルタ (quad/AltEstimator.h)。
     //     ALT_USE_ACC_FUSION=false の間は制御に未使用、記録のみ。
     //     est_vz が climb より何ms 速いかを analyze_alt_pid.py が判定する。
-    "acc_up,est_h,est_vz,est_bias";
+    "acc_up,est_h,est_vz,est_bias,"
+    // --- 2026-09-12: GUIDED 診断用。地上局からの上り指令とスイッチ生値 ---
+    //     sw_hover は mode 列から逆算できるので出さない。sw_auto だけ追加。
+    "guided_engaged,sw_auto,cmd_req,cmd_age_ms,cmd_vx,cmd_vy,cmd_alt_cm";
 
 // ============================================================
 //  formatRow  -  Rec を CSV 1 行にする「唯一のフォーマッタ」
@@ -170,7 +188,8 @@ inline void formatRow(Print& out, const Rec& r, bool with_prefix = true) {
         "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f,"
         "%.3f,"
         "%.4f,%.4f,%.4f,"
-        "%.3f,%.3f,%.3f,%.3f\n",
+        "%.3f,%.3f,%.3f,%.3f,"
+        "%d,%d,%u,%u,%.3f,%.3f,%.1f\n",
         (unsigned long)r.t_ms, (unsigned long)r.dt_us, (int)r.mode,
         (r.flags & RF_ARMED) ? 1 : 0, r.thr / 250.0f,
         r.roll_stick / 100.0f, r.pitch_stick / 100.0f, r.yaw_stick / 100.0f,
@@ -198,7 +217,10 @@ inline void formatRow(Print& out, const Rec& r, bool with_prefix = true) {
         r.alt_used / 250.0f,
         r.accx / 1000.0f, r.accy / 1000.0f, r.accz / 1000.0f,
         r.acc_up / 1000.0f, r.est_h / S5T::SC_MM,
-        r.est_vz / S5T::SC_MM, r.est_bias / 1000.0f);
+        r.est_vz / S5T::SC_MM, r.est_bias / 1000.0f,
+        (r.flags & RF_GUIDED_ENGAGED) ? 1 : 0, (r.flags & RF_SW_AUTO_UP) ? 1 : 0,
+        (unsigned)r.cmd_req, (unsigned)r.cmd_age_ms,
+        r.cmd_vx_mmps / S5T::SC_MM, r.cmd_vy_mmps / S5T::SC_MM, (float)r.cmd_alt_cm);
 }
 
 // ============================================================
@@ -246,184 +268,5 @@ inline void sample(const Rec& r) {
 
 } // namespace Usb
 
-// ============================================================
-//  Ram  -  スロットル投入時だけ本体 RAM に 500Hz で記録し、
-//          着陸後に USB へまとめて吐き出す (シリアル 'v')
-// ============================================================
-//  Usb:: は「USB を挿しっぱなしのベンチ試験」専用だった。実飛行は USB を
-//  挿せないので、s5 解析テレメトリ (IM920SL, 7.5〜15Hz) しか手段が無く、
-//  姿勢ループの発振や離陸直後の転倒は追えなかった。
-//
-//  この機体の飛行は毎回 5 秒に満たない。それなら 500Hz のフル解像度の
-//  ログを「本体の RAM に溜めておいて、着陸後に USB を挿してから吐き出す」
-//  ほうが無線よりずっと濃い情報が手に入る。Teensy 4.0 の RAM (1024KB) の
-//  うち、これは DMAMEM 領域 (OCRAM2, 512KB) に確保するので、通常の変数や
-//  スタックとは競合しない。
-//
-//  ★ RAM は揮発性。着陸後、バッテリーを抜く前に USB を挿して 'v' で
-//    ダンプすること。ここで作った内容は電源を切ると消える。
-//    (SD が使えるなら SdLog のほうが時間制限が無くて楽)
-//
-//  トリガ方式 (2026-09-05〜):
-//    アーム中に thr が THR_GATE (既定 0.20) を「上に横切った瞬間」をトリガとし、
-//    そこから SECONDS 秒間 (既定8秒) は thr の増減を無視して録り続ける。
-//    止まるのはディスアーム or 8秒経過のどちらか。オシロのシングルショット。
-//    (旧方式は thr が一瞬でも 0.20 を割ると記録を止めて凍結し、次に 0.20 を
-//     超えた瞬間に録り直していたため、ホバリング中の一瞬のスロットル低下だけで
-//     それより前の穏やかな区間が消えてしまっていた)
-namespace Ram {
-
-// スロットルがこれを超えている間だけ記録する。地面で粘っている待機時間や
-// 着陸後の惰性回転を録っても仕方が無いので、飛行に関係する区間だけに絞る。
-constexpr float    THR_GATE = 0.20f;
-// 何秒ぶん持つか。500Hz x 8秒 x 116B ≒ 464KB (OCRAM2 512KBに収まる)。
-// RAM2 が足りなくなったら、まずここを 8 -> 6 に減らす (~116KB 空く)。
-constexpr uint32_t SECONDS  = 8;
-constexpr uint32_t CAPACITY = SECONDS * LOG_HZ;   // 4000
-
-// OCRAM2 (DMAMEM) に置く。RAM1 (スタック/大半の変数) と競合しない。
-DMAMEM static Rec buf[CAPACITY];
-
-static uint32_t head          = 0;      // 次に書く位置
-static uint32_t count         = 0;      // 埋まっている行数 (CAPACITY で頭打ち)
-static bool     wrapped       = false;  // CAPACITY を超えて上書きが始まったか
-static bool     recording     = false;
-static bool     armed_and_triggered = false;  // このアームセッションで既にトリガ済みか
-static uint32_t session_start_ms = 0;   // トリガがかかった瞬間の millis()
-static bool     last_armed    = false;  // 直近 tick() が見た値 (status 表示用)
-static float    last_thr      = 0.0f;
-static bool     manual_trigger = false; // ベンチ検証用の手動トリガ中か (armed 不問)
-
-inline void resetBuffer() { head = 0; count = 0; wrapped = false; }
-
-// ★ ベンチ検証用の手動トリガ (シリアル 'n')。
-//   通常のトリガは armed && thr>0.20 が条件だが、加速度Z相補フィルタの
-//   検証(機体を手で動かして accx/y/z + roll/pitch を見る)はモーターを
-//   回さない・アームもしない状態でやりたい。これを呼ぶと armed/thr に
-//   関係なく即座に8秒間の記録を開始する。
-//   manual_trigger 中は「ディスアームで止める」判定を無視し、8秒経過
-//   だけで止める (armed=false のままなので通常の停止条件だと 1tick も
-//   録れずに終わってしまうため)。
-inline void forceTrigger() {
-    resetBuffer();
-    recording        = true;
-    manual_trigger   = true;
-    session_start_ms = millis();
-    Serial.println("RamLog: 手動トリガ。8秒間記録します (armed/スロットル不問)");
-}
-
-// トリガ状態機械だけを進める。記録するかどうかは recording を見て呼び出し側が決める。
-// ★ 2026-09-06 バグ修正: 旧コードは「8秒経過で recording=false」の直後、
-//   まだ armed && thr>0.20 (= ホバリング中) だと次の tick で
-//   trigger && !recording が再び真になり resetBuffer() が走って
-//   バッファを 0 に消していた。8秒より長くホバリングして着陸すると
-//   'v' で "記録がありません" になるのはこれが原因。armed_and_triggered
-//   ラッチを追加し、ディスアームするまで 1 アームセッションにつき
-//   1 回しかトリガしないようにしてある。
-//
-// gate: 呼び出し側が渡す追加のトリガ条件 (既定 true)。
-//   フロー試験では「SW_HOVER=up (POSHOLD) の間だけ録りたい」。gate に
-//   その条件を渡すと、ANGLE で離陸 → 上空で POSHOLD に入れた瞬間から
-//   8 秒を録れる (地上待機や離陸上昇でバッファを食い潰さない)。
-//   gate が false に戻っても記録は 8 秒 or ディスアームまで続く
-//   (トリガは「gate が true に立った瞬間」だけを見る。オシロと同じ)。
-inline void tick(bool armed, float thr, bool gate = true) {
-    last_armed = armed; last_thr = thr;        // status() 表示用
-
-    if (!armed) armed_and_triggered = false;   // ディスアームでラッチ解除
-
-    const bool trigger = armed && (thr > THR_GATE) && gate && !armed_and_triggered;
-
-    if (trigger && !recording) {
-        // 新しい記録セッションのトリガ。前回ぶんは上書きされて消える。
-        resetBuffer();
-        recording           = true;
-        armed_and_triggered = true;
-        manual_trigger      = false;   // 通常トリガなので手動フラグは下ろす
-        session_start_ms    = millis();
-    }
-
-    if (recording) {
-        const bool elapsed = (millis() - session_start_ms) >= (SECONDS * 1000UL);
-        // 手動トリガ中は armed を無視 (ベンチ検証はそもそも disarm のまま)。
-        const bool stop_by_disarm = !manual_trigger && !armed;
-        if (stop_by_disarm || elapsed) {
-            // ディスアーム、または8秒経過 → 記録を止めて凍結する。
-            // 再トリガはディスアーム後の次のスロットル投入まで起きない
-            // (armed_and_triggered ラッチ)。バッファは残すので 'v' でダンプ可。
-            recording = false;
-        }
-    }
-}
-
-// 記録中なら 1 行積む。リングなので満杯になったら古いものから上書き。
-inline void push(const Rec& r) {
-    if (!recording) return;
-    buf[head] = r;
-    head = (head + 1) % CAPACITY;
-    if (count < CAPACITY) ++count;
-    else wrapped = true;
-}
-
-inline void status() {
-    const float secs = (float)count / (float)LOG_HZ;
-    Serial.printf("RamLog: %s  %lu 行 (%.1f 秒)%s  容量 %lu 行 (%lu 秒)\n",
-                  recording ? "記録中" : (count ? "停止(ダンプ待ち)" : "空"),
-                  (unsigned long)count, secs, wrapped ? " [満杯/上書き済]" : "",
-                  (unsigned long)CAPACITY, (unsigned long)SECONDS);
-    // 空のときに「なぜ録れていないか」を切り分けられるよう、トリガ条件の
-    // 現在値を出す。armed=1 かつ thr>0.20 なのに count=0 なら別の問題。
-    Serial.printf("        [trig条件] armed=%d  thr=%.2f (gate %.2f)  "
-                  "既トリガ=%d  recording=%d\n",
-                  last_armed ? 1 : 0, last_thr, THR_GATE,
-                  armed_and_triggered ? 1 : 0, recording ? 1 : 0);
-}
-
-// ダンプ中は制御ループが数十ms〜数百ms止まる。着陸後にしか呼ばないこと
-// (handleSerial は main_tick の後に呼ばれているので、ここでブロックしても
-//  無線テレメトリと違って「今まさに飛んでいる」状態では想定していない)。
-inline void dump() {
-    if (recording) {
-        Serial.println("!! まだ記録中です (スロットルを下げるかディスアームしてから 'v')");
-        return;
-    }
-    if (count == 0) {
-        Serial.println("RamLog: 記録がありません (スロットル > "
-                       "THR_GATE でアームして飛ばすと記録されます)");
-        return;
-    }
-
-    status();
-    Serial.println();
-    Serial.print("HEADER,"); Serial.println(HEADER);
-    Serial.println("LOG_START");
-
-    const uint32_t start = wrapped ? head : 0;   // 最古の位置
-    for (uint32_t i = 0; i < count; ++i) {
-        // ★ 2026-09-06: ダンプのペーシング (弱め)。
-        //   dump() は約4000行(≈1.3MB)をフロー制御なしで一気に吐いていた。
-        //   PC (logger.py) が追いつかず Windows/pyserial の受信バッファが
-        //   溢れて「行が丸ごと消える」現象が出ていた (log_028/030 の "欠損"
-        //   は全てこれ。ループ停止ではない)。
-        //   ★ Serial.flush() を毎回入れると、PC 側が読んでいない状態で
-        //     無限に固まる (= 状態表示が止まる "取れなくなった")。なので
-        //     ブロックしない availableForWrite() の様子見だけにする。
-        //     根本の受信取りこぼし対策は PC 側 (logger.py の一括読み) で行う。
-        if ((i & 31) == 0) {
-            uint32_t guard = 0;
-            // 空きが戻るまで様子見。ただし最大 ~15ms で必ず抜ける
-            // (PC が全く読んでいなくても固まらない)。通常は 1ms 未満で復帰。
-            while (Serial.availableForWrite() < 400 && guard++ < 300) {
-                delayMicroseconds(50);
-            }
-        }
-        formatRow(Serial, buf[(start + i) % CAPACITY], /*with_prefix=*/true);
-    }
-
-    Serial.println("LOG_STOP");
-    Serial.printf("INFO: RamLog %lu 行をダンプしました\n", (unsigned long)count);
-}
-
-} // namespace Ram
 
 } // namespace FlightLog

@@ -27,7 +27,9 @@ from pathlib import Path
 # v2 (2026-09-09): accx/accy/accz の量子化スケール SC_1E4(1e4) -> 1000。
 #   ±8g 化で acc_z が [-10,+6] を取りうるようになったため。v1 の BIN は
 #   --force で吸えるが accx/accy/accz が 10 倍ずれるので注意。
-REC_VER = 2
+# v3 (2026-09-12): GUIDED 診断用に cmd_req/cmd_age_ms/cmd_vx_mmps/cmd_vy_mmps/
+#   cmd_alt_cm を末尾に追加。flags に RF_GUIDED_ENGAGED/RF_SW_AUTO_UP を追加。
+REC_VER = 3
 
 # QuadConfig.h の Q::ALT_HOVER_THR。alt_base 列に使う (機体側 formatRow と同じ)。
 # ここは実機の設定とずれることがある。--hover-thr で上書きできる。
@@ -56,6 +58,8 @@ _FIELDS = [
     ("B", "alt_thr_out"), ("B", "alt_used"),
     ("h", "accx"), ("h", "accy"), ("h", "accz"),
     ("h", "acc_up"), ("h", "est_h"), ("h", "est_vz"), ("h", "est_bias"),
+    ("B", "cmd_req"), ("H", "cmd_age_ms"),
+    ("h", "cmd_vx_mmps"), ("h", "cmd_vy_mmps"), ("h", "cmd_alt_cm"),
 ]
 _REC_STRUCT = struct.Struct("<" + "".join(c for c, _ in _FIELDS))
 _NAMES = [n for _, n in _FIELDS]
@@ -77,12 +81,14 @@ HEADER = (
     "alt_base,alt_corr,alt_thr,"
     "alt_used,"
     "accx,accy,accz,"
-    "acc_up,est_h,est_vz,est_bias"
+    "acc_up,est_h,est_vz,est_bias,"
+    "guided_engaged,sw_auto,cmd_req,cmd_age_ms,cmd_vx,cmd_vy,cmd_alt_cm"
 )
 
 # flags のビット (RamLog::RFlag)
-RF_ARMED, RF_FLOW_OK, RF_RANGE_OK, RF_ALT_EN, RF_ALT_ACT, RF_HOLDING = (
-    1 << 0, 1 << 1, 1 << 2, 1 << 3, 1 << 4, 1 << 5)
+(RF_ARMED, RF_FLOW_OK, RF_RANGE_OK, RF_ALT_EN, RF_ALT_ACT, RF_HOLDING,
+ RF_GUIDED_ENGAGED, RF_SW_AUTO_UP) = (
+    1 << 0, 1 << 1, 1 << 2, 1 << 3, 1 << 4, 1 << 5, 1 << 6, 1 << 7)
 
 
 def _row(rec, hover_thr):
@@ -94,6 +100,8 @@ def _row(rec, hover_thr):
     alt_en  = 1 if f & RF_ALT_EN   else 0
     alt_act = 1 if f & RF_ALT_ACT  else 0
     holding = 1 if f & RF_HOLDING  else 0
+    guided_engaged = 1 if f & RF_GUIDED_ENGAGED else 0
+    sw_auto        = 1 if f & RF_SW_AUTO_UP     else 0
     alt_base = hover_thr if alt_act else 0.0
 
     # 機体側 formatRow() と同じ桁数で並べる (analyze_log.py は列名参照なので
@@ -126,6 +134,9 @@ def _row(rec, hover_thr):
         f'{d["accx"]/1000:.4f}', f'{d["accy"]/1000:.4f}', f'{d["accz"]/1000:.4f}',
         f'{d["acc_up"]/1000:.3f}', f'{d["est_h"]/1000:.3f}',
         f'{d["est_vz"]/1000:.3f}', f'{d["est_bias"]/1000:.3f}',
+        guided_engaged, sw_auto, d["cmd_req"], d["cmd_age_ms"],
+        f'{d["cmd_vx_mmps"]/1000:.3f}', f'{d["cmd_vy_mmps"]/1000:.3f}',
+        f'{d["cmd_alt_cm"]:.1f}',
     ])
 
 

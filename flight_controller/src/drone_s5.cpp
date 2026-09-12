@@ -741,6 +741,18 @@ static void fillRec(FlightLog::Rec& r, uint32_t dt_us, int mode, bool armed, flo
     r.est_h    = S5T::q16(altest.heightM(),  S5T::SC_MM);
     r.est_vz   = S5T::q16(altest.climbMps(), S5T::SC_MM);
     r.est_bias = S5T::q16(altest.biasMps2(), 1000.0f);
+
+    // 2026-09-12: GUIDED 診断用。地上局からの最後の上り指令とスイッチ生値。
+    if (g_guided_engaged)                       f |= FlightLog::RF_GUIDED_ENGAGED;
+    if (S5::USE_SBUS && sbus.Ch_state(Ch::SW_AUTO) == up) f |= FlightLog::RF_SW_AUTO_UP;
+    r.flags = f;
+
+    const S5C::CmdFrame& c = s5rx.last();
+    r.cmd_req      = c.req;
+    r.cmd_age_ms   = (uint16_t)constrain(s5rx.ageMs(), 0u, 65535u);
+    r.cmd_vx_mmps  = c.vx_mmps;
+    r.cmd_vy_mmps  = c.vy_mmps;
+    r.cmd_alt_cm   = c.alt_cm;
 }
 
 
@@ -1501,11 +1513,17 @@ static void updateAltHold(float dt_s) {
 //        指令が消えて暴走する経路は存在しない (指令 0 = ホールド)。
 // ------------------------------------------------------------
 static void guidedDisengage(const char* why) {
+    // ★ 2026-09-12: 以前はここが if(g_guided_engaged) の中だけだったので、
+    //   「一度も engage していない (=まだ資格を満たしたことがない)」間は
+    //   g_guided_why が更新されず、画面の「直前の解除理由」が空のままだった。
+    //   スイッチは全部合っているのに理由が出ない、という混乱の元だったので、
+    //   理由の記録だけは常に行う。ログ行の出力 (Serial.printf) は
+    //   engage->disengage の遷移時だけに絞り、1000Hz でスパムしない。
     if (g_guided_engaged) {
         g_guided_engaged = false;
-        g_guided_why     = why;
         Serial.printf("\n>>> GUIDED 解除: %s\n", why);
     }
+    g_guided_why    = why;
     g_gp            = GP_OFF;
     g_guided_vx     = 0.0f;
     g_guided_vy     = 0.0f;
@@ -2086,25 +2104,6 @@ static void handleSerial() {
             // 500Hz ログの開始/停止 (USB 直結時のみ)。scripts/logger.py と対で使う。
             FlightLog::Usb::toggle();
             break;
-        case 'v':
-            // RAM ログ (実飛行中に自動記録した分) を USB へダンプする。
-            // 記録中 (スロットルがまだ THR_GATE を超えている) なら
-            // 拒否メッセージを出すだけで安全に呼べる。
-            FlightLog::Ram::dump();
-            break;
-        case 'y':
-            // RAM ログの状態だけ見る (何行溜まっているか)。ダンプはしない。
-            FlightLog::Ram::status();
-            break;
-        case 'n':
-            // RAM ログの手動トリガ。armed/スロットル不問で 8 秒録る。
-            //  ★ 2026-09-09: forceTrigger() は前から定義されていたのに
-            //    switch に case が無く、'n' を押しても何も起きなかった
-            //    (関数のコメントは「'n' キーでこれを呼ぶ」と書いてあった)。
-            //  加速度Z相補フィルタのベンチ検証など、モーターを回さず
-            //  機体を手で動かして録りたいときに使う。録った後は 'v' でダンプ。
-            FlightLog::Ram::forceTrigger();
-            break;
         case 'w':
             // 原因調査用: ループが異常に長くかかった回の内訳をダンプする。
             StallLog::dump();
@@ -2201,6 +2200,12 @@ static void printStatus(uint32_t dt_us) {
         //    good が増えないなら無線かパケット定義。badver なら S5Cmd.h が
         //    機体側と地上側でずれている。badcs が増えるなら電波が弱い。
         if (Q::GUIDED_ENABLE) {
+            // ★ GUIDED に入らないときの切り分け用。SW_HOVER は mode 表示から
+            //   だいたい逆算できるが、SW_AUTO の生値はここでしか見えない。
+            auto swName = [](Sw s) { return s == up ? "up" : (s == cen ? "cen" : "down"); };
+            Serial.printf("SW    : SW_HOVER=%-4s SW_AUTO=%-4s\n",
+                          swName(sbus.Ch_state(Ch::SW_HOVER)),
+                          swName(sbus.Ch_state(Ch::SW_AUTO)));
             Serial.printf("CMD   rx: good=%lu lost=%lu badcs=%lu badlen=%lu badver=%lu  "
                           "RSSI=%d %s\n",
                           (unsigned long)s5rx.nGood(),  (unsigned long)s5rx.nLost(),
@@ -2223,7 +2228,7 @@ static void printStatus(uint32_t dt_us) {
                           g_guided_engaged ? "ENGAGED" : "----   ",
                           PH[(int)g_gp], g_guided_vx, g_guided_vy,
                           g_guided_alt_m, g_guided_slew,
-                          (!g_guided_engaged && g_guided_why[0]) ? "  直前の解除理由: " : "",
+                          (!g_guided_engaged && g_guided_why[0]) ? "  入れない/直前の解除理由: " : "",
                           (!g_guided_engaged && g_guided_why[0]) ? g_guided_why : "");
         }
     }
@@ -2357,7 +2362,7 @@ static void printStatus(uint32_t dt_us) {
     }
 
     Serial.println("\n[p]ゲイン [k]IMUキャリブ(EEPROM保存) [x]キャリブ消去 [r]PIDリセット "
-                   "[l]ログ(USB直結時) [n]RAMログ手動トリガ [v]RAMログdump [y]RAMログ状態 "
+                   "[l]ログ(USB直結時) "
                    "[w]停止調査ログdump "
                    "[z]フロー積算ゼロ "
                    "[h]フロー高度(手動) [g]高度ホールド切替 [i]I2Cスキャン [m]ドライラン切替 "
@@ -2674,33 +2679,20 @@ void loop() {
         s_link_was_armed = armed_now;
     }
 
-    // --- 500Hz ログ: 1 レコードを作って USB / RAM / SD の 3 つへ配る --------
-    //  ★ 2026-09-09: 以前は Log::sample() が USB 用に独自の printf を持ち、
-    //    RamLog::update() と SD 用にそれぞれ fillRec() を呼んでいた
-    //    (= 同じ 1 行ぶんの量子化を 2 回、printf 書式は 2 本)。
-    //    Rec を 1 個だけ作って配る形に統一した。書式は
-    //    FlightLog::formatRow() の 1 本だけになり、USB と SD のログは
-    //    完全に同じ内容になる (USB 側も量子化を通るようになった。
-    //    角度 0.01deg / 角速度 0.1dps / 出力 1/250 の分解能で、解析には十分)。
+    // --- 500Hz ログ: 1 レコードを作って USB / SD / LogLink へ配る -----------
+    //  ★ 2026-09-09: Rec を 1 個だけ作って配る形に統一 (USB/SDで二重に
+    //    量子化していたのをやめた)。2026-09-12: 本体RAMバッファ(旧 Ram::)
+    //    は廃止し、SdLog に一本化した。
     {
         static int s_log_div = 0;
         if (++s_log_div >= FlightLog::DIV) {
             s_log_div = 0;
-            // RAM トリガの追加ゲート。フロー試験時 (USE_FLOW=true) は
-            //  「SW_HOVER=up = フロー水平ホールドに入れた瞬間」からの 8 秒を
-            //  録る。ANGLE で離陸してから上空でスイッチを上げるので、
-            //  地上待機や上昇でバッファを食い潰さずに済む。
-            //  SD 運用 (USE_FLOW=false) では従来どおり thr>0.20 だけで録る。
-            const bool ram_gate = !S5::USE_FLOW
-                                || sbus.Ch_state(Ch::SW_HOVER) == up;
-            FlightLog::Ram::tick(armed_now, thr_now, ram_gate);   // トリガ状態機械 (軽い)
             // どのシンクも動いていなければ量子化そのものを省く
-            if (FlightLog::Usb::active || FlightLog::Ram::recording ||
+            if (FlightLog::Usb::active ||
                 SdLog::recording() || LogLink::recording()) {
                 FlightLog::Rec r;
                 fillRec(r, main_tick.dt_us, (int)g_mode, armed_now, thr_now);
                 FlightLog::Usb::sample(r);   // 'l' 中のみ。USB が詰まっていたら捨てる
-                FlightLog::Ram::push(r);     // 記録中のみ
                 SdLog::push(&r, sizeof(r));  // アーム中のみ (中で recording を見る)
                 LogLink::push(&r, sizeof(r)); // 同上。RP2040 ロガーへ
             }

@@ -27,7 +27,7 @@
 //                  u16 rec_size | u16 rate_hz | u32 t0_ms | 残り 0 埋め
 //    [rec_size バイトのレコード] × N        (中身は呼び出し側の構造体そのまま)
 //
-//  ★ レコード構造体 (RamLog::Rec) の列を足したら RamLog::REC_VER を +1 する。
+//  ★ レコード構造体 (FlightLog::Rec) の列を足したら FlightLog::REC_VER を +1 する。
 //    scripts/bin2csv.py は rec_size / rec_ver 不一致を弾く。
 // ============================================================
 #pragma once
@@ -43,9 +43,9 @@ namespace SdLog {
 
 // ---- チューニング定数 --------------------------------------------------
 constexpr uint8_t  FMT_VER    = 1;
-// DMAMEM(RAM2, 512KB)に置く。RamLog::buf が同じ RAM2 を ~480KB 使っているので
-// 残りは僅か。32KB で約 0.6 秒ぶん (Rec≈120B × 500Hz) のカード停止を吸収できる。
-// RAM2 が足りなくなったら、まず RamLog::RAMLOG_SECONDS を減らす (8→6 で ~120KB空く)。
+// DMAMEM(RAM2, 512KB)に置く。2026-09-12 に本体RAMへの飛行中バッファリング
+// (旧 FlightLog::Ram) を廃止したので、RAM2 はほぼこのリングバッファ専用。
+// 32KB で約 0.6 秒ぶん (Rec≈125B × 500Hz) のカード停止を吸収できる。
 constexpr size_t   RING_BYTES = 32u * 1024u;
 constexpr size_t   MAX_WRITE  = 2u * 1024u;    // service() 1回で書く上限 [byte]
 constexpr size_t   SECTOR     = 512u;

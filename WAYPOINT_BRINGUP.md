@@ -79,9 +79,11 @@ GUIDED 中でも、以下はすべて生きている。上から順に強い。
 
 ### プロポの割り当て
 
-`SW_AUTO` は **ch9**（`flight_controller/include/Config.h` の `enum Ch`）。
-2ポジションスイッチを ch9 に割り当てる。`SW_HOVER` は ch8（3ポジション）、
+`SW_AUTO` は **ch6**（`flight_controller/include/Config.h` の `enum Ch`）。
+2ポジションスイッチを ch6 に割り当てる。`SW_HOVER` は ch8（3ポジション）、
 `THR_CUT` は ch7 のまま。
+（2026-09-12 追記: 当初 ch9 だったが、プロポ側で ch9 に割り当てられない
+　ため ch6（未使用だった `SW_LEVEL` 枠）に変更した。）
 
 > ⚠️ **スイッチの「上」がどちらかは、プロポの設定とリバース次第で逆になる。**
 > コードの `up` は SBUS の生値が小さい側（`Ch_state()` は `des < -0.25` で `up`）。

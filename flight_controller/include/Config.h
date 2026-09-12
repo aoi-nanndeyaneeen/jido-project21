@@ -63,10 +63,12 @@ enum Sw { up, cen, down };
 enum Ch {
     ROLL, PITCH, THR, YAW,   // ch1-4
     SW_TURN,                 // ch5  左旋回スイッチ
-    SW_LEVEL,                // ch6  水平飛行スイッチ
+    SW_AUTO,                 // ch6  地上局(自律制御)コマンド有効化スイッチ (旧SPARE1)
+                              //      ★ プロポの都合で ch9 から ch6 (旧 SW_LEVEL 枠) に変更。
+                              //        SW_LEVEL / SW_TURN は drone_s5.cpp では未使用 (封印済み)。
     THR_CUT,                 // ch7  スロットルカット
     SW_HOVER,                // ch8  ホバリング(セミマニュアル)スイッチ
-    SW_AUTO,                 // ch9  地上局(自律制御)コマンド有効化スイッチ (旧SPARE1)
+    SW_LEVEL,                // ch9  水平飛行スイッチ (未使用。旧 SW_AUTO 枠)
     SPARE2                   // ch10 未使用
 };
 
