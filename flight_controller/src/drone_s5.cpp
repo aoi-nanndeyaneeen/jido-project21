@@ -1537,6 +1537,51 @@ static void guidedDisengage(const char* why) {
     g_touch_since_ms = 0;
 }
 
+static void applyGuidedCommand(const S5C::CmdFrame& c, uint32_t now) {
+    if (c.flags & S5C::CF_POS_CORR) {
+        poshold.correctPosition((float)c.corr_n_mm / S5C::SC_MM,
+                                (float)c.corr_e_mm / S5C::SC_MM);
+    }
+
+    const float cmd_alt = (c.alt_cm > 0) ? (float)c.alt_cm / S5C::SC_CM : 0.0f;
+    switch (c.req) {
+        case S5C::REQ_TAKEOFF:
+            g_gp = GP_TAKEOFF;
+            g_guided_vx = g_guided_vy = 0.0f;
+            if (cmd_alt > 0.0f) g_guided_alt_m = cmd_alt;
+            g_guided_slew = Q::GUIDED_TAKEOFF_SLEW_MPS;
+            break;
+
+        case S5C::REQ_GUIDED:
+            g_gp = GP_CRUISE;
+            g_guided_vx = constrain((float)c.vx_mmps / S5C::SC_MMPS,
+                                    -Q::GUIDED_MAX_VEL, Q::GUIDED_MAX_VEL);
+            g_guided_vy = constrain((float)c.vy_mmps / S5C::SC_MMPS,
+                                    -Q::GUIDED_MAX_VEL, Q::GUIDED_MAX_VEL);
+            if (cmd_alt > 0.0f) g_guided_alt_m = cmd_alt;
+            g_guided_slew = Q::GUIDED_CRUISE_SLEW_MPS;
+            break;
+
+        case S5C::REQ_LAND:
+            if (g_gp != GP_LAND) {
+                g_gp = GP_LAND;
+                g_land_start_ms = now;
+                g_touch_since_ms = 0;
+                Serial.println("\n>>> GUIDED 自動着陸を開始");
+            }
+            break;
+
+        case S5C::REQ_HOLD:
+        case S5C::REQ_ABORT:
+        case S5C::REQ_IDLE:
+        default:
+            if (g_gp == GP_CRUISE || g_gp == GP_TAKEOFF) g_gp = GP_HOLD;
+            g_guided_vx = g_guided_vy = 0.0f;
+            g_guided_slew = Q::GUIDED_CRUISE_SLEW_MPS;
+            break;
+    }
+}
+
 static void updateGuided() {
     if (!Q::GUIDED_ENABLE) { g_guided_engaged = false; g_gp = GP_OFF; return; }
 
@@ -1600,51 +1645,7 @@ static void updateGuided() {
     } else {
         // --- 3) 新鮮な指令に従う -------------------------------------
 
-        // 位置補正 (req に関係なく、フラグが立っていれば毎回適用)。
-        //  ★ GUIDED 巡航中は PositionHold 側で実質無効化される
-        //    (correctPosition() のコメント参照)。ここでは無条件に渡すだけでよい。
-        if (c.flags & S5C::CF_POS_CORR) {
-            poshold.correctPosition((float)c.corr_n_mm / S5C::SC_MM,
-                                    (float)c.corr_e_mm / S5C::SC_MM);
-        }
-
-        const float cmd_alt = (c.alt_cm > 0) ? (float)c.alt_cm / S5C::SC_CM : 0.0f;
-        switch (c.req) {
-            case S5C::REQ_TAKEOFF:
-                if (g_gp != GP_TAKEOFF) { g_gp = GP_TAKEOFF; }
-                g_guided_vx = g_guided_vy = 0.0f;
-                if (cmd_alt > 0.0f) g_guided_alt_m = cmd_alt;
-                g_guided_slew = Q::GUIDED_TAKEOFF_SLEW_MPS;
-                break;
-
-            case S5C::REQ_GUIDED:
-                g_gp = GP_CRUISE;
-                g_guided_vx = constrain((float)c.vx_mmps / S5C::SC_MMPS,
-                                        -Q::GUIDED_MAX_VEL, Q::GUIDED_MAX_VEL);
-                g_guided_vy = constrain((float)c.vy_mmps / S5C::SC_MMPS,
-                                        -Q::GUIDED_MAX_VEL, Q::GUIDED_MAX_VEL);
-                if (cmd_alt > 0.0f) g_guided_alt_m = cmd_alt;
-                g_guided_slew = Q::GUIDED_CRUISE_SLEW_MPS;
-                break;
-
-            case S5C::REQ_LAND:
-                if (g_gp != GP_LAND) {
-                    g_gp            = GP_LAND;
-                    g_land_start_ms = now;
-                    g_touch_since_ms = 0;
-                    Serial.println("\n>>> GUIDED 自動着陸を開始");
-                }
-                break;
-
-            case S5C::REQ_HOLD:
-            case S5C::REQ_ABORT:
-            case S5C::REQ_IDLE:
-            default:
-                if (g_gp == GP_CRUISE || g_gp == GP_TAKEOFF) g_gp = GP_HOLD;
-                g_guided_vx = g_guided_vy = 0.0f;
-                g_guided_slew = Q::GUIDED_CRUISE_SLEW_MPS;
-                break;
-        }
+        applyGuidedCommand(c, now);
     }
 
     // --- 4) 着陸フェーズの面倒を見る --------------------------------
