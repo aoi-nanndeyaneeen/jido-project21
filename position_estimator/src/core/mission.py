@@ -123,7 +123,9 @@ class WaypointMission:
     #    離陸した瞬間に全WPが到達済みになり、一度も移動しないまま帰投する。
     ARRIVE_R_M   = 0.20    # 水平 [m]
     ARRIVE_Z_M   = 0.20    # 高度 [m]
-    DWELL_S      = 2.0     # 到達後ここで静止する時間 [s]
+    # ★ 2026-09-14: 「1秒保持できたら成功」という定義に合わせて 2.0 -> 1.0 に短縮。
+    #   問題が出るようなら伸ばす (WAYPOINT_BRINGUP.md 参照)。
+    DWELL_S      = 1.0     # 到達後ここで静止する時間 [s] = ミッション成功の定義
 
     # 離陸
     # ★ 2026-09-12: ここが config.MISSION_TAKEOFF_ALT_M と独立に 1.00 で
@@ -162,6 +164,10 @@ class WaypointMission:
         self.phase = Phase.IDLE
         self.wp_idx = 0
         self.reason = ""
+        # 実際に巡回する経路。start() のたびに組み直す (TAKEOFF_ALT_M が
+        # コンストラクタの後に上書きされることがあるため)。index 0 は必ず
+        # フィールド中心 (0,0)。理由は start() のコメント参照。
+        self._path = [(0.0, 0.0, self.TAKEOFF_ALT_M)] + self.waypoints
 
         self._t_phase = 0.0
         self._t_start = 0.0
@@ -218,6 +224,12 @@ class WaypointMission:
         self.phase = Phase.ARMING
         self.wp_idx = 0
         self.reason = ""
+        # ★ 2026-09-14: 経路の先頭に必ずフィールド中心 (0,0) を挟む。
+        #   人が PosHold で任意の場所へ飛ばしてから GUIDED に切り替えても、
+        #   機体はまず中心へ戻ってから設定した経路 (self.waypoints) を
+        #   巡回する。「今どこにいるか分からないまま経路の1点目へ直行する」
+        #   より安全 (中心なら三方の壁から距離が最大になる)。
+        self._path = [(0.0, 0.0, self.TAKEOFF_ALT_M)] + self.waypoints
         self._returning = False
         self._t_phase = now
         self._t_start = now
@@ -431,8 +443,8 @@ class WaypointMission:
             dh = self._dist_h
             dz = abs(target[2] - h_agl)
             if dh < self.ARRIVE_R_M and dz < self.ARRIVE_Z_M:
-                label = "HOME" if self._returning else f"WP{self.wp_idx}"
-                self._say(f"{label} 到達 (残り {dh:.2f} m) -> {self.DWELL_S:.0f} 秒保持")
+                self._say(f"{self._label()} 到達 (残り {dh:.2f} m) -> "
+                          f"{self.DWELL_S:.0f} 秒保持")
                 self._goto(Phase.DWELL)
             return
 
@@ -449,13 +461,21 @@ class WaypointMission:
             return
 
     # ------------------------------------------------------------ 内部
+    def _label(self):
+        """今の目標を表す短い文字列 ("CENTER" / "WP0" / "HOME")。ログと音声(print)で共有する。"""
+        if self._returning:
+            return "HOME"
+        if self.wp_idx == 0:
+            return "CENTER"      # self._path[0] = (0,0) 固定
+        return f"WP{self.wp_idx - 1}"   # self.waypoints[0] が WP0
+
     def _target(self):
-        """今向かうべき点 (x, y, z)。全 WP を消化したら home へ。"""
-        if self._returning or self.wp_idx >= len(self.waypoints):
+        """今向かうべき点 (x, y, z)。全 WP (中心含む) を消化したら home へ。"""
+        if self._returning or self.wp_idx >= len(self._path):
             if self.home is not None:
                 return (self.home[0], self.home[1], self.TAKEOFF_ALT_M)
             return (0.0, 0.0, self.TAKEOFF_ALT_M)
-        return self.waypoints[self.wp_idx]
+        return self._path[self.wp_idx]
 
     def _advance(self):
         """保持が終わったので次へ進む。最後まで行ったら帰投 -> 着陸。"""
@@ -464,12 +484,12 @@ class WaypointMission:
             self._goto(Phase.LAND)
             return
         self.wp_idx += 1
-        if self.wp_idx >= len(self.waypoints):
+        if self.wp_idx >= len(self._path):
             self._returning = True
             self._say("全ウェイポイント消化 -> 離陸地点へ帰投")
         else:
-            wp = self.waypoints[self.wp_idx]
-            self._say(f"次は WP{self.wp_idx} "
+            wp = self._path[self.wp_idx]
+            self._say(f"次は {self._label()} "
                       f"({wp[0]:+.2f}, {wp[1]:+.2f}, {wp[2]:.2f})")
         self._goto(Phase.CRUISE)
 
@@ -647,8 +667,7 @@ class WaypointMission:
 
         s = f"{self.phase.value}"
         if self.phase in (Phase.CRUISE, Phase.DWELL):
-            label = "HOME" if self._returning else f"WP{self.wp_idx}"
-            s += f" -> {label}"
+            s += f" -> {self._label()}"
         if tgt is not None:
             s += f" ({tgt[0]:+.2f}, {tgt[1]:+.2f}, {tgt[2]:.2f})"
         if self._dist_h is not None:

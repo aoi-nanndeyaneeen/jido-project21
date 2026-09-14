@@ -447,15 +447,22 @@ MISSION_SQUARE_M = 0.80
 MISSION_YAW_MODE = "fixed"
 
 # ---- ミッションの自動開始 ---------------------------------------------
-#  True : 起動した時点でミッションを ARMING にしておき、機体が GUIDED に
-#         入った瞬間（= プロポのスイッチを上げて離陸した瞬間）に自動で走り出す。
-#         本番は離陸後に PC を触れないので、これが既定。
+#  True : プロポの SW_HOVER を GUIDED (up) に上げるたびに、ミッションを
+#         最初から (経路の先頭 = フィールド中心(0,0)) 自動で開始する。
+#         「[M] を押す」という操作自体を無くすのが目的:
+#         本番は離陸後に PC を触れない・触らせたくないので、これが既定。
+#         着陸後にもう一度飛ばしたいときも、スイッチを一度 cen/down へ
+#         戻してから up に入れ直すだけでよい (main_loop.py が GUIDED
+#         フラグの立ち上がりエッジを見て mission.start() を呼び直す)。
 #  False: [M] キーを押すまで何も送らない。
 #
 #  ★ ARMING 中に送るのは REQ_HOLD だけ。機体側は未アーム／フロー不良の
 #    あいだ GUIDED に入らない (drone_s5.cpp updateGuided) ので、
 #    置いてあるだけの機体が勝手に動くことはない。
-#  ★ 着陸まで終わったあと自動では再開しない。もう一度飛ばすには [M]。
+#  ★ エッジ検出にしてあるのは、GUIDED に入りっぱなしの間 (例: 着陸直後、
+#    まだ THR_CUT していない) に毎フレーム start() を呼んで、着陸完了の
+#    瞬間にまた離陸を始めてしまう事故を防ぐため。スイッチを上げ直す =
+#    パイロットが「次の便を飛ばす」と明示的に意思表示した、とみなす。
 MISSION_AUTOSTART = True
 
 # ---- 機体の自己位置に対するカメラ補正 ----------------------------------
@@ -487,19 +494,21 @@ POS_CORR_MAX_STEP_M = 0.4
 POS_CORR_TRACK_TOL_M = 0.15  # この範囲に収まっていれば「同じズレ」とみなす
 POS_CORR_CONFIRM_S   = 1.0   # この秒数、同じズレが続いたら補正してよいと判断する
 
-MISSION_WAYPOINTS = [(0.0, 1.0, MISSION_TAKEOFF_ALT_M)]   # Phase 5: 奥へ 1.0m だけ
-# ★ 軸は x(右) ではなく y(奥) を選んだ。FIELD_PROFILE="middle" は幅1.8m
-#   (半分0.9m) しかなく、x=1.0m だとフィールド半分を超えてしまう。
-#   奥行きは2.6m (半分1.3m) あるので y=1.0m なら0.3mの余裕が残る。
-# Phase 4 (WP なし。離陸 -> 帰投 -> 着陸だけ) に戻すときはこちら:
+# Phase 6: 1.8m x 2.6m フィールドでの正方形一周 (2026-09-14〜)。
+# 経路の先頭には core/mission.py が自動でフィールド中心 (0,0) を挟むので、
+# ここには中心を含めない。1周後に開始点へ戻ってくるよう最後にもう一度
+# 最初のコーナーを入れてある (ミッション5 = ミッション1)。
+MISSION_WAYPOINTS = [
+    ( 0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # ミッション1
+    ( 0.5,  0.5, MISSION_TAKEOFF_ALT_M),   # ミッション2
+    (-0.5,  0.5, MISSION_TAKEOFF_ALT_M),   # ミッション3
+    (-0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # ミッション4
+    ( 0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # ミッション5 (ミッション1と同一点で一周を閉じる)
+]
+# Phase 5 (中心から奥へ1点だけ) に戻すときはこちら:
+# MISSION_WAYPOINTS = [(0.0, 1.0, MISSION_TAKEOFF_ALT_M)]
+# Phase 4 (WP なし。離陸 -> 中心 -> 帰投 -> 着陸だけ) に戻すときはこちら:
 # MISSION_WAYPOINTS = []
-# 正方形(Phase 6〜)に戻すときはこちら:
-# MISSION_WAYPOINTS = [
-#     ( MISSION_SQUARE_M / 2, -MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
-#     ( MISSION_SQUARE_M / 2,  MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
-#     (-MISSION_SQUARE_M / 2,  MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
-#     (-MISSION_SQUARE_M / 2, -MISSION_SQUARE_M / 2, MISSION_TAKEOFF_ALT_M),
-# ]
 
 # ==========================================
 # ダミー飛行（カメラ未検出フォールバック）
