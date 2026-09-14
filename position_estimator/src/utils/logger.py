@@ -105,6 +105,11 @@ class MissionLogger(CsvLogger):
         # カメラの見立て (これを真値の基準として扱う)
         "Cam_X(m)", "Cam_Y(m)", "Cam_Z(m)", "Pos_Valid", "In_Dummy", "Residual(m)",
         "Yaw_deg", "Yaw_Valid", "Yaw_Src",
+        # 機体自身のyaw (アーム基準の相対方位) と、PCが仮定しているyawとの差。
+        # Yaw_Src=fixed のときにこれが 0 から離れていたら、機首はもう
+        # 「フィールド奥を向いている」という前提から外れている
+        # (2026-09-14: 複数回リトライの間に手動操作で30度以上ズレた事故)。
+        "Yaw_Device_deg", "Yaw_Mismatch_deg",
         # PC が実際に送った指令
         "Req", "Cmd_Vx(m/s)", "Cmd_Vy(m/s)", "Cmd_Alt(m)", "Flags",
         # 機体の状態
@@ -151,6 +156,14 @@ class MissionLogger(CsvLogger):
         mode = t.get("mode")
         mode_name = self.MODE_NAME.get(int(mode), str(mode)) if mode is not None else ""
 
+        # 機体自身のyaw (アーム基準の相対方位) と、PC想定yawとの差。
+        # yaw_src="camera" のときは別物 (機体側は絶対方位を持たない) なので
+        # 比較しない。fixed のときだけ意味がある。
+        dev_yaw = t.get("yaw")
+        yaw_mismatch = None
+        if dev_yaw is not None and yaw.get("src") != "camera" and yaw.get("deg") is not None:
+            yaw_mismatch = dev_yaw - yaw["deg"]
+
         self._writer.writerow([
             epoch, hms,
             m["phase"], m["phase_next"], m["wp_idx"], int(m["returning"]),
@@ -162,6 +175,7 @@ class MissionLogger(CsvLogger):
             int(bool(cam.get("valid"))), int(bool(cam.get("in_dummy"))),
             _f(cam.get("residual")),
             _f(yaw.get("deg"), 2), int(bool(yaw.get("valid"))), yaw.get("src", ""),
+            _f(dev_yaw, 1), _f(yaw_mismatch, 1),
             m["req"], _f(m["vx"]), _f(m["vy"]), _f(m["alt"]), m["flags"],
             mode_name,
             int(bool(t.get("armed"))), int(bool(t.get("guided"))),

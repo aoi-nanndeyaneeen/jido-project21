@@ -303,19 +303,27 @@ def run_main_loop(cam1, cam2,
                 #    "camera" : 使わない = 水平移動しない (安全側)
                 #  ★ ここを "camera" のままにすると、ヨー推定は機体が
                 #    動いていないと収束しないため、永久に動き出さない。
+                #  ★ 前提が崩れていないかの警告は mission.py 側が GUIDED に
+                #    入るたびに出す (2026-09-14: プログラム起動中1回だけの
+                #    警告だと、複数回リトライする間に手動操作で機首がズレて
+                #    いくのを見逃した)。ここでは yaw_src を渡すだけでよい。
                 m_yaw, m_yaw_valid = yaw_rad, (yaw_rad is not None)
+                yaw_src = "camera"
                 if not m_yaw_valid and MISSION_YAW_MODE == "fixed":
                     m_yaw = math.radians(YAW_INITIAL_ALIGN_DEG)
                     m_yaw_valid = True
+                    yaw_src = "fixed"
                     if not _warned_fixed_yaw[0]:
                         _warned_fixed_yaw[0] = True
                         print(f"[Mission] ヨー推定が未収束のため、初期アラインメント "
                               f"{YAW_INITIAL_ALIGN_DEG:+.1f}deg を機首方位として使います。"
-                              f"機首をフィールド奥(+y)へ向けたまま飛ばしてください")
+                              f"機首をフィールド奥(+y)へ向けたまま飛ばしてください "
+                              f"(GUIDEDに入るたびに機体側の実測yawと一緒に再警告します)")
 
                 mission.update(pos=P, yaw_rad=m_yaw,
                                pos_valid=pos_valid,
-                               yaw_valid=m_yaw_valid)
+                               yaw_valid=m_yaw_valid,
+                               yaw_src=yaw_src)
 
                 # ── ミッションログ ──────────────────────────────
                 #  PC の判断・カメラの見立て・機体の言い分を1行にまとめる。
@@ -341,8 +349,7 @@ def run_main_loop(cam1, cam2,
                     mission_log.write(
                         snap, cam, tel,
                         {"deg": None if m_yaw is None else math.degrees(m_yaw),
-                         "valid": m_yaw_valid,
-                         "src": "camera" if yaw_rad is not None else MISSION_YAW_MODE},
+                         "valid": m_yaw_valid, "src": yaw_src},
                         event=mission.take_event())
 
             # ── 自律制御コマンドをground_receiver経由でドローンへ送信 ──
