@@ -152,6 +152,7 @@ def run_main_loop(cam1, cam2,
         if not ble_tap.start():
             ble_tap = None
 
+    _prev_guided = [False]   # MISSION_AUTOSTART のエッジ検出用
     if GROUND_LINK_ENABLED:
         print()
         print("[INIT] 地上局 (XIAO / xiao_s5_log) へ接続中...")
@@ -164,12 +165,13 @@ def run_main_loop(cam1, cam2,
                                    + ".csv"))
             print(f"       ミッションログ: {mission_log.path.name}")
             if MISSION_AUTOSTART:
-                #  ★ 本番は離陸後に PC を触れない。起動時点で待機に入れておき、
-                #    プロポを GUIDED にして離陸した瞬間に走り出させる。
-                mission.start()
-                print("  [OK] 自動開始が有効です。プロポを GUIDED にして離陸すれば"
-                      "そのままミッションが走ります")
-                print("       ([X] で中断 / 着陸後にもう一度飛ばすなら [M])")
+                #  ★ ここでは start() しない。SW_HOVER を GUIDED (up) に
+                #    上げた瞬間 (= link.flag("guided") の立ち上がりエッジ)
+                #    をメインループ側で見て、そのたびに start() し直す。
+                #    プログラム起動時点ではまだ何も送らない (IDLE のまま)。
+                print("  [OK] 自動開始が有効です。プロポを GUIDED (SW_HOVERを上)"
+                      "にするたびにミッションが最初から走ります")
+                print("       ([X] で中断)")
             else:
                 print(f"  [OK] ミッション準備完了。[M] で開始します")
             for i, wp in enumerate(MISSION_WAYPOINTS):
@@ -293,6 +295,20 @@ def run_main_loop(cam1, cam2,
             #    同じフレームで「開始 -> 1回目の指令」まで進むので、
             #    キーを押してから機体が反応するまでの遅れが 1 フレームで済む。
             if mission is not None:
+                #  ── SW_HOVER を GUIDED (up) に上げた瞬間に自動で開始 ──
+                #  ★ 立ち上がりエッジだけを見る。GUIDED に入りっぱなしの
+                #    間 (例: 着陸直後でまだ THR_CUT していない) に毎フレーム
+                #    start() を呼ぶと、着陸完了の瞬間にまた離陸してしまう。
+                #    スイッチを一度戻して上げ直す = 次の便を飛ばす意思表示。
+                guided_now = bool(link.flag("guided"))
+                if (MISSION_AUTOSTART and guided_now and not _prev_guided[0]
+                        and mission.phase in (MissionPhase.IDLE,
+                                              MissionPhase.DONE,
+                                              MissionPhase.ABORT)):
+                    print("[Mission] GUIDED 検出 (SW_HOVER 上) -> ミッションを最初から開始")
+                    mission.start()
+                _prev_guided[0] = guided_now
+
                 req = shared.get("mission_request")
                 if req is not None:
                     shared["mission_request"] = None
