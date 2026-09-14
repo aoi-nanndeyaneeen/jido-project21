@@ -140,6 +140,7 @@ def run_main_loop(cam1, cam2,
     mission = None
     mission_log = None
     _last_n_tx = [0]
+    _mission_aligned_logged = [False]
     if GROUND_LINK_ENABLED:
         print()
         print("[INIT] 地上局 (XIAO / xiao_s5_log) へ接続中...")
@@ -329,17 +330,16 @@ def run_main_loop(cam1, cam2,
                            "z": None if P is None else float(P[2]),
                            "valid": pos_valid, "in_dummy": in_dummy,
                            "residual": residual}
-                    #  機体フローの原点はフィールド原点ではない。両方が同時に
-                    #  信用できる最初の瞬間だけ、ずれの基準を取る。
-                    if (not mission_log.aligned and pos_valid
-                            and tel.get("fh_posn") is not None
-                            and bool(tel.get("flow_ok"))):
-                        mission_log.set_align((cam["x"], cam["y"]),
-                                              (tel["fh_posn"], tel["fh_pose"]))
+                    # 原点合わせと Diff_* の計算は mission.py 側が
+                    # 位置補正のために持っている値をそのまま使う
+                    # (ここで別に計算すると2つの基準がずれかねない)。
+                    snap = mission.snapshot()
+                    if snap["aligned"] and not _mission_aligned_logged[0]:
+                        _mission_aligned_logged[0] = True
                         print("[Mission] カメラと機体フローの原点を合わせました "
                               "(以後 Diff_* が機体側のドリフト量)")
                     mission_log.write(
-                        mission.snapshot(), cam, tel,
+                        snap, cam, tel,
                         {"deg": None if m_yaw is None else math.degrees(m_yaw),
                          "valid": m_yaw_valid,
                          "src": "camera" if yaw_rad is not None else MISSION_YAW_MODE},

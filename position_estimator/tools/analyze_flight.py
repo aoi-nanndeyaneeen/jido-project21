@@ -160,6 +160,11 @@ def report_divergence(rows):
         print("  → 機体のフロー推定が流れています。機体だけで位置を保とうとすると"
               "この量だけずれます")
 
+    n_corr = sum(1 for r in rows if r.get("Pos_Corr_Sent") == "1")
+    if n_corr:
+        print(f"  地上補正を{n_corr}回送信 (POS_CORR_PERIOD_S ごと)。"
+              "巡航中は無効 (静止保持中だけ効く)")
+
 
 def report_tracking_error(rows):
     """目標にどれだけ寄れていたか (制御そのものの出来)。"""

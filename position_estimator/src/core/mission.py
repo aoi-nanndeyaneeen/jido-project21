@@ -60,7 +60,8 @@ from utils.config import (MISSION_TAKEOFF_ALT_M,
                           MISSION_FENCE_X, MISSION_FENCE_Y, MISSION_FENCE_Z,
                           MISSION_FENCE_GRACE_S,
                           POS_CORR_ENABLED, POS_CORR_PERIOD_S,
-                          POS_CORR_MAX_STEP_M)
+                          POS_CORR_MAX_STEP_M,
+                          POS_CORR_TRACK_TOL_M, POS_CORR_CONFIRM_S)
 from core.s5_link import (REQ_ABORT, REQ_GUIDED, REQ_HOLD, REQ_LAND,
                           REQ_TAKEOFF, REQ_NAME,
                           CF_ARMED_OK, CF_POS_VALID, CF_YAW_VALID,
@@ -184,6 +185,10 @@ class WaypointMission:
         self._pending_corr = None   # 次の _send() 1回にだけ乗せる (n_m, e_m)
         # ログ用: (diff_x, diff_y, diff_norm, drone_x, drone_y) or None
         self._diff = None
+        # 持続性チェック: 「直近の推定から大きく変わらない値が一定時間
+        # 続いたか」を見る。誤検知1点だけを信じて補正しないための蓋。
+        self._corr_ref = None       # (diff_x, diff_y) 追跡中の基準値
+        self._t_corr_start = 0.0    # その基準値が始まった時刻
 
         # ---- ログ用 ----------------------------------------------------
         # ★ 「何を送ったか」は送った本人しか知らない。update() の中で
@@ -216,6 +221,14 @@ class WaypointMission:
         self._t_fly = None
         self._t_fence = None
         self._airborne = False
+        # 機体側の pos_n/pos_e はアーム/リセットのたびに0へ戻る
+        # (PositionHold::reset())。原点合わせもフライトごとに取り直す。
+        self._align = None
+        self._t_corr = 0.0
+        self._pending_corr = None
+        self._diff = None
+        self._corr_ref = None
+        self._t_corr_start = 0.0
         self._say(f"待機開始: 機体が GUIDED に入ったら自動で離陸します "
                   f"(WP {len(self.waypoints)} 点 -> 離陸地点へ戻って自動着陸)")
         return True
@@ -239,15 +252,26 @@ class WaypointMission:
 
     def _send(self, req, vx_mps=0.0, vy_mps=0.0, alt_m=0.0, flags=0):
         """送信と記録を必ずセットで行う。link.send_command() を直接呼ばないこと。"""
+        # 保留中の位置補正があれば、この送信1回にだけ乗せて消費する。
+        # どのフェーズの _send() 呼び出しに乗るかは問わない
+        # (補正はどのみち GUIDED 巡航中は効かないので、req が何でもよい)。
+        corr = self._pending_corr
+        self._pending_corr = None
+        corr_n = corr_e = None
+        if corr is not None:
+            flags |= CF_POS_CORR
+            corr_n, corr_e = corr
+
         # ★ phase は「送った時点」のものを控える。update() は送信後に
         #   フェーズを進めることがあるので、あとから self.phase を読むと
         #   「HOLD を送った行が TAKEOFF になっている」というズレが出る。
         self._tx = {"req": REQ_NAME.get(req, str(req)),
                     "vx": vx_mps, "vy": vy_mps, "alt": alt_m, "flags": flags,
-                    "phase": self.phase.value}
+                    "phase": self.phase.value, "corr": corr}
         self._n_tx += 1
         self.link.send_command(req, vx_mps=vx_mps, vy_mps=vy_mps,
-                               alt_m=alt_m, flags=flags)
+                               alt_m=alt_m, flags=flags,
+                               corr_n_m=corr_n, corr_e_m=corr_e)
 
     def n_tx(self):
         return self._n_tx
@@ -266,6 +290,8 @@ class WaypointMission:
                 # phase = 送信時のフェーズ / phase_next = 送信後の今のフェーズ。
                 # 2つが違う行がフェーズ遷移そのもの。
                 "phase_next": self.phase.value,
+                "aligned": self._align is not None,
+                "diff": self._diff,   # (diff_x, diff_y, diff_norm, drone_x, drone_y) or None
                 **self._tx}
 
     # ---------------------------------------------------------------- 本体
@@ -313,6 +339,8 @@ class WaypointMission:
 
         st = self.link.state()
         h_agl = float(st.get("range_h", 0.0))    # 機体の測距による対地高度 [m]
+
+        self._maybe_correct_position(now, pos, pos_valid, st)
 
         # 今の目標までの水平距離。到達判定とログの両方がこれを見る
         # (別々に計算すると、ログと判定が食い違って原因追跡が狂う)。
@@ -445,6 +473,79 @@ class WaypointMission:
         elif mag < self.MIN_VEL:
             vx, vy = 0.0, 0.0
         return vx, vy
+
+    def _maybe_correct_position(self, now, pos, pos_valid, st):
+        """
+        数秒に1回、カメラの絶対位置で機体のフロー積分位置を上書きする。
+
+        ★ 効くのは静止保持中だけ。GUIDED 巡航中は PositionHold 側で
+          実質無効化される (correctPosition() のコメント参照)。ここでは
+          「いつ・どれだけ送るか」だけを決め、実際に効くかは機体任せ。
+
+        ★ 着陸中 (Phase.LAND) は送らない。降下中に横移動を誘発したくない。
+
+        ★ 持続性チェック: 2026-09-14 の飛行で、align直後 0.02m だったズレが
+          次のチェック (2秒後) には 1.22m に見えたことがあった。窓の反射
+          などゲートを1回だけすり抜けた誤検知1点が原因。MAX_STEP_M で
+          動く量はクランプしていたが、「信じてよいズレか」自体は見て
+          いなかった。ここでは直近の推定 (self._corr_ref) から
+          POS_CORR_TRACK_TOL_M 以上外れたら「まだ様子見」として基準を
+          そこから取り直し、同じ値が POS_CORR_CONFIRM_S 秒続いて初めて
+          信用する。誤検知1フレームでは持続時間が足りず弾かれる。
+        """
+        if not POS_CORR_ENABLED or self.phase is Phase.LAND:
+            return
+        if not pos_valid or pos is None:
+            return
+        fh_n, fh_e = st.get("fh_posn"), st.get("fh_pose")
+        if fh_n is None or fh_e is None or not st.get("flow_ok"):
+            return
+
+        cam_x, cam_y = float(pos[0]), float(pos[1])
+
+        if self._align is None:
+            # 両方が同時に信用できる最初の瞬間。定義よりズレは0なので
+            # 送る意味がない。原点だけ覚えて次回以降に備える。
+            self._align = (cam_x - fh_e, cam_y - fh_n)
+            self._diff = (0.0, 0.0, 0.0, cam_x, cam_y)
+            self._corr_ref = None
+            return
+
+        drone_x = fh_e + self._align[0]
+        drone_y = fh_n + self._align[1]
+        diff_x = cam_x - drone_x
+        diff_y = cam_y - drone_y
+        diff_norm = math.hypot(diff_x, diff_y)
+        self._diff = (diff_x, diff_y, diff_norm, drone_x, drone_y)
+
+        # ---- 持続性チェック --------------------------------------------
+        if (self._corr_ref is None or
+                math.hypot(diff_x - self._corr_ref[0],
+                          diff_y - self._corr_ref[1]) > POS_CORR_TRACK_TOL_M):
+            # 新しい系列の始まり (初回、または直前の推定から大きく外れた)。
+            # まだ確信できないので、この基準で数える所からやり直す。
+            self._corr_ref = (diff_x, diff_y)
+            self._t_corr_start = now
+            return
+        if now - self._t_corr_start < POS_CORR_CONFIRM_S:
+            return   # 一致はしているが確認時間にまだ達していない
+
+        # ---- ここまで来たら「信用してよいズレ」。送信レートを間引く ----
+        if now - self._t_corr < POS_CORR_PERIOD_S:
+            return
+        self._t_corr = now
+        if diff_norm < 0.02:      # ノイズだけなら送らない (無線帯域の節約)
+            return
+
+        # 1回の補正量に上限を設ける。機体側クランプ (FLOW_POS_VEL_LIM) は
+        # 「反応の速さ」を絞るだけなので、飛んでくる値そのものを絞る蓋を
+        # PC側にも置いておく。
+        step = min(diff_norm, POS_CORR_MAX_STEP_M) / diff_norm
+        corr_n = fh_n + diff_y * step
+        corr_e = fh_e + diff_x * step
+        self._pending_corr = (corr_n, corr_e)
+        clipped = "" if step >= 0.999 else f" (上限{POS_CORR_MAX_STEP_M:.1f}mで制限)"
+        self._say(f"自己位置を補正: ずれ{diff_norm:.2f}m{clipped}")
 
     def _safety_check(self, now, pos, pos_valid):
         """

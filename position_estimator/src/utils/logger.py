@@ -91,10 +91,10 @@ class MissionLogger(CsvLogger):
       推定しており、これは必ず流れていく。カメラの絶対位置と並べて初めて
       「どれだけ流れたか」が測れる。機体単独のログでは絶対に分からない。
 
-    ★ 機体の pos_n/pos_e は「フロー保持に入った場所を原点とする相対位置」。
-      フィールド座標とは原点が違うので、両方が同時に有効になった最初の
-      瞬間のオフセットを覚えて引く (set_align)。それ以降の差が「ずれ」。
-      生値 (Fh_PosN/Fh_PosE) も残してあるので、後から別の基準で取り直せる。
+    ★ 原点合わせと Diff_* の計算そのものは core/mission.py が持っている
+      (2026-09-14〜: 同じ値を使って機体の自己位置を定期的に補正するため、
+      ログ専用にここでもう一度計算すると2つの基準がずれかねない)。
+      ここはその結果 (snapshot()["diff"]) を書くだけ。
     """
 
     HEADER = [
@@ -113,6 +113,9 @@ class MissionLogger(CsvLogger):
         # 機体自身の水平位置推定と、カメラとの食い違い
         "Fh_PosN(m)", "Fh_PosE(m)", "Fh_HoldN(m)", "Fh_HoldE(m)",
         "Drone_X(m)", "Drone_Y(m)", "Diff_X(m)", "Diff_Y(m)", "Diff_Norm(m)",
+        "Aligned",
+        # この行で地上補正 (mission.py) を送ったか。送った場合の絶対目標値
+        "Pos_Corr_Sent", "Pos_Corr_N(m)", "Pos_Corr_E(m)",
         "Fh_Vxt(m/s)", "Fh_Vyt(m/s)", "Fh_Vxc(m/s)", "Fh_Vyc(m/s)",
         "Flow_OK", "Range_Valid", "Bad",
         "Event",
@@ -123,27 +126,14 @@ class MissionLogger(CsvLogger):
 
     def __init__(self, log_path: Path):
         super().__init__(log_path, self.HEADER, mode="w")
-        self._align = None      # (dx, dy) フィールド座標 - 機体座標
-
-    def set_align(self, cam_xy, fh_ne):
-        """
-        カメラと機体フローの原点合わせ。両方が同時に有効な最初の1回だけ呼ぶ。
-
-        機体の n(北) をフィールドの +y(奥)、e(東) を +x(右) に対応させる。
-        これは「機首をフィールド奥へ向けて置く」という運用前提そのもの
-        (config の YAW_INITIAL_ALIGN_DEG=0)。前提が崩れていれば Diff_* に
-        回転ずれとして現れる。
-        """
-        self._align = (cam_xy[0] - fh_ne[1], cam_xy[1] - fh_ne[0])
-
-    @property
-    def aligned(self):
-        return self._align is not None
 
     def write(self, mission_snap, cam, tel, yaw, event=""):
         """
         Args:
             mission_snap: WaypointMission.snapshot()
+                          ("diff" = (diff_x,diff_y,diff_norm,drone_x,drone_y) か None、
+                           "aligned" = 原点合わせが済んでいるか、
+                           "corr" = この行で送った補正 (n_m,e_m) か None)
             cam : dict  x,y,z,valid,in_dummy,residual
             tel : dict  機体テレメトリ (S5Link.state()) + age
             yaw : dict  deg,valid,src
@@ -154,15 +144,9 @@ class MissionLogger(CsvLogger):
         cam_x, cam_y = cam.get("x"), cam.get("y")
         fh_n, fh_e = t.get("fh_posn"), t.get("fh_pose")
 
-        # ---- 機体の自己位置をフィールド座標へ写して差を取る ----------
-        drone_x = drone_y = dif_x = dif_y = dif_n = None
-        if self._align is not None and fh_n is not None and fh_e is not None:
-            drone_x = fh_e + self._align[0]
-            drone_y = fh_n + self._align[1]
-            if cam.get("valid") and cam_x is not None:
-                dif_x = cam_x - drone_x
-                dif_y = cam_y - drone_y
-                dif_n = (dif_x ** 2 + dif_y ** 2) ** 0.5
+        diff = m.get("diff")
+        dif_x, dif_y, dif_n, drone_x, drone_y = diff if diff else (None,) * 5
+        corr = m.get("corr")
 
         mode = t.get("mode")
         mode_name = self.MODE_NAME.get(int(mode), str(mode)) if mode is not None else ""
@@ -186,6 +170,8 @@ class MissionLogger(CsvLogger):
             _f(t.get("range_h")), _f(t.get("alt_hold")), _f(t.get("age")),
             _f(fh_n), _f(fh_e), _f(t.get("fh_holdn")), _f(t.get("fh_holde")),
             _f(drone_x), _f(drone_y), _f(dif_x), _f(dif_y), _f(dif_n),
+            int(bool(m.get("aligned"))),
+            int(corr is not None), _f(corr[0]) if corr else "", _f(corr[1]) if corr else "",
             _f(t.get("fh_vxt")), _f(t.get("fh_vyt")),
             _f(t.get("fh_vxc")), _f(t.get("fh_vyc")),
             int(bool(t.get("flow_ok"))), int(bool(t.get("range_valid"))),
