@@ -56,7 +56,7 @@ import math
 import time
 from enum import Enum
 
-from utils.config import (MISSION_TAKEOFF_ALT_M,
+from utils.config import (MISSION_TAKEOFF_ALT_M, YAW_INITIAL_ALIGN_DEG,
                           MISSION_FENCE_X, MISSION_FENCE_Y, MISSION_FENCE_Z,
                           MISSION_FENCE_GRACE_S,
                           POS_CORR_ENABLED, POS_CORR_PERIOD_S,
@@ -190,6 +190,10 @@ class WaypointMission:
         self._corr_ref = None       # (diff_x, diff_y) 追跡中の基準値
         self._t_corr_start = 0.0    # その基準値が始まった時刻
 
+        # ヨーの出所。"camera"(実測収束済み) か "fixed"(決め打ち)。
+        # status_line() と GUIDED 進入時の警告で使う。
+        self._yaw_src = "fixed"
+
         # ---- ログ用 ----------------------------------------------------
         # ★ 「何を送ったか」は送った本人しか知らない。update() の中で
         #   分岐した結果を外から再現しようとすると必ずズレるので、
@@ -295,7 +299,8 @@ class WaypointMission:
                 **self._tx}
 
     # ---------------------------------------------------------------- 本体
-    def update(self, pos=None, yaw_rad=None, pos_valid=False, yaw_valid=False):
+    def update(self, pos=None, yaw_rad=None, pos_valid=False, yaw_valid=False,
+              yaw_src="fixed"):
         """
         毎フレーム呼ぶ。実際に送信するのは SEND_HZ に間引いた回だけ。
 
@@ -304,11 +309,17 @@ class WaypointMission:
             yaw_rad   : 機首方位 [rad]。None なら未確定
             pos_valid : 自己位置が信用できるか (ダミー飛行中は False を渡すこと)
             yaw_valid : ヘディング推定が収束しているか
+            yaw_src   : "camera" (実測収束済み) か "fixed" (初期アラインメント
+                       決め打ち)。"fixed" の間は機首が本当にフィールド奥を
+                       向いているかを機体側では確認できない
+                       (2026-09-14: 複数回リトライする間に手動操作で機首が
+                       30度以上ズレたまま気づかなかった事故を参照)。
         """
         if self.phase in (Phase.IDLE, Phase.DONE, Phase.ABORT):
             return
 
         now = time.time()
+        self._yaw_src = yaw_src
         if pos_valid and pos is not None:
             self._t_pos_ok = now
 
@@ -356,7 +367,20 @@ class WaypointMission:
             #  機体側のシリアル画面に出る。ここでは待つだけ。
             self._send(REQ_HOLD, flags=flags)
             if self.link.flag("guided"):
-                self._say("機体が GUIDED に入りました -> 離陸")
+                dev_yaw = st.get("yaw")
+                if self._yaw_src != "camera":
+                    # ★ リトライのたびに出す (プログラム起動中1回だけだと、
+                    #   2026-09-14 のように手動操作の合間に機首がズレていく
+                    #   のを見逃す)。機体自身の yaw (アーム基準の相対方位)
+                    #   も一緒に出す。ここが 0 から離れていたら、機首は
+                    #   もうフィールド奥を向いていない。
+                    dev_str = f"{dev_yaw:+.1f}deg" if dev_yaw is not None else "不明"
+                    self._say(f"機体が GUIDED に入りました -> 離陸 "
+                              f"(機首方位は{YAW_INITIAL_ALIGN_DEG:+.1f}deg決め打ち。"
+                              f"機体自身のyaw={dev_str}。0から離れていたら"
+                              f"機首はもうフィールド奥を向いていません)")
+                else:
+                    self._say("機体が GUIDED に入りました -> 離陸")
                 self._t_fly = now        # 飛行時間はここから数える
                 self._goto(Phase.TAKEOFF)
             elif self.link.flag("armed") and now - self._t_phase > 15.0:
@@ -604,16 +628,47 @@ class WaypointMission:
         return None
 
     # ------------------------------------------------------------ 表示
+    MODE_NAME = {0: "RATE", 1: "ANGLE", 2: "GUIDED", 3: "POSHOLD", 4: "ALTHOLD"}
+
     def status_line(self):
+        """
+        「今どういう状態か」を1行で。2秒ごとにコンソールへ出る想定。
+
+        ★ 機体自身の yaw (アーム基準の相対方位) を必ず出す。yaw_src が
+          "fixed" のときはこれが唯一の手掛かり。0 から離れているほど、
+          PCが仮定している「機首はフィールド奥」という前提が崩れている
+          (2026-09-14 に複数回リトライの間に機首が30度以上ズレて
+          フィールド外まで飛んだ事故を参照)。
+        """
         st = self.link.state()
         tgt = self._target() if self.phase not in (Phase.IDLE, Phase.DONE) else None
+        mode = st.get("mode")
+        mode_name = self.MODE_NAME.get(int(mode), "?") if mode is not None else "?"
+
         s = f"{self.phase.value}"
         if self.phase in (Phase.CRUISE, Phase.DWELL):
             label = "HOME" if self._returning else f"WP{self.wp_idx}"
             s += f" -> {label}"
         if tgt is not None:
             s += f" ({tgt[0]:+.2f}, {tgt[1]:+.2f}, {tgt[2]:.2f})"
-        s += f"  h={st.get('range_h', 0.0):.2f}m"
+        if self._dist_h is not None:
+            s += f" 残{self._dist_h:.2f}m"
+        s += f"  mode={mode_name}"
+        s += f"  armed={int(bool(st.get('armed', 0)))}"
         s += f"  guided={int(bool(st.get('guided', 0)))}"
+        s += f"  h={st.get('range_h', 0.0):.2f}m"
+
+        dev_yaw = st.get("yaw")
+        if self._yaw_src == "camera":
+            s += "  yaw=camera(実測)"
+        elif dev_yaw is not None:
+            flag = " ★機首ズレ疑い" if abs(dev_yaw) > 15.0 else ""
+            s += (f"  yaw=fixed(前提{YAW_INITIAL_ALIGN_DEG:+.0f}) "
+                  f"機体実測={dev_yaw:+.1f}deg{flag}")
+        else:
+            s += "  yaw=fixed(機体側yaw不明)"
+
+        if self._diff is not None:
+            s += f"  自己位置ズレ={self._diff[2]:.2f}m"
         s += f"  link={'OK' if self.link.telemetry_ok() else 'LOST'}"
         return s

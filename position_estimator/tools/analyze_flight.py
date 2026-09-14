@@ -139,6 +139,19 @@ def report_mission(rows):
         print(f"  [!] 指令が届いていない行 {stale}/{len(rows)} "
               "← 無線の上りが細っています")
 
+    # 機首ズレ: Yaw_Src=fixed の間、機体自身の yaw が 0 からどれだけ
+    # 離れていたか。2026-09-14 に複数回リトライの間で30度以上ズレて
+    # フィールド外まで飛んだ事故の再検出用。
+    mism = [_f(r, "Yaw_Mismatch_deg") for r in rows if r.get("Yaw_Src") == "fixed"]
+    mism = [m for m in mism if m is not None]
+    if mism:
+        worst = max(mism, key=abs)
+        print(f"  機首ズレ (fixed中の機体実測yaw) 最大{worst:+.1f}deg")
+        if abs(worst) > 15.0:
+            print(f"  [!] {abs(worst):.0f}度ズレた区間あり。"
+                  "機首がフィールド奥から外れている可能性 (90度未満なら"
+                  "位置ループ自体は収束するが、90度に近いほど遠回りになる)")
+
 
 def report_divergence(rows):
     """カメラの絶対位置と、機体自身のフロー推定のズレ。"""
@@ -190,6 +203,26 @@ def report_tracking_error(rows):
     if vx:
         print(f"  指令速度 前後 {min(vx):+.2f}〜{max(vx):+.2f}  "
               f"左右 {min(vy):+.2f}〜{max(vy):+.2f} m/s")
+
+    # CRUISE区間ごとに「本当に近づいていたか」。ヨーがズレていても
+    # 90度未満なら収束するはず (2026-09-14 の検証)。ここが増加していたら
+    # 90度以上ズレているか、まったく別の異常。
+    print("  区間ごとの収束 (CRUISE開始→終了の残距離):")
+    seg, cur = [], []
+    for r in rows:
+        if r["Phase"] == "CRUISE":
+            cur.append(r)
+        elif cur:
+            seg.append(cur); cur = []
+    if cur:
+        seg.append(cur)
+    for i, s in enumerate(seg):
+        dists = [_f(r, "Dist_H(m)") for r in s if r.get("Dist_H(m)")]
+        if not dists:
+            continue
+        arrow = "収束" if dists[-1] < dists[0] else "拡大 [!]"
+        print(f"    区間{i+1}: {s[0]['Time']}〜{s[-1]['Time']}  "
+              f"{dists[0]:.2f}m -> {dists[-1]:.2f}m ({arrow})")
 
 
 def main():

@@ -27,6 +27,31 @@ private:
     int16_t gx_raw, gy_raw, gz_raw;
     TwoWire *wire;
 
+    // MPU6050 のレジスタに書き込み、読み戻して一致するまで数回リトライする。
+    //  ★ 2026-09-14: レンジ設定 (0x1C) の書き込みが黙って反映されないケースが
+    //    あり、ソフトとセンサーのスケール食い違いに何日も気づけなかった。
+    //    ここで検証しないと同じ事故が再発する。
+    bool writeRegVerified(uint8_t reg, uint8_t value, uint8_t retries = 3) {
+        for (uint8_t attempt = 0; attempt <= retries; ++attempt) {
+            wire->beginTransmission(0x68);
+            wire->write(reg);
+            wire->write(value);
+            wire->endTransmission();
+            delay(2);
+
+            wire->beginTransmission(0x68);
+            wire->write(reg);
+            wire->endTransmission(false);
+            wire->requestFrom((uint8_t)0x68, (uint8_t)1);
+            if (wire->available()) {
+                const uint8_t readback = wire->read();
+                if (readback == value) return true;
+            }
+            delay(5);
+        }
+        return false;
+    }
+
 public:
     IMU(TwoWire *wire_i = &Wire) : mpu(0x68), wire(wire_i) {};
 
@@ -104,12 +129,29 @@ public:
         //    ACCEL_SCALE のコメント参照 (上下逆マウント + s_az_bias≈-2 で上向き
         //    加速の余裕が 1g しか無く、AltEstimator が飽和していた)。
         //    ACCEL_SCALE = 4096.0f と対で変えること。
-        wire->beginTransmission(0x68); wire->write(0x1C); wire->write(0x10); wire->endTransmission(); // Accel ±8g
-        wire->beginTransmission(0x68); wire->write(0x1B); wire->write(0x00); wire->endTransmission(); // Gyro ±250dps
-        
-        // ★ここを追加：DLPF (Digital Low Pass Filter) を42Hzに設定
-        wire->beginTransmission(0x68); wire->write(0x1A); wire->write(0x03); wire->endTransmission();
-        
+        //  ★ 2026-09-14: この書き込みが (I2Cバスのノイズ or MPU6050 が
+        //    initialize() 直後の内部リセット中で書き込みを無視した等の理由で)
+        //    黙って反映されないケースを実機で確認した。ソフトは ±8g のつもりで
+        //    ACCEL_SCALE=4096 で割り続けるが、実際のセンサーが ±2g のままだと
+        //    読み値が正確に4倍(16384/4096)に膨らみ、az が水平でも -4g 付近に
+        //    見える。この状態だと recalibrate() の |a|≒1g チェックに必ず
+        //    REJECTED され、EEPROM のバイアスは (スケールが正しかった頃の)
+        //    古い値のまま固定されてしまい、姿勢推定が発散する
+        //    (roll_ang が 180° 付近に張り付く不具合の原因になった)。
+        //    書き込み後に読み戻して確認し、ズレていたら再送・それでもダメなら
+        //    起動時に大きく警告を出す。
+        if (!writeRegVerified(0x1C, 0x10)) {           // Accel ±8g
+            Serial.println("!!!! FATAL: MPU6050 ACCEL_CONFIG (±8g) が反映されていません。"
+                           "加速度スケールが実際と食い違うため、姿勢推定が壊れます。"
+                           "I2C配線・MPU6050の電源を確認してください。");
+        }
+        if (!writeRegVerified(0x1B, 0x00)) {           // Gyro ±250dps
+            Serial.println("!!!! WARN: MPU6050 GYRO_CONFIG (±250dps) の書き込み確認に失敗しました。");
+        }
+        if (!writeRegVerified(0x1A, 0x03)) {           // DLPF 42Hz
+            Serial.println("!!!! WARN: MPU6050 DLPF 設定の書き込み確認に失敗しました。");
+        }
+
         filter.begin(Config::Timing::MAIN_Hz);
 
         if (loadCalibration()) {
