@@ -682,6 +682,29 @@ static void handleKey(char c) {
 }
 
 // ------------------------------------------------------------
+//  起動時の IM920 疎通チェック。RDCH を投げて応答が返るかだけ見る。
+//  ★ ここで NG なら配線/電源/ボーレートの問題。テレメトリが来ないのを
+//    何十秒も待つ前に切り分けられる (im920_passthrough の trial() と同じ考え方)。
+// ------------------------------------------------------------
+void imBootCheck() {
+    while (IM->available()) IM->read();   // 起動直後のゴミを捨てる
+    IM->print("RDCH\r\n");
+
+    unsigned long t0 = millis();
+    String got;
+    while (millis() - t0 < 300) {
+        while (IM->available()) got += (char)IM->read();
+    }
+    got.trim();
+
+    if (got.length() == 0) {
+        Serial.println("# [BOOT CHECK] IM920 応答なし。配線/電源(3V3か)/ボーレート(19200)を確認してください。");
+    } else {
+        Serial.printf("# [BOOT CHECK] IM920 応答あり: %s\n", got.c_str());
+    }
+}
+
+// ------------------------------------------------------------
 void setup() {
     Serial.begin(USB_BAUD);
 #if defined(ARDUINO_ARCH_RP2040)
@@ -694,6 +717,7 @@ void setup() {
     while (!Serial && millis() < 3000) {}
     Serial.println();
     Serial.println("# === s5 telemetry receiver / logger ===");
+    imBootCheck();
     printHelp();
 }
 
