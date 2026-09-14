@@ -337,7 +337,9 @@ python graph.py                          # 軌跡の3Dグラフ
 
 無線プロトコルは `S5Cmd.h`（`flight_controller/` と `ground_receiver/` の両方、必ず同一内容）の `CmdFrame` に `corr_n_mm`/`corr_e_mm` と `CF_POS_CORR` フラグを追加して実装（IM920sLの32バイト制限に収まる）。
 
-同じ `CmdFrame` に、PID reset / IMU再キャリブレーション / デバイス確認 (I2C再走査) を無線越しに1回だけ実行させる `action`/`action_seq` も追加してある（2026-09-14〜）。地上局コンソール (`console.py` の `P`/`k`/`i` キー) から送れる。詳しくはルートの README とS5Cmd.hのコメント参照。
+PID reset / IMU再キャリブレーション / デバイス確認 (I2C再走査) を無線越しに1回だけ実行させる仕組みも用意してある（2026-09-14〜）。一時期 `CmdFrame` に `action`/`action_seq` を足してIM920経由でも送れるようにしていたが、**IM920は操縦専用に戻し、この単発指令はBLE専用にした**（同日）。理由: 誤ってIM920から操縦以外のものを送れる余地を無くすため。
+
+今は `ble_monitor.py` からのみ送れる。IM920(地上局)を一切経由せず、log_recorder(XIAO)に新設した BLE Write 用 characteristic → UART → `LogLinkProto.h` の `ActReq`(action/action_seqの2byteのみ)という独立経路で、操縦系のフィールドがプロトコル上存在しないため機体の操縦には使えない。地上局が無いベンチ上での確認用。詳しくはルートの README・`GROUND_CONSOLE_GUIDE.md`・`S5Cmd.h`/`LogLinkProto.h` のコメント参照。
 
 ### mission ログの読みどころ
 

@@ -31,6 +31,8 @@
 //    保険        : T_REC が IDLE_CLOSE_MS 途切れたら RP2040 が勝手に閉じる
 //                  (STOP が化けても BIN が壊れたまま残らない)
 //    逆方向      : RP2040 -> T_STAT を 2Hz。Teensy の 's' 表示に出る
+//    デバッグ    : RP2040 -> T_ACT (BLE Write を中継。PID reset/IMU校正/
+//                  デバイス確認のみ)。Teensy -> T_ACT_ACK (実行結果)
 // ============================================================
 #pragma once
 #include <stdint.h>
@@ -45,8 +47,40 @@ constexpr uint8_t SOF2 = 0x5A;
 constexpr uint8_t T_START = 0x01;   // payload = 32B の BIN ヘッダ ("S5LOG"...)
 constexpr uint8_t T_REC   = 0x02;   // payload = FlightLog::Rec
 constexpr uint8_t T_STOP  = 0x03;   // payload なし
+constexpr uint8_t T_ACT_ACK = 0x04; // payload = ActAck (下記)。単発。定期送信ではない
 // ロガー -> FC
 constexpr uint8_t T_STAT  = 0x81;   // payload = Stat
+constexpr uint8_t T_ACT   = 0x82;   // payload = ActReq (下記)。単発。BLE から来る
+
+// ------------------------------------------------------------
+//  BLE 経由の単発メンテナンス指令 (2026-09-14 追加)
+// ------------------------------------------------------------
+//  PC ─BLE Write→ ロガー(XIAO) ─UART(この T_ACT)→ FC ─UART(T_ACT_ACK)→
+//  ロガー ─BLE Notify→ PC、という往復。デバッグ用 (IMU再校正/デバイス確認/
+//  PIDリセット) 専用の経路で、S5Cmd.h の Action をそのまま運ぶ。
+//
+//  ★★ ここが一番大事: このフレームには action と action_seq しか無い。
+//    速度・高度・離着陸要求などの操縦系フィールドは存在しない (=構造的に
+//    入れられない)。BLE 経由で機体を操縦することは絶対にしない、という
+//    要件をプロトコルレベルで保証するための設計。操縦は今まで通り
+//    IM920 (S5Cmd.h の CmdFrame) だけが担う。
+//
+//  action_seq の重複排除は FC 側 (drone_s5.cpp handleBleAction()) が
+//  S5Cmd.h の CmdFrame.action_seq と同じ流儀 (値が変わった最初の1回だけ
+//  実行) でやる。IM920 経由の action_seq とは別カウンタで独立に見る。
+struct __attribute__((packed)) ActReq {
+    uint8_t action;       // S5Cmd.h の Action (PID_RESET/IMU_CAL/SELFTEST)
+    uint8_t action_seq;   // 1..255。0 は「無視される」
+};
+
+// 上記の実行結果。S5Telem.h の AckResult をそのまま使う。
+struct __attribute__((packed)) ActAck {
+    uint8_t action;
+    uint8_t action_seq;
+    uint8_t result;        // S5Telem.h の AckResult
+    uint8_t imu_ok;        // SELFTEST のときだけ意味を持つ
+    uint8_t i2c_found;     // 同上
+};
 
 constexpr size_t  HDR_LEN     = 5;    // SOF1 SOF2 type len seq
 constexpr size_t  OVERHEAD    = HDR_LEN + 1;          // + crc

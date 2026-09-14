@@ -67,23 +67,10 @@ CF_YAW_VALID = 1 << 2
 CF_ALT_ABS   = 1 << 3
 CF_POS_CORR  = 1 << 4   # corr_n_m/corr_e_m を機体の pos_n/pos_e へ適用する
 
-# S5Cmd.h の Action。PID reset / IMU校正 / デバイス確認の単発指令
-# (通常の巡航指令 req とは別枠。send_command() の action/action_seq 引数で使う)
-ACT_NONE      = 0
-ACT_PID_RESET = 1
-ACT_IMU_CAL   = 2
-ACT_SELFTEST  = 3
-
-ACT_NAME = {ACT_NONE: "-", ACT_PID_RESET: "PID_RESET",
-            ACT_IMU_CAL: "IMU_CAL", ACT_SELFTEST: "SELFTEST"}
-
-# S5Telem.h の AckResult。Action の実行結果
-ACK_OK            = 0
-ACK_REFUSED_ARMED = 1
-ACK_CAL_REJECTED  = 2
-
-ACK_RESULT_NAME = {ACK_OK: "OK", ACK_REFUSED_ARMED: "拒否(アーム中)",
-                   ACK_CAL_REJECTED: "却下(妥当性チェック不合格)"}
+# ★ 2026-09-14: PID reset / IMU校正 / デバイス確認の単発指令 (Action) は
+#   IM920 から削除した (IM920は操縦専用に戻し、これらはBLE経由に一本化。
+#   core/ble_tap.py 参照)。この CmdFrame (IM920) には二度と action/
+#   action_seq を足さないこと。
 
 # XIAO の USB CDC。Windows では description で判別できないので VID:PID。
 # ★ 地上局を RP2040 -> ESP32C3 に移行済み。ESP32C3 はチップ内蔵のネイティブ
@@ -142,9 +129,6 @@ class S5Link:
         self._running = False
         self._n_sent = 0
         self._last_param_line = None
-        self._last_ack = None       # dict or None (まだ受けていない)
-        self._last_ack_ts = 0.0
-        self._action_seq = 0        # 次に使う action_seq (1..255 を循環。0は使わない)
 
         if self.port is None:
             self._say("[S5Link] 地上局 (XIAO ESP32C3 303A:1001 / 旧RP2040 2E8A:000A) が見つかりません。")
@@ -228,14 +212,6 @@ class S5Link:
                 self._last_param_line = line
                 continue
 
-            if line.startswith("ACK,"):
-                # S5Cmd.h の Action (PID reset / IMU校正 / デバイス確認) の実行結果。
-                #  ★ _state (DATA行由来) には混ぜない。DATA は 10Hz 前後で丸ごと
-                #    差し替わるので、混ぜると次の1行で ACK が消えてしまう。
-                #    別枠で保持し、last_ack() で取り出す。
-                self._parse_ack(line)
-                continue
-
             if line.startswith("#"):
                 # 受信機からの人間向けメッセージ。切り分けに効くのでそのまま出す。
                 self._say(f"[地上局] {line[1:].strip()}")
@@ -259,54 +235,11 @@ class S5Link:
             self._last_rx = time.time()
             self._n_data += 1
 
-    def _parse_ack(self, line):
-        # "ACK,<action>,<action_seq>,<result>,<imu_ok>,<i2c_found>"
-        #  s5_log.cpp の emitAck() と同じ順。壊れていたら黙って捨てる
-        #  (古いACKを誤表示するより、何も表示しない方が安全)。
-        parts = line[len("ACK,"):].split(",")
-        if len(parts) != 5:
-            return
-        try:
-            action, action_seq, result, imu_ok, i2c_found = (int(x) for x in parts)
-        except ValueError:
-            return
-        with self._lock:
-            self._last_ack = {"action": action, "action_seq": action_seq,
-                              "result": result, "imu_ok": bool(imu_ok),
-                              "i2c_found": i2c_found}
-            self._last_ack_ts = time.time()
-        self._say(f"[S5Link] ACK: {ACT_NAME.get(action, action)} -> "
-                  f"{ACK_RESULT_NAME.get(result, result)}")
-
     # ---------------------------------------------------------------- 状態
     def state(self):
         """最新テレメトリの dict (コピー)。未受信なら空 dict。"""
         with self._lock:
             return dict(self._state)
-
-    def last_ack(self):
-        """
-        最後に受けた Action 実行結果。
-
-        Returns: (dict または None, 受信からの秒数)
-            未受信なら (None, inf)。dict は
-            {"action", "action_seq", "result", "imu_ok", "i2c_found"}。
-        """
-        with self._lock:
-            if self._last_ack is None:
-                return None, float("inf")
-            return dict(self._last_ack), time.time() - self._last_ack_ts
-
-    def next_action_seq(self):
-        """
-        新しい Action を送るときの action_seq を1つ払い出す。
-
-        ★ 0 は「実行済み扱い」と衝突するので使わない (S5Cmd.h のコメント
-          参照)。呼ぶたびに 1..255 を循環する。
-        """
-        with self._lock:
-            self._action_seq = (self._action_seq % 255) + 1
-            return self._action_seq
 
     def age(self):
         """最後にテレメトリを受けてからの秒数。未受信なら inf。"""
@@ -336,8 +269,7 @@ class S5Link:
             self._say(f"[S5Link] 送信エラー: {e}")
 
     def send_command(self, req, vx_mps=0.0, vy_mps=0.0, alt_m=0.0,
-                     yaw_rate_dps=0.0, flags=0, corr_n_m=None, corr_e_m=None,
-                     action=ACT_NONE, action_seq=0):
+                     yaw_rate_dps=0.0, flags=0, corr_n_m=None, corr_e_m=None):
         """
         上りコマンドを 1 行送る。
 
@@ -353,15 +285,6 @@ class S5Link:
                 flags に CF_POS_CORR を含めること (呼び出し側の責任。
                 ここで勝手に足すと「補正のつもりがなかった0,0」を
                 誤って適用させかねない)。
-            action/action_seq: PID reset / IMU校正 / デバイス確認の単発指令
-                (ACT_*)。action_seq は next_action_seq() で払い出すこと
-                (0 だと機体側の重複排除の初期値と衝突して無視される。
-                S5Cmd.h のコメント参照)。action を送るときは corr_n_m/
-                corr_e_m が None でも 0,0 として自動で埋める
-                (ワイヤ上で action は corr の *後ろ* 固定位置にあるため)。
-                req は毎ループ上書きされる連続指令だが、action は
-                「値が変わった最初の1回」だけ機体側が実行するエッジ
-                トリガなので、呼び続けても何度も実行されたりはしない。
 
         ★ これを呼び続けるあいだだけ機体は GUIDED でいられる。呼ぶのを
           止めれば機体はホールド -> 自動着陸に落ちる (それが仕様)。
@@ -370,12 +293,13 @@ class S5Link:
           含んだ位置を毎ループ使うと発振するので、数秒に1回だけ
           (core/mission.py の POS_CORR_PERIOD_S) 送ること。詳しくは
           S5Cmd.h の CmdFrame コメント参照。
+
+        ★ 2026-09-14: PID reset / IMU校正 / デバイス確認の単発指令は
+          ここから削除した。IM920は操縦専用に戻したので、それらは
+          core/ble_tap.py (BLE経由) を使うこと。
         """
         if not self.ok:
             return
-        if action != ACT_NONE and action_seq == 0:
-            self._say("[S5Link] 警告: action_seq=0 は機体側で無視されます "
-                      "(next_action_seq() を使ってください)")
         self._n_sent += 1
         parts = [
             "CMD", str(int(req)),
@@ -385,16 +309,9 @@ class S5Link:
             str(int(round(yaw_rate_dps * 100.0))),
             str(int(flags)),
         ]
-        if corr_n_m is not None and corr_e_m is not None or action != ACT_NONE:
-            # action を送るなら、ワイヤ上その手前にある corr_n/corr_e も
-            # 必ず埋める (省略すると位置がずれて action が別の値として届く)。
-            cn = int(round(corr_n_m * 1000.0)) if corr_n_m is not None else 0
-            ce = int(round(corr_e_m * 1000.0)) if corr_e_m is not None else 0
-            parts.append(str(cn))
-            parts.append(str(ce))
-            if action != ACT_NONE:
-                parts.append(str(int(action)))
-                parts.append(str(int(action_seq)))
+        if corr_n_m is not None and corr_e_m is not None:
+            parts.append(str(int(round(corr_n_m * 1000.0))))
+            parts.append(str(int(round(corr_e_m * 1000.0))))
         self._write_raw(",".join(parts) + "\n")
 
     def send_key(self, ch):

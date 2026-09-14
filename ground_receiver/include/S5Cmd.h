@@ -56,8 +56,10 @@
 namespace S5C {
 
 // 構造体を変えたら必ずインクリメントすること (相手側が不一致を検出する)
-// VERSION 3 (2026-09-14): action/action_seq を追加 (下記)。
-constexpr uint8_t VERSION = 3;
+// VERSION 4 (2026-09-14): action/action_seq を削除 (IM920は操縦専用に戻し、
+//   単発メンテナンス指令はBLE経由に限定したため。下の Action 列挙子の
+//   コメント参照)。
+constexpr uint8_t VERSION = 4;
 
 // 下りテレメトリ (S5T) の type と衝突しない値。'K' = command
 constexpr uint8_t MAGIC = 0x4B;
@@ -92,25 +94,16 @@ inline const char* reqName(uint8_t r) {
 }
 
 // ------------------------------------------------------------
-//  地上局からの単発メンテナンス指令 (2026-09-14 追加)
+//  単発メンテナンス指令の種類 (Action)
 // ------------------------------------------------------------
-//  req/vx/vy/alt は「今どう飛びたいか」を毎回上書きする連続指令だが、
-//  こちらは「PID reset を1回」のような単発操作。同じ仕組みに混ぜると
-//  Commander が 5Hz で送り続けている間ずっと再実行されてしまう
-//  (IMUキャリブレーションが 5Hz で回るのは論外)。
-//
-//  そこで action_seq を「値が変わったときだけ実行する」エッジトリガに
-//  使う。地上局は 1 回の要求につき action_seq を 1 つ進め、届く確率を
-//  上げるためにしばらく (console.py は約1秒) 同じ値を送り続けるが、
-//  機体側は前回実行した action_seq と比較して「値が変わった最初の1回」
-//  だけ実行する (drone_s5.cpp handleRemoteAction() の g_last_action_seq)。
-//  req のように毎ループ送り続けても安全な値ではないので、必ずこの
-//  重複排除を通すこと。
-//
-//  ★ action_seq は 1..255 だけを使うこと (0 にしない)。機体側の
-//    g_last_action_seq は起動時に 0 で初期化されるので、地上局が 0 を
-//    送るとその action が「起動直後から実行済み」扱いで黙って無視される。
-//    ACT_NONE のときは何を送っても実行されないので 0 のままでよい。
+//  ★ 2026-09-14: 元はここ (IM920 の CmdFrame) に action/action_seq を
+//    足して地上局から送っていたが、「IM920は操縦専用にする / PID reset・
+//    IMU校正・デバイス確認のようなデバッグ用の単発操作はBLE経由に限定する」
+//    という方針にしたため、CmdFrame からは action/action_seq を削除した。
+//    今このファイルに残っているのは、値の意味 (Action の列挙子) を
+//    BLE 側 (log_recorder/src/main.cpp の Cmd:: / LogLinkProto.h の
+//    ActReq / drone_s5.cpp の handleBleAction()) と共有するためだけ。
+//    IM920 経由でこれらの値が機体に届くことはもう無い。
 // ------------------------------------------------------------
 enum Action : uint8_t {
     ACT_NONE      = 0,  // 何もしない (通常の巡航中はずっとこれ)
@@ -120,7 +113,7 @@ enum Action : uint8_t {
                         //     'k' と違い、遠隔操作者は機体に触れていない
                         //     ため。詳細は drone_s5.cpp のコメント参照)
     ACT_SELFTEST  = 3,  // I2Cバス再走査 + IMU疎通確認 (シリアル 'i' 相当)
-                        //   結果は S5Telem.h の AckFrame で返る
+                        //   結果は BLE 側 (LogLinkProto.h の ActAck) で返る
 };
 
 inline const char* actionName(uint8_t a) {
@@ -164,10 +157,8 @@ struct __attribute__((__packed__)) CmdFrame {
     uint16_t flags;         // 14  CmdFlag
     int16_t  corr_n_mm;     // 16  位置補正の絶対目標 pos_n [mm]。CF_POS_CORR 時のみ有効
     int16_t  corr_e_mm;     // 18  同 pos_e [mm]
-    uint8_t  action;        // 19  Action (単発メンテナンス指令。上のコメント参照)
-    uint8_t  action_seq;    // 20  action の連番。値が変わった1回だけ機体側が実行する
 };
-static_assert(sizeof(CmdFrame) == 20, "CmdFrame は 20 byte");
+static_assert(sizeof(CmdFrame) == 18, "CmdFrame は 18 byte");
 static_assert(sizeof(CmdFrame) + CHECKSUM_BYTES <= IM920SL_MAX_PAYLOAD,
               "IM920sL の 32 バイト制限を超えています");
 

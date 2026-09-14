@@ -24,7 +24,10 @@
 //
 //  【配線】 (既定は Teensy4.0 Serial4: TX=17 / RX=16)
 //     Teensy TX17 ---- RP2040(XIAO) D7/GP1 (RX)
-//     Teensy RX16 ---- RP2040(XIAO) D6/GP0 (TX)   ※状態表示用。省いても動く
+//     Teensy RX16 ---- RP2040(XIAO) D6/GP0 (TX)   ※状態表示 + BLE経由の
+//                                                    デバッグ指令(T_ACT)用。
+//                                                    省いても飛行はできるが、
+//                                                    BLE からの IMU校正等は使えない
 //     GND         ---- GND                        ※必須
 //    電源は分ける (SD 書き込みの突入で FC を巻き込まないため)。GND だけ共通。
 // ============================================================
@@ -68,6 +71,13 @@ static size_t   s_peak_ring = 0;   // リング使用量のピーク
 static P::Stat  s_stat = {};
 static uint32_t s_stat_ms = 0;
 static uint32_t s_stat_n  = 0;
+
+// ロガー(BLE Write 中継)からの単発メンテナンス指令。pollAction() で
+// 「前回取り出した後に新しく届いたか」だけを見る (取りこぼし前提の
+// 単純なエッジ検出。重複排除そのものは drone_s5.cpp 側の action_seq 比較で行う)。
+static P::ActReq s_act_req   = {};
+static uint32_t  s_act_rx_n  = 0;   // 受信した ActReq の総数
+static uint32_t  s_act_seen_n = 0;  // pollAction() 済みの数
 
 // ---- RX 診断カウンタ (配線の切り分け用) ----
 //  rx_bytes==0      : 線に何も来ていない → GND 未共通 / D6→RX16 断線 / RX16 不良
@@ -113,7 +123,7 @@ inline bool sendFrame(uint8_t type, const void* payload, size_t len) {
     return true;
 }
 
-// ---- ロガーからの T_STAT 受信 (小さな受信ステートマシン) -------------------
+// ---- ロガーからの受信 (T_STAT / T_ACT。小さな受信ステートマシン) -----------
 inline void pollStat() {
     static uint8_t st = 0, type = 0, len = 0, seq = 0, idx = 0;
     static uint8_t buf[P::MAX_PAYLOAD];
@@ -139,6 +149,9 @@ inline void pollStat() {
                     memcpy(&s_stat, buf, sizeof(s_stat));
                     s_stat_ms = millis();
                     s_stat_n++;
+                } else if (crc == c && type == P::T_ACT && len == sizeof(P::ActReq)) {
+                    memcpy(&s_act_req, buf, sizeof(s_act_req));
+                    s_act_rx_n++;
                 } else if (crc != c) {
                     s_rx_crcfail++;
                 }
@@ -147,6 +160,25 @@ inline void pollStat() {
             }
         }
     }
+}
+
+// BLE 経由の単発メンテナンス指令を取り出す。前回 pollAction() 済みの
+// ものより新しいものが届いていれば true (取り出したら「消費済み」)。
+// ★ drone_s5.cpp 側でさらに action_seq の変化を見て重複排除すること
+//   (これ自体は「新着があったか」しか見ていない)。
+inline bool pollAction(P::ActReq& out) {
+    if (s_act_seen_n >= s_act_rx_n) return false;
+    s_act_seen_n = s_act_rx_n;
+    out = s_act_req;
+    return true;
+}
+
+// 上記の実行結果を FC -> ロガー -> BLE へ送る。既存の送信リング
+// (T_START/T_REC/T_STOP と同じ) に積むだけなので service() が捌く。
+inline bool sendAck(uint8_t action, uint8_t action_seq, uint8_t result,
+                    uint8_t imu_ok = 0, uint8_t i2c_found = 0) {
+    P::ActAck a{action, action_seq, result, imu_ok, i2c_found};
+    return sendFrame(P::T_ACT_ACK, &a, sizeof(a));
 }
 
 // ============================================================

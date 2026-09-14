@@ -38,14 +38,17 @@ except ImportError:
 
 # ---- quad/LogLinkProto.h と一致させること ---------------------------------
 SOF1, SOF2 = 0xA5, 0x5A
-T_START, T_REC, T_STOP = 0x01, 0x02, 0x03
+T_START, T_REC, T_STOP, T_ACT_ACK = 0x01, 0x02, 0x03, 0x04
+T_ACT = 0x82   # ロガー -> FC (Notify には流れない。参考として持っておくだけ)
 HDR_LEN = 5          # SOF1 SOF2 type len seq
 BIN_HDR_LEN = 32
 BIN_HDR_T0_OFS = 12
+ACT_ACK_STRUCT = "<BBBBB"   # action, action_seq, result, imu_ok, i2c_found
 
 # ---- log_recorder/src/main.cpp と一致させること -----------------------------
 BLE_DEVICE_NAME = "S5-LogBLE"
-BLE_CHAR_UUID = "d5913037-2d8a-41ee-85b9-4e361aa5c8a7"
+BLE_CHAR_UUID = "d5913037-2d8a-41ee-85b9-4e361aa5c8a7"      # Notify (ログ)
+BLE_CHAR_CMD_UUID = "d5913038-2d8a-41ee-85b9-4e361aa5c8a7"  # Write (デバッグ指令。ActReq 2byte)
 
 
 def crc8(data: bytes, crc: int = 0) -> int:

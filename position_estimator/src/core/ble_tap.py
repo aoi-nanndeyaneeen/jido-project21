@@ -35,11 +35,15 @@ zip して dict にしている。125Hz 全部を文字列化すると無駄な�
         ...
         st  = tap.status()          # 接続/レート/ファイル
         rec = tap.state()           # 最新レコード (dict, 物理値)
+        seq = tap.next_action_seq()
+        tap.fire_action(ACT_PID_RESET, seq)   # デバッグ指令 (BLE Write)
+        ack, age = tap.last_ack()             # 実行結果 (来ていれば dict)
     tap.stop()
 """
 
 import asyncio
 import importlib.util
+import struct
 import sys
 import threading
 import time
@@ -55,6 +59,14 @@ DECODE_HZ = 10.0
 
 
 _MODE_NAME = {0: "IDLE", 1: "HOLD", 2: "TAKEOFF", 3: "GUIDED", 4: "LAND"}
+
+# S5Cmd.h / S5Telem.h と一致させること (BLE 側は Action の値をそのまま運ぶだけ)
+ACT_NONE, ACT_PID_RESET, ACT_IMU_CAL, ACT_SELFTEST = 0, 1, 2, 3
+ACT_NAME = {ACT_NONE: "-", ACT_PID_RESET: "PID_RESET",
+           ACT_IMU_CAL: "IMU_CAL", ACT_SELFTEST: "SELFTEST"}
+ACK_OK, ACK_REFUSED_ARMED, ACK_CAL_REJECTED = 0, 1, 2
+ACK_RESULT_NAME = {ACK_OK: "OK", ACK_REFUSED_ARMED: "拒否(アーム中)",
+                   ACK_CAL_REJECTED: "却下(妥当性チェック)"}
 
 
 def _format_rec_line(rec):
@@ -108,6 +120,7 @@ class BleTap:
 
         self._logger = None          # ble_receiver.BinLogger
         self._connected = False
+        self._client = None          # bleak.BleakClient (接続中のみ)
         self._last_rec = {}          # 解釈済みの最新レコード
         self._t_decode = 0.0
         self._n_rec = 0              # 受け取った T_REC の総数
@@ -116,6 +129,11 @@ class BleTap:
         self._rate_hz = 0.0
         self._rec_size_ok = None     # None=未確認 / True / False
         self._err = ""
+
+        # デバッグ指令 (PID reset/IMU校正/デバイス確認) の ACK
+        self._last_ack = None        # dict または None
+        self._last_ack_t = 0.0
+        self._act_seq = 0            # next_action_seq() のカウンタ
 
         self._ble = None             # ble_receiver モジュール
         self._b2c = None             # bin2csv モジュール
@@ -185,10 +203,55 @@ class BleTap:
         with self._lock:
             return dict(self._last_rec)
 
+    def last_ack(self):
+        """(dict または None, 受信してからの経過秒)。まだ無ければ (None, inf)。"""
+        with self._lock:
+            if self._last_ack is None:
+                return None, float("inf")
+            return dict(self._last_ack), time.time() - self._last_ack_t
+
+    def next_action_seq(self):
+        """1..255 を巡回するカウンタ。0 は機体側で無視されるので使わない。"""
+        with self._lock:
+            self._act_seq = (self._act_seq % 255) + 1
+            return self._act_seq
+
+    # ------------------------------------------------------------ 送信
+    def fire_action(self, action, action_seq):
+        """デバッグ指令 (PID reset/IMU校正/デバイス確認) を BLE Write で送る。
+        接続していなければ False (呼び出し側がメッセージを出すこと)。
+        ★ ここで運べるのは action + action_seq の 2byte だけ。速度・高度・
+          離着陸要求のような操縦系は絶対に足さないこと (S5Cmd.h のコメント
+          と同じ理由: BLE 経由で機体を操縦する経路を作らない設計)。"""
+        if self._loop is None or not self._connected:
+            return False
+        payload = bytes([int(action) & 0xFF, int(action_seq) & 0xFF])
+        try:
+            asyncio.run_coroutine_threadsafe(self._write_action(payload), self._loop)
+        except RuntimeError:
+            return False
+        return True
+
+    async def _write_action(self, payload: bytes):
+        client = self._client
+        if client is None or not client.is_connected:
+            self._say("[BLE] 未接続のため指令を送れませんでした")
+            return
+        try:
+            await client.write_gatt_char(self._ble.BLE_CHAR_CMD_UUID, payload, response=True)
+        except Exception as e:
+            self._say(f"[BLE] 指令の送信に失敗: {e}")
+
     # ------------------------------------------------------------ 内部
     def _on_frame(self, type_, seq, payload):
         if self._stop.is_set():
             return
+
+        if type_ == self._ble.T_ACT_ACK:
+            # デバッグ指令の実行結果。.BIN には書かない (ログレコードではないため)。
+            self._on_act_ack(payload)
+            return
+
         # まず保存 (ble_receiver.BinLogger と完全に同じ .BIN ができる)
         self._logger.on_frame(type_, seq, payload)
 
@@ -238,6 +301,23 @@ class BleTap:
         if self.verbose:
             self._say(_format_rec_line(rec))
 
+    def _on_act_ack(self, payload):
+        try:
+            action, action_seq, result, imu_ok, i2c_found = struct.unpack(
+                self._ble.ACT_ACK_STRUCT, payload)
+        except struct.error:
+            return
+        ack = {"action": action, "action_seq": action_seq, "result": result,
+               "imu_ok": imu_ok, "i2c_found": i2c_found}
+        with self._lock:
+            self._last_ack = ack
+            self._last_ack_t = time.time()
+        extra = ""
+        if action == ACT_SELFTEST and result == ACK_OK:
+            extra = f"  IMU疎通={'OK' if imu_ok else 'NG'} I2C={i2c_found}個"
+        self._say(f"[BLE] ACK  {ACT_NAME.get(action, action)} "
+                  f"-> {ACK_RESULT_NAME.get(result, result)}{extra}")
+
     def _run(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
@@ -271,6 +351,7 @@ class BleTap:
                 async with ble.BleakClient(dev) as client:
                     with self._lock:
                         self._connected = True
+                        self._client = client
                         self._err = ""
                     self._say(f"[BLE] 接続: {dev.address}")
 
@@ -286,6 +367,7 @@ class BleTap:
             finally:
                 with self._lock:
                     self._connected = False
+                    self._client = None
 
             if not self._stop.is_set():
                 self._say("[BLE] 切断。再接続します")

@@ -92,7 +92,6 @@ static S5T::AltFrame   last_alt{};
 static S5T::PosFrame   last_pos{};
 static S5T::AttFrame   last_att{};
 static S5T::ParamFrame last_param{};
-static S5T::AckFrame   last_ack{};
 static bool  have_alt = false, have_pos = false, have_att = false, have_param = false;
 static int   last_rssi  = -1;
 static uint32_t last_rx_ms = 0;
@@ -108,7 +107,7 @@ static bool     t_init = false;
 //   相手が違う / パケット定義がずれている、と原因を分けられる。
 static uint32_t n_rx_bytes = 0, n_rx_lines = 0;
 static bool     raw_dump = false;   // 'd' で IM920 の生の行をそのまま出す
-static uint32_t n_alt = 0, n_pos = 0, n_att = 0, n_param = 0, n_ack = 0;
+static uint32_t n_alt = 0, n_pos = 0, n_att = 0, n_param = 0;
 static uint32_t n_lost  = 0;   // seq の飛びから数えた累積欠落
 static uint32_t n_bad_cs = 0;  // チェックサム不一致
 static uint32_t n_bad_len = 0; // 長さ / type が合わない (構造体バージョン違い?)
@@ -215,9 +214,9 @@ static void startCsv() {
 static void stopCsv() {
     csv_on = false;
     Serial.println("LOG_STOP");
-    Serial.printf("# A=%lu B=%lu C=%lu param=%lu ack=%lu lost=%lu badcs=%lu badlen=%lu\n",
+    Serial.printf("# A=%lu B=%lu C=%lu param=%lu lost=%lu badcs=%lu badlen=%lu\n",
                   (unsigned long)n_alt, (unsigned long)n_pos, (unsigned long)n_att,
-                  (unsigned long)n_param, (unsigned long)n_ack, (unsigned long)n_lost,
+                  (unsigned long)n_param, (unsigned long)n_lost,
                   (unsigned long)n_bad_cs, (unsigned long)n_bad_len);
 }
 
@@ -237,28 +236,6 @@ static void emitParam(const S5T::ParamFrame& p) {
                   p.alt_rate_ki / S5T::SC_GAIN, p.alt_rate_kd / S5T::SC_GAIN,
                   p.alt_hover_thr / S5T::SC_GAIN, p.alt_target_m / S5T::SC_GAIN,
                   p.flow_max_lean / S5T::SC_GAIN, p.alt_thr_auth / S5T::SC_GAIN);
-}
-
-// S5Cmd.h の Action (PID reset / IMU校正 / デバイス確認) の実行結果。
-//  ★ csv_on の有無に関わらず常に出す。PARAM/DATA と違い定期送信ではなく
-//    「操作した本人が待っている返事」なので、CSV出力をONにし忘れていても
-//    見えないと困る。1行目は s5_link.py が機械的にパースする数値、
-//    2行目はシリアルモニタで直接見る人向けの人間可読な要約。
-static void emitAck(const S5T::AckFrame& r) {
-    Serial.printf("ACK,%u,%u,%u,%u,%u\n",
-                  (unsigned)r.last_action, (unsigned)r.last_action_seq,
-                  (unsigned)r.result, (unsigned)r.imu_ok, (unsigned)r.i2c_found);
-
-    const char* result_s = (r.result == S5T::ACK_OK)            ? "OK"
-                          : (r.result == S5T::ACK_REFUSED_ARMED) ? "拒否(アーム中)"
-                          : (r.result == S5T::ACK_CAL_REJECTED)  ? "却下(妥当性チェック不合格)"
-                                                                  : "?";
-    Serial.printf("# ACK: %s -> %s", S5C::actionName(r.last_action), result_s);
-    if (r.last_action == S5C::ACT_SELFTEST && r.result == S5T::ACK_OK) {
-        Serial.printf("  (IMU疎通=%s I2Cデバイス数=%u)",
-                      r.imu_ok ? "OK" : "NG", (unsigned)r.i2c_found);
-    }
-    Serial.println();
 }
 
 // 量子化を物理値へ戻して 1行書く。CSV_HEADER と同じ順であること。
@@ -334,9 +311,9 @@ static void printStatus() {
                   (unsigned long)n_cmd_lines, (unsigned long)n_cmd_tx,
                   (unsigned long)n_cmd_bad,
                   cmd_have ? "(送信中)" : "(PC からの指令なし)");
-    Serial.printf("stats: A=%lu B=%lu C=%lu P=%lu R=%lu  lost=%lu  badcs=%lu badlen=%lu",
+    Serial.printf("stats: A=%lu B=%lu C=%lu P=%lu  lost=%lu  badcs=%lu badlen=%lu",
                   (unsigned long)n_alt, (unsigned long)n_pos, (unsigned long)n_att,
-                  (unsigned long)n_param, (unsigned long)n_ack, (unsigned long)n_lost,
+                  (unsigned long)n_param, (unsigned long)n_lost,
                   (unsigned long)n_bad_cs, (unsigned long)n_bad_len);
     const uint32_t tot = n_alt + n_pos + n_att + n_param + n_lost;
     if (tot) Serial.printf("   欠落率 %.1f%%", 100.0f * (float)n_lost / (float)tot);
@@ -580,18 +557,12 @@ static void handleLine(String& line) {
             if (csv_on) emitParam(last_param);
             break;
         }
-        case S5T::TYPE_ACK: {
-            memcpy(&last_ack, buf, sizeof(last_ack));
-            n_ack++;
-            emitAck(last_ack);   // csv_on を問わず常に出す (emitAck 内のコメント参照)
-            break;
-        }
         default:
             n_bad_len++;
             if (n_bad_len <= 3)
-                Serial.printf("# 未知の type=0x%02X (期待 A=0x%02X B=0x%02X C=0x%02X P=0x%02X R=0x%02X)\n",
+                Serial.printf("# 未知の type=0x%02X (期待 A=0x%02X B=0x%02X C=0x%02X P=0x%02X)\n",
                               buf[0], S5T::TYPE_ALT, S5T::TYPE_POS,
-                              S5T::TYPE_ATT, S5T::TYPE_PARAM, S5T::TYPE_ACK);
+                              S5T::TYPE_ATT, S5T::TYPE_PARAM);
             break;
     }
 }
@@ -599,22 +570,22 @@ static void handleLine(String& line) {
 // ------------------------------------------------------------
 //  上りコマンド行のパース
 //    CMD,<req>,<vx_mmps>,<vy_mmps>,<alt_cm>,<yaw_rate_cdps>,<flags>
-//        [,<corr_n_mm>,<corr_e_mm>[,<action>,<action_seq>]]
+//        [,<corr_n_mm>,<corr_e_mm>]
 //  ★ 欠けているフィールドは 0 として扱わず、行ごと捨てる。数値が 1 個
 //    ずれただけで「目標高度」が「速度」になる。黙って飛ばすほうが危ない。
-//    ただし flags 以降 (flags, corr_n_mm, corr_e_mm, action, action_seq) は
-//    後から足したぶんなので省略可 (旧PCとの互換ではなく、それらを使わない
-//    指令行を短く保つため)。action/action_seq は corr_n_mm/corr_e_mm の
-//    *後ろ* に固定なので、action を送りたいときは corr の2つも
-//    (使わないなら 0,0 で) 必ず埋めること — s5_link.py の send_command()
-//    はこの順序を守っている。
+//    ただし flags 以降 (flags, corr_n_mm, corr_e_mm) は後から足したぶん
+//    なので省略可 (旧PCとの互換ではなく、それらを使わない指令行を
+//    短く保つため)。
+//  ★ 2026-09-14: action/action_seq はここから削除した。IM920 は操縦専用
+//    に戻し、単発メンテナンス指令 (PID reset/IMU校正/デバイス確認) は
+//    BLE 経由に一本化したため (log_recorder/src/main.cpp の Cmd:: 参照)。
 // ------------------------------------------------------------
 static void handleCmdLine(char* line) {
     n_cmd_lines++;
-    long v[10];
+    long v[8];
     int  n = 0;
     char* p = line + 4;              // "CMD," の次から
-    while (n < 10 && *p) {
+    while (n < 8 && *p) {
         char* end = nullptr;
         v[n] = strtol(p, &end, 10);
         if (end == p) break;          // 数字が無い
@@ -623,10 +594,10 @@ static void handleCmdLine(char* line) {
         if (*p == ',') p++;
         else break;
     }
-    if (n < 5) {                      // flags/corr_*/action_* は省略可
+    if (n < 5) {                      // flags/corr_* は省略可
         n_cmd_bad++;
         Serial.printf("# CMD 行が短い (%d 個)。"
-                      "CMD,req,vx,vy,alt,yawrate[,flags[,corrN,corrE[,action,actionSeq]]]\n", n);
+                      "CMD,req,vx,vy,alt,yawrate[,flags[,corrN,corrE]]\n", n);
         return;
     }
 
@@ -640,8 +611,6 @@ static void handleCmdLine(char* line) {
     cmd_box.flags         = (uint16_t)((n >= 6) ? v[5] : 0);
     cmd_box.corr_n_mm     = (int16_t)constrain((n >= 8) ? v[6] : 0, -32768, 32767);
     cmd_box.corr_e_mm     = (int16_t)constrain((n >= 8) ? v[7] : 0, -32768, 32767);
-    cmd_box.action        = (uint8_t)constrain((n >= 10) ? v[8] : 0, 0, 255);
-    cmd_box.action_seq    = (uint8_t)constrain((n >= 10) ? v[9] : 0, 0, 255);
     cmd_have       = true;
     cmd_last_pc_ms = millis();
 }
@@ -713,7 +682,7 @@ static void handleKey(char c) {
             break;
         case 'z': case 'Z':
             n_rx_bytes = n_rx_lines = 0;
-            n_alt = n_pos = n_att = n_param = n_ack = n_lost = n_bad_cs = n_bad_len = 0;
+            n_alt = n_pos = n_att = n_param = n_lost = n_bad_cs = n_bad_len = 0;
             seq_init = false;
             Serial.println("# 統計をクリアしました");
             break;

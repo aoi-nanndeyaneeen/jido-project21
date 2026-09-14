@@ -31,9 +31,18 @@
 //    をそのまま Notify に乗せる。受信側は既存の LogLinkProto::crc8()/フレーム
 //    パーサをそのまま流用できる。
 //
+//  【PC -> 機体 のデバッグ指令 (2026-09-14 追加)】
+//    BLE_CHAR_CMD_UUID (Write) に ActReq (action + action_seq の2byte) を
+//    書くと、そのまま UART (D6 TX) 経由で機体へ中継する (Cmd:: 参照)。
+//    運べるのは PID reset / IMU校正 / デバイス確認の3種類だけで、速度・
+//    高度・離着陸要求のような操縦系のフィールドはプロトコル上存在しない。
+//    機体の操縦は今まで通り IM920 だけが担う (詳細は LogLinkProto.h)。
+//
 //  【配線】
 //     D7  RX  <---- Teensy TX17 (Serial4)
-//     D6  TX  ----> Teensy RX16          ※状態返信用。省略可
+//     D6  TX  ----> Teensy RX16          ※状態返信 + 上記デバッグ指令用。
+//                                           省略すると飛行はできるが、
+//                                           BLEからのデバッグ指令は使えない
 //     GND     <--------> Teensy GND      ※必須
 //    ★ XIAO の電源は FC と分ける。GND だけ共通にすること。
 //
@@ -48,6 +57,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <string>
 
 #include "quad/LogLinkProto.h"   // ★ flight_controller 側の実体を include
 
@@ -78,7 +88,12 @@ constexpr uint32_t BLE_MIN_TX_INTERVAL_MS = 5;   // 上限 200 notify/s 程度�
 
 static const char* BLE_DEVICE_NAME    = "S5-LogBLE";
 static const char* BLE_SERVICE_UUID   = "d5913036-2d8a-41ee-85b9-4e361aa5c8a7";
-static const char* BLE_CHAR_UUID      = "d5913037-2d8a-41ee-85b9-4e361aa5c8a7";
+static const char* BLE_CHAR_UUID      = "d5913037-2d8a-41ee-85b9-4e361aa5c8a7";   // Notify (ログ)
+// PC -> 機体 のデバッグ指令 (Write)。2026-09-14 追加。
+//  ★ ここに書けるのは ActReq (action + action_seq の2byte) だけ。
+//    速度・高度・離着陸要求のような操縦系は一切運べない設計にしてある
+//    (機体を操縦する経路は今まで通り IM920 だけ。詳細は LogLinkProto.h)。
+static const char* BLE_CHAR_CMD_UUID  = "d5913038-2d8a-41ee-85b9-4e361aa5c8a7";
 
 // ============================================================
 //  コア間 (タスク間) リング (SPSC)
@@ -110,6 +125,60 @@ struct Stats {
     volatile uint32_t peak_ring = 0;
 };
 static Stats g_st;
+
+// ============================================================
+//  §1.6  PC -> 機体 のデバッグ指令 (BLE Write -> UART 中継)
+// ============================================================
+//  onWrite() は BLE スタックのタスクから呼ばれる (rx/ble タスクとは別)。
+//  Serial1 への書き込みは rx役 (loop()) だけがやる、という既存の取り決め
+//  (Rx::sendStat() 参照) を崩さないよう、ここではフラグを立てるだけにして
+//  実際の送信は loop() 側に任せる。1回分しか覚えない (デバッグ用の単発
+//  ボタン押下が対象で、連打を全部拾う必要はない)。
+namespace Cmd {
+
+static volatile bool    s_pending = false;
+static volatile uint8_t s_action  = 0;
+static volatile uint8_t s_seq     = 0;
+static uint32_t         s_n_rx    = 0;   // 診断用 (printStatus)
+static uint32_t         s_n_bad   = 0;   // 長さ不正などで捨てた数
+
+// ★ action の値そのものは中身を見ない (0..255 何でも素通し)。
+//   意味の検証 (Action として妥当か / action_seq の重複排除) は
+//   全部 FC 側 (drone_s5.cpp handleBleAction()) の役目にしてある。
+//   ここで判定を持つと、Action が増えたときに両方直す羽目になる。
+static void onWrite(const uint8_t* data, size_t len) {
+    if (len != 2) { s_n_bad++; return; }
+    s_action  = data[0];
+    s_seq     = data[1];
+    s_pending = true;
+    s_n_rx++;
+}
+
+// loop() から毎回呼ぶ。Serial1 への書き込みはここでだけ行う。
+static void service() {
+    if (!s_pending) return;
+    s_pending = false;
+    uint8_t f[P::MAX_FRAME];
+    P::ActReq req{ s_action, s_seq };
+    static uint8_t seq = 0;
+    const size_t n = P::buildFrame(f, P::T_ACT, seq++, &req, sizeof(req));
+    if ((size_t)Serial1.availableForWrite() >= n) {
+        Serial1.write(f, n);
+        Serial.printf("[CMD] BLE -> 機体: action=%u seq=%u\n",
+                      (unsigned)req.action, (unsigned)req.action_seq);
+    } else {
+        Serial.println("[CMD] UART送信バッファが詰まっていて送れませんでした");
+    }
+}
+
+class WriteCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* c) override {
+        const std::string v = c->getValue();
+        Cmd::onWrite((const uint8_t*)v.data(), v.size());
+    }
+};
+
+} // namespace Cmd
 
 // ============================================================
 //  §1  rx役 : UART 受信 + フレーム検証 + リングへ push
@@ -299,6 +368,12 @@ static void init() {
     BLEService* svc = server->createService(BLE_SERVICE_UUID);
     s_char = svc->createCharacteristic(BLE_CHAR_UUID, BLECharacteristic::PROPERTY_NOTIFY);
     s_char->addDescriptor(new BLE2902());
+
+    // PC -> 機体 のデバッグ指令 (Write)。ActReq (2byte) のみ受け付ける。
+    BLECharacteristic* cmd_char = svc->createCharacteristic(
+        BLE_CHAR_CMD_UUID, BLECharacteristic::PROPERTY_WRITE);
+    cmd_char->setCallbacks(new Cmd::WriteCallbacks());
+
     svc->start();
 
     BLEAdvertising* adv = BLEDevice::getAdvertising();
@@ -414,6 +489,15 @@ static void drainRing() {
                 s_bytes        = 0;
                 break;
             }
+            case P::T_ACT_ACK: {
+                // デバッグ指令(T_ACT)の実行結果。記録中かどうかに関係なく、
+                // 常に転送する (recording state gate の対象外)。
+                if (!readyToSend()) return;   // pop せず次回に持ち越す
+                discard();
+                sendFrame(f, flen);
+                Serial.println("[BLE] ACT_ACK 送信");
+                break;
+            }
             default:
                 discard();
                 break;
@@ -465,6 +549,8 @@ static void printStatus() {
                   (unsigned long)g_st.crc_err,
                   (unsigned long)g_st.seq_gap, (unsigned long)g_st.orphan);
     Serial.printf("  最悪tx    : %lu us\n", (unsigned long)g_st.worst_tx_us);
+    Serial.printf("  デバッグ指令(BLE->機体): 受信 %lu 件  不正 %lu 件\n",
+                  (unsigned long)Cmd::s_n_rx, (unsigned long)Cmd::s_n_bad);
     if (g_st.crc_err || g_st.seq_gap)
         Serial.println("  ★ crc_err/seq_gap が増える = UART が化けている。"
                        "配線を短く / GND を確実に / 両側の BAUD を 1000000 へ");
@@ -505,6 +591,7 @@ void loop() {
         last_stat = millis();
         Rx::sendStat();
     }
+    Cmd::service();   // BLE から指令が来ていれば、ここで初めて Serial1 へ書く
 
     // USB コンソール
     if (Serial.available()) {

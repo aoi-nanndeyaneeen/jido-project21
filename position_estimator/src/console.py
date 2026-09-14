@@ -67,11 +67,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from core.keyreader import KeyReader
 from core.s5_link import (S5Link, REQ_ABORT, REQ_GUIDED, REQ_HOLD, REQ_IDLE,
                           REQ_LAND, REQ_TAKEOFF, REQ_NAME,
-                          CF_ARMED_OK, CF_ALT_ABS,
-                          ACT_NONE, ACT_PID_RESET, ACT_IMU_CAL, ACT_SELFTEST,
-                          ACT_NAME, ACK_OK, ACK_RESULT_NAME)
+                          CF_ARMED_OK, CF_ALT_ABS)
 from utils.config import GROUND_LINK_PORT, LOG_DIR, MISSION_TAKEOFF_ALT_M
 from utils.logger import CsvLogger
 
@@ -87,11 +86,6 @@ ALT_MAX_M = 2.00
 # それ以上送っても無線には出ない。
 SEND_HZ = 5.0
 
-# 単発メンテナンス指令 (PID reset / IMU校正 / デバイス確認) を、
-# 届く確率を上げるためにこの秒数だけ同じ action_seq で送り続ける。
-# 機体側は action_seq の重複を排除するので、届いた回数分は実行されない。
-ACTION_LINGER_S = 1.0
-
 # 機体側のフェイルセーフ (QuadConfig.h)。画面の注意書きに使う。
 STALE_HOLD_S = 1.0
 STALE_LAND_S = 4.0
@@ -102,54 +96,6 @@ MODE_NAME = {0: "RATE", 1: "ANGLE", 2: "GUIDED", 3: "POSHOLD", 4: "ALTHOLD"}
 # 機体の高度サブ状態 (S5Telem の AltState)
 ALT_STATE_NAME = {0: "OFF", 1: "HOLD", 2: "TAKEOFF", 3: "LAND", 4: "LANDED"}
 
-
-# ==========================================================================
-#  キー入力  -  Enter を押さずに 1 文字取る
-# ==========================================================================
-class KeyReader:
-    """Windows は msvcrt、それ以外は termios。どちらも無ければ無効化する。"""
-
-    def __init__(self):
-        self._mode = None
-        self._fd = None
-        self._saved = None
-        if os.name == "nt":
-            import msvcrt  # noqa: F401
-            self._mode = "nt"
-        elif sys.stdin.isatty():
-            self._mode = "posix"
-
-    def __enter__(self):
-        if self._mode == "posix":
-            import termios
-            import tty
-            self._fd = sys.stdin.fileno()
-            self._saved = termios.tcgetattr(self._fd)
-            tty.setcbreak(self._fd)
-        return self
-
-    def __exit__(self, *exc):
-        if self._mode == "posix" and self._saved is not None:
-            import termios
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
-
-    def get(self):
-        """押されていれば 1 文字、無ければ None。ブロックしない。"""
-        if self._mode == "nt":
-            import msvcrt
-            if not msvcrt.kbhit():
-                return None
-            ch = msvcrt.getwch()
-            if ch in ("\x00", "\xe0"):   # 方向キーなどの 2 バイト目を捨てる
-                msvcrt.getwch()
-                return None
-            return ch
-        if self._mode == "posix":
-            import select
-            if not select.select([sys.stdin], [], [], 0)[0]:
-                return None
-            return sys.stdin.read(1)
-        return None
 
 
 # ==========================================================================
@@ -209,7 +155,6 @@ class ConsoleLogger(CsvLogger):
 
     HEADER = ["Epoch_s", "Time", "Event",
               "Tx_On", "Req", "Cmd_Vx(m/s)", "Cmd_Vy(m/s)", "Cmd_Alt(m)", "Flags",
-              "Action", "Action_Seq",
               "Mode", "Armed", "Guided", "Cmd_Fresh", "Landed", "Airborne",
               "Range_H(m)", "Alt_Hold(m)", "Climb(m/s)", "Thr",
               "Fh_PosN(m)", "Fh_PosE(m)", "Flow_OK", "Range_Valid",
@@ -226,8 +171,6 @@ class ConsoleLogger(CsvLogger):
             int(cmd["tx_on"]), REQ_NAME.get(cmd["req"], cmd["req"]),
             round(cmd["vx"], 3), round(cmd["vy"], 3), round(cmd["alt"], 3),
             cmd["flags"],
-            ACT_NAME.get(cmd.get("action", ACT_NONE), cmd.get("action", "")),
-            cmd.get("action_seq", 0),
             MODE_NAME.get(int(mode), mode) if mode is not None else "",
             int(bool(tel.get("armed"))), int(bool(tel.get("guided"))),
             int(bool(tel.get("cmd_fresh"))), int(bool(tel.get("landed"))),
@@ -265,9 +208,6 @@ class Commander:
         self._tx = False              # ★ 起動時は必ず送信 OFF
         self._event = ""
         self._n_tx = 0
-        self._action = ACT_NONE
-        self._action_seq = 0
-        self._action_until = 0.0      # この時刻まで action を送り続ける
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -275,12 +215,9 @@ class Commander:
     # ---- 状態 ----------------------------------------------------------
     def snapshot(self):
         with self._lock:
-            action_live = self._action if time.time() < self._action_until else ACT_NONE
             return {"req": self._req, "vx": self._vx, "vy": self._vy,
                     "alt": self._alt, "tx_on": self._tx,
-                    "flags": CF_ARMED_OK | CF_ALT_ABS, "n_tx": self._n_tx,
-                    "action": action_live,
-                    "action_seq": self._action_seq if action_live != ACT_NONE else 0}
+                    "flags": CF_ARMED_OK | CF_ALT_ABS, "n_tx": self._n_tx}
 
     # ---- 操作 ----------------------------------------------------------
     def set_req(self, req, event=""):
@@ -311,20 +248,6 @@ class Commander:
             self._vx = self._vy = 0.0
             self._event = "TX STOP (機体は 1s でホールド -> 4s で自動着陸)"
 
-    def fire_action(self, action, event=""):
-        """単発メンテナンス指令 (PID reset / IMU校正 / デバイス確認) を1つ発行する。
-
-        ★ 巡航指令 (req) を送っていない (tx_on=False) 状態でも送れる。
-          これが主用途: 飛ばす前に地上でPID resetやデバイス確認をする。
-          その場合 _loop() は req を REQ_IDLE に強制する
-          (勝手に GUIDED へ入ってしまわないように)。
-        """
-        with self._lock:
-            self._action = action
-            self._action_seq = self.link.next_action_seq()
-            self._action_until = time.time() + ACTION_LINGER_S
-            self._event = event or f"ACTION={ACT_NAME.get(action, action)}"
-
     def take_event(self):
         with self._lock:
             ev, self._event = self._event, ""
@@ -341,20 +264,11 @@ class Commander:
             t0 = time.time()
             snap = self.snapshot()
             event = self.take_event()
-            # action は tx_on と無関係に送る (飛ばす前の地上チェックが主用途)。
-            #  ★ tx_on=False のときは req を REQ_IDLE に強制する。self._req の
-            #    既定値 REQ_HOLD をそのまま送ると、GUIDED に入る資格さえ
-            #    揃っていれば「意味のある指令」として勝手に engage されうる
-            #    (drone_s5.cpp updateGuided() の初回エンゲージ条件)。
-            #    デバイス確認のつもりが離陸資格を与えてしまう事故を防ぐ。
-            send_now = snap["tx_on"] or snap["action"] != ACT_NONE
+            send_now = snap["tx_on"]
             if send_now:
-                req = snap["req"] if snap["tx_on"] else REQ_IDLE
-                self.link.send_command(req, vx_mps=snap["vx"],
+                self.link.send_command(snap["req"], vx_mps=snap["vx"],
                                        vy_mps=snap["vy"], alt_m=snap["alt"],
-                                       flags=snap["flags"],
-                                       action=snap["action"],
-                                       action_seq=snap["action_seq"])
+                                       flags=snap["flags"])
                 with self._lock:
                     self._n_tx += 1
             if self.logger is not None and (send_now or event):
@@ -377,7 +291,6 @@ class KeyHandler:
         self.say = say
         self.help_on = True
         self._t_takeoff = 0.0
-        self._t_imu_cal = 0.0
 
     def handle(self, ch):
         """処理して True。q が押されたら False (呼び出し側が終了する)。"""
@@ -427,29 +340,12 @@ class KeyHandler:
             cmdr.nudge(dalt=+ALT_STEP_M)
         elif ch == "f":
             cmdr.nudge(dalt=-ALT_STEP_M)
-        elif ch == "P":
-            # PID reset。シリアル 'r' キーと同じ操作で、アーム中でも実行される
-            # (機体側もそこは serial と同じ挙動にそろえてある)。
-            cmdr.fire_action(ACT_PID_RESET, "KEY P -> PID_RESET")
-            self.say("[Console] PID reset を送信")
-        elif ch == "k":
-            # ★ IMU校正は 2 回押し。機体を水平に静止させてから押すこと。
-            #   機体側は非アーム中しか実行しない (アーム中は ACK が拒否を返す)。
-            if now - self._t_imu_cal < self.TAKEOFF_CONFIRM_S:
-                cmdr.fire_action(ACT_IMU_CAL, "KEY k -> IMU_CAL")
-                self.say("[Console] IMU校正を送信 (機体は非アーム中のみ実行)")
-                self._t_imu_cal = 0.0
-            else:
-                self._t_imu_cal = now
-                armed = self.link.flag("armed")
-                warn = "  ※テレメトリはアーム中と表示しています。拒否されます" if armed else ""
-                self.say(f"[Console] IMU校正? 機体を水平な床に置いて静止させてから "
-                         f"{self.TAKEOFF_CONFIRM_S:.0f} 秒以内にもう一度 k を"
-                         f"押してください{warn}")
-        elif ch == "i":
-            # デバイス確認 (I2C再走査)。機体側は非アーム中のみ実行する。
-            cmdr.fire_action(ACT_SELFTEST, "KEY i -> SELFTEST")
-            self.say("[Console] デバイス確認 (I2C再走査) を送信")
+        elif ch in ("P", "k", "i"):
+            # ★ 2026-09-14: PID reset / IMU校正 / デバイス確認は IM920 から
+            #   廃止した (IM920は操縦専用に戻した)。BLEだけで完結する
+            #   ble_monitor.py の同じキーを使うこと。
+            self.say("[Console] P/k/i はIM920では廃止しました。"
+                     "ble_monitor.py を使ってください (BLE経由)")
         elif ch in ("S", "D", "Z", "C"):
             # 地上局 XIAO のキーをそのまま転送する (s5_log.cpp の handleKey)
             fwd = {"S": "s", "D": "d", "Z": "z", "C": "1"}[ch]
@@ -565,17 +461,6 @@ def build_lines(link, cmd, tap, messages, rate_hz, help_on):
     if not cmd["tx_on"]:
         lines.append(f"        (黙っている間、機体は {STALE_HOLD_S:.0f}s でホールド"
                      f" -> {STALE_LAND_S:.0f}s で自動着陸)")
-
-    # ---- 単発メンテナンス指令の実行結果 --------------------------------
-    ack, ack_age = link.last_ack()
-    if ack is not None:
-        result_s = ACK_RESULT_NAME.get(ack["result"], str(ack["result"]))
-        extra = ""
-        if ack["action"] == ACT_SELFTEST and ack["result"] == ACK_OK:
-            extra = f"  IMU疎通={'OK' if ack['imu_ok'] else 'NG'} I2C={ack['i2c_found']}個"
-        age_s = f"{ack_age:4.1f}s前" if ack_age < 999 else "  --  "
-        lines.append(f" ACK    {ACT_NAME.get(ack['action'], ack['action']):<10}"
-                     f"-> {result_s}{extra}   ({age_s})")
     lines.append(thin)
 
     # ---- キー ---------------------------------------------------------
@@ -583,9 +468,9 @@ def build_lines(link, cmd, tap, messages, rate_hz, help_on):
         lines += [
             " h HOLD   t TAKEOFF(2回押し)   g GUIDED   l LAND   SPACE ABORT(=即HOLD)",
             " x 送信停止   w/s 前後   a/d 左右   0 速度ゼロ   r/f 目標高度   q 終了",
-            " P PIDリセット   k IMU校正(2回押し、非アーム時のみ)   i デバイス確認(I2C)",
             " S 地上局の状態   D 生データ表示   Z 統計クリア   C CSV出力ON   ? ヘルプ",
             " ★ w/a/s/d は機体座標 (機首向き基準)。緊急停止はプロポ。",
+            " ★ PIDリセット/IMU校正/デバイス確認は ble_monitor.py (BLE) へ移動しました。",
         ]
     else:
         lines.append(" ? キーでヘルプ")
