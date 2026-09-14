@@ -65,6 +65,7 @@ CF_ARMED_OK  = 1 << 0
 CF_POS_VALID = 1 << 1
 CF_YAW_VALID = 1 << 2
 CF_ALT_ABS   = 1 << 3
+CF_POS_CORR  = 1 << 4   # corr_n_m/corr_e_m を機体の pos_n/pos_e へ適用する
 
 # XIAO の USB CDC。Windows では description で判別できないので VID:PID。
 # ★ 地上局を RP2040 -> ESP32C3 に移行済み。ESP32C3 はチップ内蔵のネイティブ
@@ -258,7 +259,7 @@ class S5Link:
             print(f"[S5Link] 送信エラー: {e}")
 
     def send_command(self, req, vx_mps=0.0, vy_mps=0.0, alt_m=0.0,
-                     yaw_rate_dps=0.0, flags=0):
+                     yaw_rate_dps=0.0, flags=0, corr_n_m=None, corr_e_m=None):
         """
         上りコマンドを 1 行送る。
 
@@ -269,23 +270,35 @@ class S5Link:
             alt_m      : 目標対地高度 [m]。0 以下 = 「現状維持」
             yaw_rate_dps: 目標ヨーレート [deg/s]。現状 機体側は未使用
             flags      : CF_* の論理和
+            corr_n_m/corr_e_m: 地面固定フレームの絶対位置補正 [m]。
+                None なら送らない (行を短く保つ)。値を渡すときは
+                flags に CF_POS_CORR を含めること (呼び出し側の責任。
+                ここで勝手に足すと「補正のつもりがなかった0,0」を
+                誤って適用させかねない)。
 
         ★ これを呼び続けるあいだだけ機体は GUIDED でいられる。呼ぶのを
           止めれば機体はホールド -> 自動着陸に落ちる (それが仕様)。
+
+        ★ 位置補正は姿勢・速度とは別物。往復100〜200msの無線遅延を
+          含んだ位置を毎ループ使うと発振するので、数秒に1回だけ
+          (core/mission.py の POS_CORR_PERIOD_S) 送ること。詳しくは
+          S5Cmd.h の CmdFrame コメント参照。
         """
         if not self.ok:
             return
         self._n_sent += 1
-        self._write_raw(
-            "CMD,{:d},{:d},{:d},{:d},{:d},{:d}\n".format(
-                int(req),
-                int(round(vx_mps * 1000.0)),
-                int(round(vy_mps * 1000.0)),
-                int(round(alt_m * 100.0)),
-                int(round(yaw_rate_dps * 100.0)),
-                int(flags),
-            )
-        )
+        parts = [
+            "CMD", str(int(req)),
+            str(int(round(vx_mps * 1000.0))),
+            str(int(round(vy_mps * 1000.0))),
+            str(int(round(alt_m * 100.0))),
+            str(int(round(yaw_rate_dps * 100.0))),
+            str(int(flags)),
+        ]
+        if corr_n_m is not None and corr_e_m is not None:
+            parts.append(str(int(round(corr_n_m * 1000.0))))
+            parts.append(str(int(round(corr_e_m * 1000.0))))
+        self._write_raw(",".join(parts) + "\n")
 
     def n_sent(self):
         return self._n_sent

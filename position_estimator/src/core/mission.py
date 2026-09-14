@@ -26,6 +26,23 @@ core/mission.py
   黙って落ちても最終的には降りてくるが、降り始めが 4 秒遅れる。
 
 ==========================================================================
+自己位置の補正 (2026-09-14〜)
+==========================================================================
+機体はオプティカルフローの積分だけで自分の水平位置 (pos_n/pos_e) を
+持っている。床の模様が薄いフィールドではこれが流れる。カメラは絶対位置
+(cm オーダー) を持っているので、POS_CORR_PERIOD_S 秒に1回だけ
+「本当はここにいるはず」を機体へ送って pos_n/pos_e を上書きする。
+
+★ これは姿勢・速度のクローズドループとは別物。IM920sL の往復遅延
+  (100〜200ms) を含んだ位置を毎ループ使うと発振するため、数秒に1回の
+  「たまに書き換えるだけ」に留める。効くのは静止保持中だけで、GUIDED
+  巡航中は機体側の hold が pos に毎ループ追従するため実質無効になる
+  (flight_controller/include/quad/PosHold.h の correctPosition() 参照)。
+  巡航中に効かないのは意図した挙動: 行き先はカメラ由来の速度指令
+  そのもので決まっており、位置を書き換えても無駄にレイテンシを
+  持ち込むだけだから。
+
+==========================================================================
 自動離陸・自動着陸をどこでやるか
 ==========================================================================
 機体側 (AltHold::commandTarget) にやらせる。PC は「目標高度 1.0m」と
@@ -41,11 +58,13 @@ from enum import Enum
 
 from utils.config import (MISSION_TAKEOFF_ALT_M,
                           MISSION_FENCE_X, MISSION_FENCE_Y, MISSION_FENCE_Z,
-                          MISSION_FENCE_GRACE_S)
+                          MISSION_FENCE_GRACE_S,
+                          POS_CORR_ENABLED, POS_CORR_PERIOD_S,
+                          POS_CORR_MAX_STEP_M)
 from core.s5_link import (REQ_ABORT, REQ_GUIDED, REQ_HOLD, REQ_LAND,
                           REQ_TAKEOFF, REQ_NAME,
                           CF_ARMED_OK, CF_POS_VALID, CF_YAW_VALID,
-                          CF_ALT_ABS)
+                          CF_ALT_ABS, CF_POS_CORR)
 
 
 class Phase(Enum):
@@ -153,6 +172,18 @@ class WaypointMission:
         self._t_fly = None      # 離陸フェーズに入った時刻 (タイムアウトの起点)
         self._t_fence = None    # ジオフェンスの外に出始めた時刻
         self._airborne = False  # 機体が一度でも「浮いた」と言ったか
+
+        # ---- 自己位置補正の状態 ------------------------------------------
+        # align: (フィールドx - フロー e, フィールドy - フロー n)。
+        #   機体のフロー原点はフィールド原点ではないので、両方が同時に
+        #   信用できる最初の瞬間に1回だけ取る (機首がフィールド奥を向いて
+        #   いる前提 = YAW_INITIAL_ALIGN_DEG=0 と同じ前提。core/mission.py
+        #   の body_frame_errors と揃えてある: n<->y(奥), e<->x(右))。
+        self._align = None
+        self._t_corr = 0.0
+        self._pending_corr = None   # 次の _send() 1回にだけ乗せる (n_m, e_m)
+        # ログ用: (diff_x, diff_y, diff_norm, drone_x, drone_y) or None
+        self._diff = None
 
         # ---- ログ用 ----------------------------------------------------
         # ★ 「何を送ったか」は送った本人しか知らない。update() の中で
