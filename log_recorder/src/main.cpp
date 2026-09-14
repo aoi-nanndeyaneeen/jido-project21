@@ -1,119 +1,90 @@
 // ============================================================
-//  log_recorder / main.cpp  -  XIAO を「SD ログ専用機」にする
-//  対応ボード: Seeed XIAO RP2040 / Seeed XIAO ESP32C3 (どちらも同一フットプリント)
+//  log_recorder / main.cpp  -  XIAO ESP32C3 を「BLE ログ中継機」にする
 // ============================================================
-//  Teensy(FC) --UART 2Mbaud--> XIAO --SPI--> HW-125 --> microSD
+//  Teensy(FC) --UART 2Mbaud--> XIAO ESP32C3 --BLE Notify--> 受信側(スマホ/PC)
 //
-//  【なぜ分けたか】
-//    FC (Teensy4.0) では PMW3901 と HW-125 が SPI0 を共有していて共存できず、
-//    「フローを使う飛行では SD ログを諦めて RAM ログ 8 秒」になっていた
-//    (flight_controller/src/drone_s5.cpp の USE_FLOW / USE_SD)。
-//    SD を丸ごとこちらへ引っ越すと、FC の SPI0 は PMW3901 専用になり、
-//    フロー使用中でも飛行まるごとのログが録れる。
+//  【経緯】
+//    元々は SD (HW-125) へ書く専用機だったが、SD カードが壊れたため、
+//    SD/SPI 周りを全部やめて BLE で常時送信する方式に置き換えた。
+//    ボードも RP2040/ESP32C3 両対応をやめ、内蔵 BLE を持つ ESP32C3 専用にした。
 //
-//  【役割分担】 ここがこのスケッチの肝
-//    rx役 : UART を受けてフレームを検証し、リングへ積むだけ。SD に触らない。
-//    sd役 : リングから取り出して SD へ書くだけ。UART の受信に触らない。
-//    SD カードは GC で 100ms 以上黙ることがある。同じ実行文脈でやると、
-//    その間の UART が確実に溢れる。分けておけば rx 役は止まらず、停止は
-//    リングが吸収する (128KB = 500Hz なら約 2 秒ぶん)。
-//    ★ RP2040 は物理 2 コア (setup1()/loop1() = core1) でこれを実現しているが、
-//      ESP32C3 はシングルコアなので FreeRTOS の 2 タスクに役割分担させている。
-//      SD 書き込み中に UART の ISR 自体は止まらない (ドライバの受信バッファに
-//      ハードウェア割込みで積まれ続ける) ので、rx 側バッファ (UART_FIFO) が
-//      吸収できる範囲であれば ESP32C3 でもレコードロストしない。
+//  【役割分担】
+//    rx役 : UART を受けてフレームを検証し、リングへ積むだけ。BLE に触らない。
+//    ble役: リングから取り出して BLE Notify で送るだけ。UART の受信に触らない。
+//    ESP32C3 はシングルコアなので FreeRTOS の 2 タスクに役割分担させている
+//    (rx = loop()、ble = 専用タスク)。BLE の送信待ち・切断でも rx 側は
+//    止まらず、そのぶんはリングが吸収する (128KB ≒ 全レート換算で約 2 秒ぶん)。
 //
-//  【出来上がる BIN】
-//    SdLog.h が作っていたものと完全に同じ = 32B ヘッダ + Rec の連続。
-//    変換はこれまでどおり PC で flight_controller/scripts/bin2csv.py。
+//  【BLE の帯域制約 ★ここが要】
+//    実測できる Notify のスループットはコネクション間隔次第で
+//    だいたい 20〜80KB/s が上限 (理論値はもっと出るが安定運用の目安として)。
+//    一方 FC からの T_REC は 500Hz × 122B/rec ≒ 61KB/s あり、フルレートを
+//    そのまま Notify すると確実に破綻する。そのため BLE_REC_DECIM で
+//    REC を間引いて送る (既定は 1/4 = 実質 125Hz ≒ 15KB/s。値は要調整)。
+//    T_START/T_STOP は間引かずそのまま転送する (頻度が低いので問題ない)。
+//    間引き後も溜まる分はリングが吸収する。BLE が未接続/輻輳中はフレームを
+//    ring に残したまま送信を待つので、それでも溢れて初めて drop_ring で数える
+//    (ring から取り出した後で送信に失敗して黙って捨てる、ということはしない)。
 //
-//  【配線】 XIAO は RP2040/ESP32C3 でフットプリント・D番号が共通なので、
-//    同じ位置に挿すだけで配線はそのまま使い回せる (実 GPIO 番号だけが違う。
-//    main.cpp 側で #if により吸収している)。
+//  【送るフレーム形式】
+//    UART と全く同じ LogLinkProto のバイト列 (SOF1 SOF2 type len seq payload crc8)
+//    をそのまま Notify に乗せる。受信側は既存の LogLinkProto::crc8()/フレーム
+//    パーサをそのまま流用できる。
+//
+//  【配線】
 //     D7  RX  <---- Teensy TX17 (Serial4)
 //     D6  TX  ----> Teensy RX16          ※状態返信用。省略可
 //     GND     <--------> Teensy GND      ※必須
-//     D8  SCK ----> HW-125 SCK
-//     D10 MOSI----> HW-125 MOSI
-//     D9  MISO<---- HW-125 MISO
-//     D2  CS  ----> HW-125 CS
-//     5V      ----> HW-125 VCC (モジュール上でレギュレータ + レベル変換)
-//     GND     ----> HW-125 GND
-//    ★ XIAO の電源は FC と分ける。SD 書き込みの突入電流で FC を
-//      巻き込まないため。GND だけ共通にすること。
+//    ★ XIAO の電源は FC と分ける。GND だけ共通にすること。
 //
-//  【LED】
-//    XIAO RP2040 はオンボード RGB (いずれも負論理):
-//      緑 = 記録中     青 = 待機 (SD OK)     赤 = SD NG / ロスト発生
-//    XIAO ESP32C3 にはユーザー制御可能なオンボードLEDが無いため、
-//    LED 表示は行わない (状態は USB シリアルの 's' コマンドで確認する)。
+//  【状態確認】
+//    USB シリアル (115200) の 's' コマンドで状態表示、'r' で統計リセット。
+//    ESP32C3 にはユーザー制御可能なオンボードLEDが無いため LED 表示は無い。
 // ============================================================
 #include <Arduino.h>
-#include <SPI.h>
-#include <SdFat.h>
-#if defined(ARDUINO_ARCH_ESP32)
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#endif
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
 #include "quad/LogLinkProto.h"   // ★ flight_controller 側の実体を include
 
 namespace P = LogLinkProto;
 
-// ---- ピン ------------------------------------------------------------
-//  XIAO は RP2040 版/ESP32C3 版でシルク印刷の D0-D10 は共通だが、実 GPIO
-//  番号はチップごとに違う。ボードごとに定数を切り替える。
-#if defined(ARDUINO_ARCH_RP2040)
-constexpr uint8_t PIN_UART_TX = 0;    // D6
-constexpr uint8_t PIN_UART_RX = 1;    // D7
-constexpr uint8_t PIN_SPI_SCK = 2;    // D8
-constexpr uint8_t PIN_SPI_TX  = 3;    // D10 (MOSI)
-constexpr uint8_t PIN_SPI_RX  = 4;    // D9  (MISO)
-constexpr uint8_t PIN_SD_CS   = 28;   // D2
-
-constexpr uint8_t PIN_LED_RED   = 17;  // 負論理 (オンボード RGB)
-constexpr uint8_t PIN_LED_GREEN = 16;
-constexpr uint8_t PIN_LED_BLUE  = 25;
-#define LOGREC_HAS_RGB_LED 1
-
-#elif defined(ARDUINO_ARCH_ESP32)
+// ---- ピン (XIAO ESP32C3) ----------------------------------------------
 constexpr uint8_t PIN_UART_TX = 21;   // D6
 constexpr uint8_t PIN_UART_RX = 20;   // D7
-constexpr uint8_t PIN_SPI_SCK = 8;    // D8
-constexpr uint8_t PIN_SPI_TX  = 10;   // D10 (MOSI)
-constexpr uint8_t PIN_SPI_RX  = 9;    // D9  (MISO)
-constexpr uint8_t PIN_SD_CS   = 4;    // D2
-// ★ XIAO ESP32C3 にはユーザー制御可能なオンボードLEDが無い。
-#define LOGREC_HAS_RGB_LED 0
-
-#else
-#error "log_recorder: unsupported board (RP2040 / ESP32C3 のみ対応)"
-#endif
 
 // ---- チューニング定数 ----------------------------------------------------
 constexpr uint32_t LINK_BAUD  = 2000000;   // LogLink::BAUD と一致させること
-constexpr size_t   UART_FIFO  = 4096;      // Philhower core の受信バッファ
-// リングは 2 の冪。128KB = 122B/rec × 500Hz なら約 2.1 秒ぶんのカード停止を吸収。
-// RP2040 の SRAM は 264KB なので、書き込みバッファと合わせても余裕がある。
+constexpr size_t   UART_FIFO  = 4096;      // 受信バッファ
+// リングは 2 の冪。128KB は全レート (61kB/s) 換算で約 2.1 秒ぶんの
+// BLE 側停止・輻輳・切断を吸収する猶予。
 constexpr uint32_t RING_BYTES = 128u * 1024u;
 constexpr uint32_t RING_MASK  = RING_BYTES - 1;
 static_assert((RING_BYTES & RING_MASK) == 0, "RING_BYTES は 2 の冪にすること");
 
-constexpr size_t   WBUF_BYTES = 8192;              // SD へ渡す前の整列バッファ
-constexpr size_t   WRITE_CHUNK = 4096;             // 1 回の write サイズ (512 の倍数)
-constexpr uint32_t SD_SCK_MHZ_VAL = 20;            // 手配線の HW-125。安定したら 25
-constexpr uint64_t PREALLOC   = 16ull * 1024 * 1024;   // ≒300 秒ぶん
-constexpr uint32_t SYNC_MS    = 2000;              // FAT 保存間隔 (電源断保険)
-constexpr uint32_t STAT_MS    = 500;               // FC への状態返信 (2Hz)
+constexpr uint32_t STAT_MS = 500;   // FC への状態返信 (2Hz)
+
+// T_REC をこの分の1だけ BLE へ転送する (帯域対策。3で割り切れなくてよい)。
+// 1 なら間引きなし (非推奨: 500Hz フルレートは BLE の帯域を確実に超える)。
+constexpr uint8_t BLE_REC_DECIM = 4;   // 500Hz -> 実質 125Hz ≒ 15kB/s
+
+// BLE 輻輳対策の下限送信間隔。これより速く notify() を連打すると
+// コントローラ側の送信キューが溢れて notify が無言で落ちることがある。
+constexpr uint32_t BLE_MIN_TX_INTERVAL_MS = 5;   // 上限 200 notify/s 程度に抑える
+
+static const char* BLE_DEVICE_NAME    = "S5-LogBLE";
+static const char* BLE_SERVICE_UUID   = "d5913036-2d8a-41ee-85b9-4e361aa5c8a7";
+static const char* BLE_CHAR_UUID      = "d5913037-2d8a-41ee-85b9-4e361aa5c8a7";
 
 // ============================================================
-//  コア間リング (SPSC)
-//    core0 だけが g_head を進め、core1 だけが g_tail を進める。
+//  コア間 (タスク間) リング (SPSC)
+//    rx タスク (loop()) だけが g_head を進め、ble タスクだけが g_tail を進める。
 //    インデックスは 32bit のフリーランニング。使用量は head - tail の
-//    引き算で出る (符号なしのラップがそのまま正しく効く)。こうすると
-//    「満杯と空が同じ値」問題が起きない。
-//    アクセスは __atomic_* で acquire/release を明示する。RP2040 は
-//    2 コアが同じ SRAM を見るので、これが無いと最適化で壊れる。
+//    引き算で出る (符号なしのラップがそのまま正しく効く)。
 // ============================================================
 static uint8_t  g_ring[RING_BYTES];
 static volatile uint32_t g_head = 0;
@@ -125,33 +96,28 @@ static inline uint32_t ringUsed() {
     return h - t;
 }
 
-// ---- 統計 (core1 が書き、core0 が読んで FC へ返す) ------------------------
+// ---- 統計 (ble タスクが書き、rx タスクが読んで FC へ返す) ------------------
 //  ★ 複数フィールドをまたぐ一貫性までは保証しない (診断用なので許容)。
 struct Stats {
-    volatile bool     sd_ok     = false;
+    volatile bool     ble_ok    = false;   // BLE クライアントが接続 & Notify 購読中
     volatile bool     recording = false;
-    volatile uint16_t file_idx  = 0;
-    volatile uint32_t bytes     = 0;
-    // ★ ロス系カウンタは「誰が書くか」でコアを分けてある。同じ変数を両コアから
-    //   ++ すると read-modify-write が競合して数が狂う (診断値そのものが
-    //   信用できなくなる)。合算は読む側 (core0) でやる。
-    volatile uint32_t drop_ring = 0;   // core0: リング溢れで捨てたレコード
-    volatile uint32_t drop_wbuf = 0;   // core1: 整列バッファに入らず捨てたレコード
+    volatile uint32_t bytes     = 0;       // BLE へ実際に送ったバイト数 (Stat.kbytes に載せる)
+    volatile uint32_t drop_ring = 0;   // rx: リング溢れで捨てたレコード (BLE未接続/輻輳が続くと増える)
     volatile uint32_t crc_err   = 0;   // CRC 不一致フレーム
     volatile uint32_t seq_gap   = 0;   // seq 飛び = UART 取りこぼし
     volatile uint32_t orphan    = 0;   // START 前に来た REC
-    volatile uint32_t worst_w_us = 0;
+    volatile uint32_t worst_tx_us = 0;
     volatile uint32_t peak_ring = 0;
 };
 static Stats g_st;
 
 // ============================================================
-//  §1  core0 : UART 受信 + フレーム検証 + リングへ push
+//  §1  rx役 : UART 受信 + フレーム検証 + リングへ push
 // ============================================================
 namespace Rx {
 
 // 完成したフレームを「丸ごと」リングへ積む。途中まで積むことはしない
-// (core1 は「リングの中身は必ず完全なフレーム」を前提にパースするため)。
+// (ble 役は「リングの中身は必ず完全なフレーム」を前提にパースするため)。
 static bool push(const uint8_t* f, uint32_t n) {
     const uint32_t h = __atomic_load_n(&g_head, __ATOMIC_ACQUIRE);
     const uint32_t t = __atomic_load_n(&g_tail, __ATOMIC_ACQUIRE);
@@ -215,17 +181,21 @@ static void feed(const uint8_t* p, size_t n) {
 }
 
 // FC へ状態を返す (2Hz)。FC 側は LogLink::brief()/status() に出す。
+//  ★ Stat.flags の STAT_SD_OK ビットは「BLE クライアント接続中」に読み替えている。
+//    Stat.file_idx は未使用 (常に 0)。Stat.kbytes は「BLE へ送った累計KB」。
+//    LogLinkProto.h / flight_controller 側の表示文言 ("SD") は元の意味のまま
+//    残っているので、実際の値の意味とラベルがずれる点に注意 (別途要修正)。
 static void sendStat() {
     P::Stat s = {};
-    s.flags     = (uint8_t)((g_st.sd_ok ? P::STAT_SD_OK : 0) |
+    s.flags     = (uint8_t)((g_st.ble_ok ? P::STAT_SD_OK : 0) |
                             (g_st.recording ? P::STAT_REC : 0));
     s.ring_pct  = (uint8_t)((uint64_t)ringUsed() * 100 / RING_BYTES);
-    s.file_idx  = g_st.file_idx;
+    s.file_idx  = 0;
     s.kbytes    = g_st.bytes / 1024;
-    s.drop_rec  = g_st.drop_ring + g_st.drop_wbuf;
+    s.drop_rec  = g_st.drop_ring;
     s.crc_err   = g_st.crc_err;
     s.seq_gap   = g_st.seq_gap;
-    s.worst_w_us = g_st.worst_w_us;
+    s.worst_w_us = g_st.worst_tx_us;
 
     uint8_t f[P::MAX_FRAME];
     static uint8_t seq = 0;
@@ -238,122 +208,137 @@ static void sendStat() {
 } // namespace Rx
 
 // ============================================================
-//  §2  core1 : リング -> SD
+//  §1.5  デバッグ用: FC 無しで BLE 経路を試すためのダミーデータ注入
+//    USB シリアルの 't' で、UART を経由せず直接リングへ
+//    T_START(ダミーヘッダ) -> T_REC x N(パターンデータ) -> T_STOP を積む。
+//    Rx::feed() のフレーム検証は素通りする (自分で組み立てるので当然正しい)。
+//    本番の UART 受信とは無関係。ブリングアップ/BLE 単体試験専用。
 // ============================================================
-namespace Sd {
+namespace Dbg {
 
-static SdFs   s_sd;
-static FsFile s_file;
-static bool   s_ok        = false;
-static bool   s_recording = false;
-static uint32_t s_next_idx = 0;
-static uint32_t s_t0       = 0;      // 今開いているファイルの識別子 (BIN ヘッダの t0_ms)
-static uint32_t s_bytes    = 0;
-static uint32_t s_last_rec_ms  = 0;
-static uint32_t s_last_sync_ms = 0;
+static void injectDummy() {
+    static uint8_t seq = 0;
+    uint8_t f[P::MAX_FRAME];
 
-static uint8_t s_wbuf[WBUF_BYTES];
-static size_t  s_wlen = 0;
+    // T_START: SdLog と同じ 32B ヘッダ形式 (FlightLog::REC_VER=2 を模す)
+    uint8_t hdr[P::BIN_HDR_LEN] = {0};
+    memcpy(hdr, "S5LOG", 5);
+    hdr[6] = 1;                          // fmt_ver
+    hdr[7] = 2;                          // rec_ver (FlightLog::REC_VER)
+    hdr[8] = 116; hdr[9] = 0;            // rec_size = sizeof(FlightLog::Rec)
+    hdr[10] = 500 & 0xFF; hdr[11] = (500 >> 8) & 0xFF;   // rate_hz
+    const uint32_t t0 = millis();
+    memcpy(hdr + P::BIN_HDR_T0_OFS, &t0, 4);
 
-static void scanNextIndex() {
-    char name[16];
-    for (uint32_t i = 0; i < 10000; ++i) {
-        snprintf(name, sizeof(name), "LOG%04lu.BIN", (unsigned long)i);
-        if (!s_sd.exists(name)) { s_next_idx = i; return; }
+    size_t n = P::buildFrame(f, P::T_START, seq++, hdr, sizeof(hdr));
+    Rx::push(f, (uint32_t)n);
+    Serial.printf("[DBG] dummy T_START 送信 (t0=%lu)\n", (unsigned long)t0);
+
+    // T_REC を N 個。中身は検証用のパターン (116B = FlightLog::Rec と同サイズ)。
+    constexpr int N = 200;
+    uint8_t pay[116];
+    int sent = 0;
+    for (int i = 0; i < N; ++i) {
+        for (size_t k = 0; k < sizeof(pay); ++k) pay[k] = (uint8_t)(i + k);
+        n = P::buildFrame(f, P::T_REC, seq++, pay, sizeof(pay));
+        if (!Rx::push(f, (uint32_t)n)) { Serial.println("[DBG] ring 溢れで中断"); break; }
+        sent++;
     }
-    s_next_idx = 0;   // 全部埋まっていたら 0 から上書き
+    Serial.printf("[DBG] dummy T_REC x%d 送信\n", sent);
+
+    n = P::buildFrame(f, P::T_STOP, seq++, nullptr, 0);
+    Rx::push(f, (uint32_t)n);
+    Serial.println("[DBG] dummy T_STOP 送信");
 }
 
-static bool init() {
-#if defined(ARDUINO_ARCH_RP2040)
-    SPI.setSCK(PIN_SPI_SCK);
-    SPI.setTX(PIN_SPI_TX);
-    SPI.setRX(PIN_SPI_RX);
-#elif defined(ARDUINO_ARCH_ESP32)
-    SPI.begin(PIN_SPI_SCK, PIN_SPI_RX, PIN_SPI_TX);   // sck, miso, mosi (CS は SdFat が別途叩く)
-#endif
-    // このバスには SD しか繋がっていないので DEDICATED_SPI にできる。
-    // SdFat がマルチブロック書き込みを使えるようになり、FC 側 (SHARED_SPI)
-    // より格段に速い。ここが「SD を別 MCU に出した」ことの副次的な利得。
-    s_ok = s_sd.begin(SdSpiConfig(PIN_SD_CS, DEDICATED_SPI,
-                                  SD_SCK_MHZ(SD_SCK_MHZ_VAL), &SPI));
-    if (s_ok) scanNextIndex();
-    g_st.sd_ok    = s_ok;
-    g_st.file_idx = (uint16_t)s_next_idx;
-    return s_ok;
-}
+} // namespace Dbg
 
-// 実際に SD へ流す。512 の倍数だけ書き、端数は次に持ち越す
-// (セクタ境界で書くとカード内部の read-modify-write が起きない)。
-static void flushAligned(bool force) {
-    if (s_wlen == 0) return;
-    size_t n = force ? s_wlen : (s_wlen / 512) * 512;
-    if (!force && n > WRITE_CHUNK) n = WRITE_CHUNK;
-    if (n == 0) return;
+// ============================================================
+//  §2  ble役 : リング -> BLE Notify
+// ============================================================
+namespace Ble {
 
-    const uint32_t t0 = micros();
-    const size_t w = s_file.write(s_wbuf, n);
-    const uint32_t dt = micros() - t0;
-    if (dt > g_st.worst_w_us) g_st.worst_w_us = dt;
+static BLEServer*         s_server = nullptr;
+static BLECharacteristic* s_char   = nullptr;
+static volatile bool      s_connected = false;
 
-    s_bytes += w;
-    g_st.bytes = s_bytes;
-    if (w < s_wlen) memmove(s_wbuf, s_wbuf + w, s_wlen - w);
-    s_wlen -= w;
-}
+static bool     s_recording = false;
+static uint32_t s_t0        = 0;      // 現在の記録セッション識別子 (BIN ヘッダの t0_ms)
+static uint32_t s_bytes     = 0;
+static uint32_t s_last_rec_ms = 0;
+static uint32_t s_last_tx_ms  = 0;
+static uint8_t  s_rec_decim_ctr = 0;
+// 「tail の REC は間引き判定の結果すでに送信対象と確定していて、あとは
+// BLE の送信間隔 (gate) が空くのを待っているだけ」を覚えておくフラグ。
+// ★ これが無いと、gate 待ちで drainRing() が return して次回また同じ
+//   (pop していない) REC を見たときに間引きカウンタをもう一度進めてしまい、
+//   本来送るはずだった REC まで間引き判定で捨ててしまう
+//   (実機テストで 200 REC 中 21 件しか送れなかったのはこれが原因)。
+static bool     s_rec_pending = false;
 
-static void closeFile() {
-    if (!s_recording) return;
-    flushAligned(true);              // 端数も含めて全部出す
-    s_file.truncate(s_bytes);        // preAllocate の未使用ぶんを解放
-    s_file.sync();
-    s_file.close();
-    s_recording   = false;
-    g_st.recording = false;
-    Serial.printf("[SD] close LOG%04lu.BIN  %lu bytes\n",
-                  (unsigned long)(s_next_idx - 1), (unsigned long)s_bytes);
-}
-
-static void openFile(const uint8_t* bin_hdr) {
-    if (!s_ok) return;
-    if (s_recording) closeFile();
-
-    char name[16];
-    snprintf(name, sizeof(name), "LOG%04lu.BIN", (unsigned long)s_next_idx);
-    if (!s_file.open(name, O_WRONLY | O_CREAT | O_TRUNC)) {
-        Serial.printf("[SD] open 失敗: %s\n", name);
-        return;
+class ServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer*) override {
+        s_connected  = true;
+        g_st.ble_ok  = true;
+        Serial.println("[BLE] connected");
     }
-    s_file.preAllocate(PREALLOC);    // 連続領域 → 書き込みレイテンシが安定
+    void onDisconnect(BLEServer*) override {
+        s_connected  = false;
+        g_st.ble_ok  = false;
+        Serial.println("[BLE] disconnected -> advertising 再開");
+        BLEDevice::startAdvertising();
+    }
+};
 
-    s_wlen  = 0;
-    s_bytes = 0;
-    s_file.write(bin_hdr, P::BIN_HDR_LEN);   // SdLog と同一の 32B ヘッダ
-    s_bytes = P::BIN_HDR_LEN;
+static void init() {
+    BLEDevice::init(BLE_DEVICE_NAME);
+    BLEServer* server = BLEDevice::createServer();
+    server->setCallbacks(new ServerCallbacks());
+    s_server = server;
 
-    memcpy(&s_t0, bin_hdr + P::BIN_HDR_T0_OFS, 4);
-    s_recording    = true;
-    g_st.recording = true;
-    g_st.bytes     = s_bytes;
-    g_st.file_idx  = (uint16_t)s_next_idx;
-    s_last_rec_ms  = millis();
-    s_last_sync_ms = millis();
-    s_next_idx++;
-    Serial.printf("[SD] open %s (t0=%lu)\n", name, (unsigned long)s_t0);
+    BLEService* svc = server->createService(BLE_SERVICE_UUID);
+    s_char = svc->createCharacteristic(BLE_CHAR_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    s_char->addDescriptor(new BLE2902());
+    svc->start();
+
+    BLEAdvertising* adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID(BLE_SERVICE_UUID);
+    adv->setScanResponse(true);
+    BLEDevice::startAdvertising();
+    Serial.println("[BLE] advertising開始");
 }
 
-// リングから 1 フレーム取り出して処理する。core0 が完全なフレームしか
-// 積まないので、ここでは CRC を見直す必要がない。
 static inline uint8_t peek(uint32_t tail, uint32_t i) {
     return g_ring[(tail + i) & RING_MASK];
 }
 
+// notify() を連打しすぎるとコントローラの送信キューが溢れて黙って落ちる
+// ことがあるので、最低送信間隔を空ける (BLE_MIN_TX_INTERVAL_MS)。
+//  ★ これは「送っていいタイミングか」を見るだけの関数にしてある。
+//    ここが false のときにフレームを ring から pop 済みで捨ててしまうと、
+//    間引き後のデータまで黙って失う (実機テストで実際に踏んだバグ)。
+//    なので drainRing() 側は「pop する前」にこれを確認する。
+static inline bool readyToSend() {
+    if (!s_connected) return false;
+    return millis() - s_last_tx_ms >= BLE_MIN_TX_INTERVAL_MS;
+}
+
+static void sendFrame(const uint8_t* f, size_t n) {
+    s_last_tx_ms = millis();
+    const uint32_t t0 = micros();
+    s_char->setValue((uint8_t*)f, n);
+    s_char->notify();
+    const uint32_t dt = micros() - t0;
+    if (dt > g_st.worst_tx_us) g_st.worst_tx_us = dt;
+
+    s_bytes += n;
+    g_st.bytes = s_bytes;
+}
+
 //  ★ 1 回の呼び出しで処理するフレーム数に上限を設ける。
 //    リングが空になるまで回す作りだと、FC が 500Hz で流し続けている間は
-//    ここから戻れず、service() の sync() とタイムアウト close が
-//    永久に実行されない (= 電源断保険が効かない)。
-//    500Hz に対して 64 は十分な追い上げ余力がある (loop1 は空回りが速い)。
-constexpr int DRAIN_MAX_FRAMES = 64;
+//    ここから戻れず、タイムアウト close が永久に実行されない。
+constexpr int DRAIN_MAX_FRAMES = 32;
 
 static void drainRing() {
     for (int i = 0; i < DRAIN_MAX_FRAMES; ++i) {
@@ -366,75 +351,90 @@ static void drainRing() {
         const uint32_t flen = P::OVERHEAD + len;
         if (used < flen) return;                 // まだ全部来ていない
 
-        // payload を取り出す
-        static uint8_t pay[P::MAX_PAYLOAD];
-        const uint32_t idx   = (tail + P::HDR_LEN) & RING_MASK;
-        const uint32_t first = min((uint32_t)len, RING_BYTES - idx);
-        memcpy(pay, g_ring + idx, first);
-        if (len > first) memcpy(pay + first, g_ring, len - first);
+        static uint8_t f[P::MAX_FRAME];
+        const uint32_t idx   = tail & RING_MASK;
+        const uint32_t first = min(flen, RING_BYTES - idx);
+        memcpy(f, g_ring + idx, first);
+        if (flen > first) memcpy(f + first, g_ring, flen - first);
+        const uint8_t* pay = f + P::HDR_LEN;
 
-        __atomic_store_n(&g_tail, tail + flen, __ATOMIC_RELEASE);
+        // pop (tail 前進) するのは「送信する」か「意図的に捨てる」と決まってから。
+        // 送信を試みる予定なのに BLE が今送れる状態でなければ、pop せずに
+        //今回の drainRing を切り上げる (フレームは ring に残る = 次回に再試行)。
+        const auto discard = [&]() {
+            __atomic_store_n(&g_tail, tail + flen, __ATOMIC_RELEASE);
+        };
 
         switch (type) {
             case P::T_START: {
-                if (len != P::BIN_HDR_LEN) break;
+                if (len != P::BIN_HDR_LEN) { discard(); break; }
                 uint32_t t0; memcpy(&t0, pay + P::BIN_HDR_T0_OFS, 4);
-                // FC は同じヘッダを 1Hz で再送してくる (ロガーが後から
-                // 起動しても拾えるように)。同じ t0 なら既に開いている
-                // ファイルの続き = 無視する。違えば別フライト。
-                if (s_recording && t0 == s_t0) break;
-                openFile(pay);
+                // FC は同じヘッダを 1Hz で再送してくる。同じ t0 なら継続中の
+                // セッションの続き = 送らずに捨てる。違えば別フライト。
+                if (s_recording && t0 == s_t0) { discard(); break; }
+                if (!readyToSend()) return;   // pop せず次回に持ち越す
+                discard();
+                s_t0        = t0;
+                s_recording = true;
+                g_st.recording = true;
+                Serial.printf("[BLE] START (t0=%lu)\n", (unsigned long)s_t0);
+                sendFrame(f, flen);
                 break;
             }
             case P::T_REC: {
-                if (!s_recording) { g_st.orphan++; break; }
+                if (!s_recording) { discard(); g_st.orphan++; break; }
                 s_last_rec_ms = millis();
-                if (s_wlen + len > WBUF_BYTES) flushAligned(false);
-                if (s_wlen + len > WBUF_BYTES) { g_st.drop_wbuf++; break; } // まだ入らない
-                memcpy(s_wbuf + s_wlen, pay, len);
-                s_wlen += len;
+                // 帯域対策の間引き。捨てた分は drop に数えない (意図的な間引きのため)。
+                // ★ s_rec_pending が立っていなければ「まだこの REC の間引き判定を
+                //   していない」ので一度だけ判定する。gate 待ちで戻ってきた再訪
+                //   (pending==true) では判定をやり直さない (カウンタを二重に
+                //   進めてしまうため)。
+                if (!s_rec_pending) {
+                    if (BLE_REC_DECIM > 1) {
+                        s_rec_decim_ctr++;
+                        if (s_rec_decim_ctr < BLE_REC_DECIM) { discard(); break; }
+                        s_rec_decim_ctr = 0;
+                    }
+                    s_rec_pending = true;
+                }
+                if (!readyToSend()) return;   // pop せず次回に持ち越す (判定はやり直さない)
+                discard();
+                s_rec_pending = false;
+                sendFrame(f, flen);
                 break;
             }
-            case P::T_STOP:
-                closeFile();
+            case P::T_STOP: {
+                if (!s_recording) { discard(); break; }
+                if (!readyToSend()) return;   // pop せず次回に持ち越す
+                discard();
+                sendFrame(f, flen);
+                Serial.printf("[BLE] STOP  %lu bytes 送信\n", (unsigned long)s_bytes);
+                s_recording    = false;
+                g_st.recording = false;
+                s_bytes        = 0;
                 break;
+            }
             default:
+                discard();
                 break;
         }
-
-        if (s_wlen >= WRITE_CHUNK) flushAligned(false);
     }
 }
 
 static void service() {
-    if (!s_ok) {
-        // カードが後から挿されることもあるので 2 秒ごとに再挑戦する。
-        static uint32_t last = 0;
-        if (millis() - last > 2000) { last = millis(); init(); }
-        return;
-    }
     drainRing();
     if (!s_recording) return;
-
-    // 電源断保険。FAT/dir を定期保存する。
-    if (millis() - s_last_sync_ms >= SYNC_MS) {
-        s_last_sync_ms = millis();
-        flushAligned(false);
-        s_file.sync();
-    }
     // STOP が化けて届かなかったときの保険。REC が途切れたら勝手に閉じる。
-    // これが無いと preAllocate した 16MB が open のまま残り、次回起動時に
-    // ゴミファイルになる。
     if (millis() - s_last_rec_ms >= P::IDLE_CLOSE_MS) {
-        Serial.println("[SD] REC 途切れ -> タイムアウトで close");
-        closeFile();
+        Serial.println("[BLE] REC 途切れ -> タイムアウトで終了扱い");
+        s_recording    = false;
+        g_st.recording = false;
+        s_bytes        = 0;
     }
 }
 
-#if defined(ARDUINO_ARCH_ESP32)
-// ESP32C3 (シングルコア) では setup1()/loop1() が無いので、SD 書き込み役を
-// 専用 FreeRTOS タスクとして起動する。rx 側 (loop()) より低い優先度にして
-// あるので、UART 受信の処理が滞らないよう配慮している。
+// シングルコアなので BLE 送信役を専用 FreeRTOS タスクとして起動する。
+// rx 側 (loop()) より低い優先度にしてあるので、UART 受信の処理が滞らない。
 static void task(void*) {
     delay(50);   // core0/loop() 側の Serial 初期化と競合しないように
     init();
@@ -443,76 +443,50 @@ static void task(void*) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
-#endif
 
-} // namespace Sd
+} // namespace Ble
 
 // ============================================================
-//  §3  LED / USB コンソール
+//  §3  USB コンソール
 // ============================================================
-static void led(bool r, bool g, bool b) {   // 負論理
-#if LOGREC_HAS_RGB_LED
-    digitalWrite(PIN_LED_RED,   r ? LOW : HIGH);
-    digitalWrite(PIN_LED_GREEN, g ? LOW : HIGH);
-    digitalWrite(PIN_LED_BLUE,  b ? LOW : HIGH);
-#else
-    (void)r; (void)g; (void)b;   // ESP32C3 にはオンボードLEDが無いので何もしない
-#endif
-}
-
 static void printStatus() {
-    Serial.println("---- log_recorder ----");
-    Serial.printf("  SD        : %s   次/現ファイル = LOG%04u.BIN\n",
-                  g_st.sd_ok ? "OK" : "NG (CS=GP28 / VCC=5V / FAT32 / 配線)",
-                  (unsigned)g_st.file_idx);
-    Serial.printf("  記録      : %s   %lu bytes\n",
+    Serial.println("---- log_recorder (BLE) ----");
+    Serial.printf("  BLE       : %s   (decim=1/%u)\n",
+                  g_st.ble_ok ? "接続中" : "未接続 (advertising中)",
+                  (unsigned)BLE_REC_DECIM);
+    Serial.printf("  記録      : %s   送信済み %lu bytes\n",
                   g_st.recording ? "REC" : "idle", (unsigned long)g_st.bytes);
     Serial.printf("  リング    : %lu / %lu B (peak %lu = %lu%%)\n",
                   (unsigned long)ringUsed(), (unsigned long)RING_BYTES,
                   (unsigned long)g_st.peak_ring,
                   (unsigned long)((uint64_t)g_st.peak_ring * 100 / RING_BYTES));
-    Serial.printf("  ロス      : drop=%lu (ring %lu / wbuf %lu)  crc_err=%lu  "
-                  "seq_gap=%lu  orphan=%lu\n",
-                  (unsigned long)(g_st.drop_ring + g_st.drop_wbuf),
-                  (unsigned long)g_st.drop_ring, (unsigned long)g_st.drop_wbuf,
+    Serial.printf("  ロス      : drop_ring=%lu  crc_err=%lu  seq_gap=%lu  orphan=%lu\n",
+                  (unsigned long)g_st.drop_ring,
                   (unsigned long)g_st.crc_err,
                   (unsigned long)g_st.seq_gap, (unsigned long)g_st.orphan);
-    Serial.printf("  最悪write : %lu us\n", (unsigned long)g_st.worst_w_us);
+    Serial.printf("  最悪tx    : %lu us\n", (unsigned long)g_st.worst_tx_us);
     if (g_st.crc_err || g_st.seq_gap)
         Serial.println("  ★ crc_err/seq_gap が増える = UART が化けている。"
                        "配線を短く / GND を確実に / 両側の BAUD を 1000000 へ");
+    if (!g_st.ble_ok && g_st.recording)
+        Serial.println("  ★ BLE 未接続のまま記録中 = drop_ring が伸び続ける。"
+                       "受信側アプリを接続すること");
     if (g_st.peak_ring > RING_BYTES / 2)
-        Serial.println("  ★ リングが半分を超えた = SD が遅い。"
-                       "カードを速いものに変える / SD_SCK_MHZ_VAL を上げる");
+        Serial.println("  ★ リングが半分を超えた = BLE が遅い/輻輳している。"
+                       "BLE_REC_DECIM を上げる / 受信側との距離を詰める");
 }
 
 // ============================================================
-//  §4  rx役 (UART 受信専用。RP2040 では core0、ESP32C3 では既定の loop タスク)
+//  §4  rx役 (UART 受信専用。既定の loop タスク)
 // ============================================================
 void setup() {
-#if LOGREC_HAS_RGB_LED
-    pinMode(PIN_LED_RED, OUTPUT); pinMode(PIN_LED_GREEN, OUTPUT);
-    pinMode(PIN_LED_BLUE, OUTPUT);
-    led(true, true, true);        // 起動中は白
-#endif
-
     Serial.begin(115200);         // USB (デバッグ用)
 
-#if defined(ARDUINO_ARCH_RP2040)
-    Serial1.setRX(PIN_UART_RX);
-    Serial1.setTX(PIN_UART_TX);
-    Serial1.setFIFOSize(UART_FIFO);   // ★ begin() より前に呼ぶこと
-    Serial1.begin(LINK_BAUD);
-#elif defined(ARDUINO_ARCH_ESP32)
     Serial1.setRxBufferSize(UART_FIFO);   // ★ begin() より前に呼ぶこと
     Serial1.begin(LINK_BAUD, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX);
-    // ESP32C3 (シングルコア) 版の sd 役。RP2040 の setup1()/loop1() に相当。
-    xTaskCreate(Sd::task, "sd_task", 4096, nullptr, 1, nullptr);
-#endif
 
-#if LOGREC_HAS_RGB_LED
-    led(false, false, true);      // 青 = 待機
-#endif
+    // BLE 送信役 (ESP32C3 はシングルコアなので専用タスクに分離)。
+    xTaskCreate(Ble::task, "ble_task", 4096, nullptr, 1, nullptr);
 }
 
 void loop() {
@@ -536,42 +510,15 @@ void loop() {
     if (Serial.available()) {
         const char c = (char)Serial.read();
         if (c == 's') printStatus();
-        if (c == 'r') { g_st.drop_ring = g_st.drop_wbuf = 0;
+        if (c == 'r') { g_st.drop_ring = 0;
                         g_st.crc_err = g_st.seq_gap = 0;
-                        g_st.orphan = 0; g_st.peak_ring = 0; g_st.worst_w_us = 0;
+                        g_st.orphan = 0; g_st.peak_ring = 0; g_st.worst_tx_us = 0;
                         Serial.println("統計をリセットしました"); }
+        if (c == 't') Dbg::injectDummy();
     }
 
-#if defined(ARDUINO_ARCH_ESP32)
-    // シングルコアなので sd タスク (と裏の idle/WDT) に実行機会を渡す。
+    // シングルコアなので ble タスク (と裏の idle/WDT) に実行機会を渡す。
     // UART 受信バッファは割込みで積まれ続けるので、この程度の delay では
     // 取りこぼさない (UART_FIFO のサイズで数十 ms ぶん吸収できる)。
     vTaskDelay(pdMS_TO_TICKS(1));
-#endif
 }
-
-#if defined(ARDUINO_ARCH_RP2040)
-// ============================================================
-//  §5  core1  (SD 書き込み専用。RP2040 のみ。ESP32C3 は Sd::task() を使う)
-// ============================================================
-void setup1() {
-    // core0 が SPI ピンを触らないよう、SD の初期化はここに閉じる。
-    delay(50);                    // core0 の Serial 初期化と competing しないように
-    Sd::init();
-}
-
-void loop1() {
-    Sd::service();
-
-    // LED: 記録中=緑 / SD NG=赤 / ロスト有り=赤点滅 / 待機=青
-    static uint32_t last_led = 0;
-    if (millis() - last_led >= 100) {
-        last_led = millis();
-        const bool lost = (g_st.drop_ring || g_st.drop_wbuf ||
-                           g_st.crc_err   || g_st.seq_gap);
-        if (!g_st.sd_ok)          led(true, false, false);
-        else if (g_st.recording)  led(lost && (millis() / 200) % 2, true, false);
-        else                      led(lost, false, true);
-    }
-}
-#endif
