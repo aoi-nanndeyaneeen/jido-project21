@@ -66,6 +66,12 @@ python ble_receiver.py --out logs
 `ble_receiver.py` が保存する `LOGnnnn.BIN` は SD 版と同じ形式なので、
 `flight_controller/scripts/bin2csv.py` でそのまま CSV 化できる。
 
+★ 地上局コンソール (`position_estimator/src/console.py --ble`) を使うと、この
+受信を別プロセスで走らせずに済む。テレメトリ・指令ログと同じ `src/logs/` へ
+同じセッションのぶんが揃うので、あとで
+`flight_controller/scripts/merge_logs.py` に渡すだけで 1 本の時系列になる
+(機体の `millis()` を西暦の時刻へ直す手順もそこに書いてある)。
+
 FC 側のシリアルで `s` を押すとリンクとロガーの状態が出る (`SD=OK/NG` の表示は
 実際には「BLE 接続中か」を指す。表示文言は旧SD時代のまま残っている点に注意)。
 

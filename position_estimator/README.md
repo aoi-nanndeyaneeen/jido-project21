@@ -120,6 +120,26 @@ python main.py
 3. **ログファイル準備**
 4. **キャリブレーション** - 保存済みデータがあれば使用するか選択可能。新規の場合はCamera1はPC画面で、Camera2はRPi画面でそれぞれ5点をクリック
 
+### 3. 手で動かしたいとき: 地上局コンソール
+
+`main.py` の自動飛行ではなく、テレメトリを見ながら自分で指令を出す場合はこちら。
+
+```bash
+cd position_estimator/src
+python console.py          # 地上局を自動検出。ログは自動で全部取る
+python console.py --no-ble # BLE(機体125Hzログ)だけ止めたいとき
+```
+
+**`main.py` と同時には起動できません。** 地上局XIAOのUSBは1プロセスしか開けません
+（`s5_logger.py` も同様。BLEは別デバイスなのでこの制約には入らない）。
+キー割り当てはコンソール内の `?` か、ルートのREADMEを参照。
+
+このコンソールは同じセッションのログを `src/logs/` に揃えて落とします
+（`s5_link_*.csv` / `console_*.csv` / `LOGnnnn.BIN`）。そのまま
+`flight_controller/scripts/merge_logs.py` に渡すと1本の時系列になります。
+`main.py` も同様に、起動するだけでBLEログを含めて自動で取ります
+(`utils/config.py` の `BLE_LOG_ENABLED`)。
+
 ### キー操作
 
 | キー | 動作 |
@@ -315,7 +335,9 @@ python graph.py                          # 軌跡の3Dグラフ
 
 原点合わせは、カメラと機体フローの両方が同時に信用できる最初の瞬間に1回だけ行う。機体の `pos_n`(北) をフィールドの `+y`(奥)、`pos_e`(東) を `+x`(右) に対応させており、これは「機首をフィールド奥へ向けて置く」運用前提（`YAW_INITIAL_ALIGN_DEG=0`）そのもの。前提が崩れていれば `Diff_X/Y` に回転ずれとして現れる。
 
-無線プロトコルは `S5Cmd.h`（`flight_controller/` と `ground_receiver/` の両方、必ず同一内容）の `CmdFrame` に `corr_n_mm`/`corr_e_mm` と `CF_POS_CORR` フラグを追加して実装（18+4=22バイト、IM920sLの32バイト制限に収まる）。
+無線プロトコルは `S5Cmd.h`（`flight_controller/` と `ground_receiver/` の両方、必ず同一内容）の `CmdFrame` に `corr_n_mm`/`corr_e_mm` と `CF_POS_CORR` フラグを追加して実装（IM920sLの32バイト制限に収まる）。
+
+同じ `CmdFrame` に、PID reset / IMU再キャリブレーション / デバイス確認 (I2C再走査) を無線越しに1回だけ実行させる `action`/`action_seq` も追加してある（2026-09-14〜）。地上局コンソール (`console.py` の `P`/`k`/`i` キー) から送れる。詳しくはルートの README とS5Cmd.hのコメント参照。
 
 ### mission ログの読みどころ
 

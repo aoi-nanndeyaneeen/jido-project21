@@ -61,7 +61,8 @@
 namespace S5T {
 
 // 構造体を変えたら必ずインクリメントすること (地上局が不一致を検出する)
-constexpr uint8_t VERSION = 5;
+// VERSION 6 (2026-09-14): TYPE_ACK / AckFrame を追加 (下記)。
+constexpr uint8_t VERSION = 6;
 
 // IM920sL の実効ペイロード上限 [byte]。これを超えると黙って切られる。
 constexpr size_t IM920SL_MAX_PAYLOAD = 32;
@@ -72,6 +73,10 @@ constexpr uint8_t TYPE_ALT   = 0x41;  // 'A'  高度ループ + 姿勢
 constexpr uint8_t TYPE_POS   = 0x42;  // 'B'  水平位置ループ
 constexpr uint8_t TYPE_ATT   = 0x43;  // 'C'  姿勢ループ内部 (モーター出力/レート)
 constexpr uint8_t TYPE_PARAM = 0x50;  // 'P'  ゲイン一覧
+// ★ 0x4B ('K') は使わない。S5Cmd.h の S5C::MAGIC と同じ値で、下り/上りで
+//   種別バイトが衝突していないことを一目で確認できなくなる (S5Cmd.h の
+//   MAGIC のコメント参照)。'R' = Result。
+constexpr uint8_t TYPE_ACK   = 0x52;  // 'R'  S5Cmd.h の Action 実行結果 (単発。P と同じく枠を borrow)
 
 // ---- 量子化スケール (物理値 = 整数値 / SC_xxx) ----
 constexpr float SC_CDEG = 100.0f;    // 0.01 deg
@@ -228,6 +233,29 @@ struct __attribute__((__packed__)) ParamFrame {
     int16_t alt_thr_auth;  // 28
 };
 static_assert(sizeof(ParamFrame) == PACKET_BYTES, "ParamFrame が 28 byte ではありません");
+
+// ------------------------------------------------------------
+//  R: 単発メンテナンス指令 (S5Cmd.h の Action) の実行結果  (28 byte)
+// ------------------------------------------------------------
+//  P と同じく「起きたときだけ枠を borrow して送る」。定期送信ではない
+//  (drone_s5.cpp の S5Tel::requestAck() / tick() 参照)。
+enum AckResult : uint8_t {
+    ACK_OK             = 0,  // 実行した
+    ACK_REFUSED_ARMED  = 1,  // アーム中だったので拒否した (IMU_CAL/SELFTEST)
+    ACK_CAL_REJECTED   = 2,  // IMU_CAL は実行したが、妥当性チェックで却下された
+                             // (機体が水平/静止していなかった。値は変えていない)
+};
+
+struct __attribute__((__packed__)) AckFrame {
+    Header  h;                 //  6
+    uint8_t last_action;       //  7  S5C::Action。何を実行/拒否したか
+    uint8_t last_action_seq;   //  8  対応する action_seq (地上局が自分の要求か確認する)
+    uint8_t result;            //  9  AckResult
+    uint8_t imu_ok;            // 10  0/1  IMU (MPU6050) の I2C 疎通。SELFTEST 時のみ意味を持つ
+    uint8_t i2c_found;         // 11  I2Cスキャンで ACK が返ったアドレス数。同上
+    uint8_t reserved[17];      // 28  将来の拡張用 (0埋め)
+};
+static_assert(sizeof(AckFrame) == PACKET_BYTES, "AckFrame が 28 byte ではありません");
 
 // ------------------------------------------------------------
 //  量子化ヘルパ (飽和付き)

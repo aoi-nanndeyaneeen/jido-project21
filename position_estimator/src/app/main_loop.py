@@ -17,7 +17,8 @@ from utils.config import (DISP_W, DISP_H, VELOCITY_W, VELOCITY_H,
                           YAW_SEND_HZ, YAW_SEND_INITIAL_ALIGN,
                           GROUND_LINK_ENABLED, GROUND_LINK_PORT,
                           MISSION_WAYPOINTS, MISSION_TAKEOFF_ALT_M,
-                          MISSION_YAW_MODE, MISSION_AUTOSTART, LOG_DIR)
+                          MISSION_YAW_MODE, MISSION_AUTOSTART, LOG_DIR,
+                          BLE_LOG_ENABLED, BLE_LOG_NAME)
 from core.tracker import camera_thread_func
 from core.controller import AltitudeController
 from core.geometry import accel_to_angles
@@ -141,6 +142,16 @@ def run_main_loop(cam1, cam2,
     mission_log = None
     _last_n_tx = [0]
     _mission_aligned_logged = [False]
+
+    # ── BLE (機体125Hzログ) ── 地上局リンクとは別デバイスなので、
+    #  つながらなくても追跡・ミッションはそのまま続く。
+    ble_tap = None
+    if BLE_LOG_ENABLED:
+        from core.ble_tap import BleTap
+        ble_tap = BleTap(LOG_DIR, name=BLE_LOG_NAME)
+        if not ble_tap.start():
+            ble_tap = None
+
     if GROUND_LINK_ENABLED:
         print()
         print("[INIT] 地上局 (XIAO / xiao_s5_log) へ接続中...")
@@ -437,6 +448,8 @@ def run_main_loop(cam1, cam2,
     if mission_log is not None:
         mission_log.close()
         print(f"[Mission] ミッションログを保存しました: {mission_log.path}")
+    if ble_tap is not None:
+        ble_tap.stop()
 
     patrol.close()
     if alt_sensor is not None:

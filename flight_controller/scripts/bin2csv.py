@@ -129,6 +129,72 @@ def _row(rec, hover_thr):
     ])
 
 
+def decode_bin(binpath, hover_thr=DEFAULT_HOVER_THR, force=False, say=print):
+    """LOGnnnn.BIN を読んで (CSV 行のリスト, メタ情報) を返す。
+
+    ★ main() だけでなく scripts/merge_logs.py もここを通る。BIN の読み方
+      (ヘッダ検査・未書き込み領域の切り落とし) を 2 か所に書くと、必ず
+      片方だけ直されて「解析結果が食い違う」事故になる。
+
+    エラーは ValueError で投げる。終わり方 (sys.exit するか続けるか) は
+    呼び出し側が決める。
+    """
+    raw = binpath.read_bytes()
+    if len(raw) < 32 or raw[:6] != b"S5LOG\0":
+        raise ValueError(f"ヘッダが S5LOG ではありません: {binpath}")
+
+    meta = {
+        "path": binpath,
+        "fmt_ver": raw[6],
+        "rec_ver": raw[7],
+        "rec_size": raw[8] | (raw[9] << 8),
+        "rate_hz": raw[10] | (raw[11] << 8),
+        "t0_ms": struct.unpack_from("<I", raw, 12)[0],
+    }
+    say(f"[INFO] {binpath.name}  fmt_ver={meta['fmt_ver']} rec_ver={meta['rec_ver']} "
+        f"rec_size={meta['rec_size']} rate={meta['rate_hz']}Hz t0={meta['t0_ms']}ms")
+
+    if (meta["rec_ver"] != REC_VER or meta["rec_size"] != _REC_STRUCT.size) and not force:
+        raise ValueError(f"このスクリプトは rec_ver={REC_VER} / "
+                         f"rec_size={_REC_STRUCT.size} 用です。--force で強行できますが "
+                         f"値がずれる可能性があります。")
+
+    body = raw[32:]
+    step = meta["rec_size"] if force else _REC_STRUCT.size
+    n_full = len(body) // step
+    tail = len(body) - n_full * step
+    if tail:
+        say(f"[WARN] 末尾 {tail} バイトが半端です (電源断で切れた?)。無視します。")
+
+    # --- preAllocate の未使用領域を切り落とす -------------------------------
+    #  SdLog::startFile() は PREALLOC (16MB) を先に確保し、stopFile() が
+    #  truncate して余りを返す。ディスアームせずに電源を抜くと stopFile() が
+    #  走らないので、実データの後ろに未書き込み領域がまるごと残る。
+    #  未書き込みセクタは 0xFF (または 0x00) で読めるので、そこで打ち切る。
+    #  (LOG0054 は 9.1MB の実データ + 7MB の 0xFF で、そのまま変換すると
+    #   t_ms=4294967295 のゴミ行が 7 万行できていた)
+    def _is_blank(rec):
+        return rec.count(0xFF) == len(rec) or rec.count(0x00) == len(rec)
+
+    n_valid = n_full
+    for i in range(n_full):
+        if _is_blank(body[i * step:i * step + step]):
+            n_valid = i
+            break
+    if n_valid < n_full:
+        say(f"[WARN] {n_valid} 行目以降が未書き込み領域 (preAllocate の余り) でした。"
+            f"{n_full - n_valid} 行を切り捨てます。")
+        say("       → ディスアームしてから電源を切ると truncate されます。")
+        n_full = n_valid
+    if n_full == 0:
+        raise ValueError("有効なレコードがありません。")
+
+    rows = [_row(body[i * step:i * step + _REC_STRUCT.size], hover_thr)
+            for i in range(n_full)]
+    meta["n_rec"] = n_full
+    return rows, meta
+
+
 def _pick_bin(arg):
     p = Path(arg)
     if p.is_file():
@@ -152,53 +218,10 @@ def main():
     args = ap.parse_args()
 
     binpath = _pick_bin(args.path)
-    raw = binpath.read_bytes()
-    if len(raw) < 32 or raw[:6] != b"S5LOG\0":
-        sys.exit(f"[ERROR] ヘッダが S5LOG ではありません: {binpath}")
-
-    fmt_ver = raw[6]
-    rec_ver = raw[7]
-    rec_size = raw[8] | (raw[9] << 8)
-    rate_hz = raw[10] | (raw[11] << 8)
-    t0_ms = struct.unpack_from("<I", raw, 12)[0]
-
-    print(f"[INFO] {binpath.name}  fmt_ver={fmt_ver} rec_ver={rec_ver} "
-          f"rec_size={rec_size} rate={rate_hz}Hz t0={t0_ms}ms")
-
-    if (rec_ver != REC_VER or rec_size != _REC_STRUCT.size) and not args.force:
-        sys.exit(f"[ERROR] このスクリプトは rec_ver={REC_VER} / "
-                 f"rec_size={_REC_STRUCT.size} 用です。--force で強行できますが "
-                 f"値がずれる可能性があります。")
-
-    body = raw[32:]
-    step = rec_size if args.force else _REC_STRUCT.size
-    n_full = len(body) // step
-    tail = len(body) - n_full * step
-    if tail:
-        print(f"[WARN] 末尾 {tail} バイトが半端です (電源断で切れた?)。無視します。")
-
-    # --- preAllocate の未使用領域を切り落とす -------------------------------
-    #  SdLog::startFile() は PREALLOC (16MB) を先に確保し、stopFile() が
-    #  truncate して余りを返す。ディスアームせずに電源を抜くと stopFile() が
-    #  走らないので、実データの後ろに未書き込み領域がまるごと残る。
-    #  未書き込みセクタは 0xFF (または 0x00) で読めるので、そこで打ち切る。
-    #  (LOG0054 は 9.1MB の実データ + 7MB の 0xFF で、そのまま変換すると
-    #   t_ms=4294967295 のゴミ行が 7 万行できていた)
-    def _is_blank(rec):
-        return rec.count(0xFF) == len(rec) or rec.count(0x00) == len(rec)
-
-    n_valid = n_full
-    for i in range(n_full):
-        if _is_blank(body[i * step:i * step + step]):
-            n_valid = i
-            break
-    if n_valid < n_full:
-        print(f"[WARN] {n_valid} 行目以降が未書き込み領域 (preAllocate の余り) でした。"
-              f"{n_full - n_valid} 行を切り捨てます。")
-        print("       → ディスアームしてから電源を切ると truncate されます。")
-        n_full = n_valid
-    if n_full == 0:
-        sys.exit("[ERROR] 有効なレコードがありません。")
+    try:
+        rows, meta = decode_bin(binpath, args.hover_thr, args.force)
+    except ValueError as e:
+        sys.exit(f"[ERROR] {e}")
 
     if args.out:
         outp = Path(args.out)
@@ -209,11 +232,10 @@ def main():
 
     with outp.open("w", encoding="utf-8", newline="") as fo:
         fo.write(HEADER + "\n")
-        for i in range(n_full):
-            off = i * step
-            fo.write(_row(body[off:off + _REC_STRUCT.size], args.hover_thr) + "\n")
+        for row in rows:
+            fo.write(row + "\n")
 
-    print(f"[OK] {n_full} 行 -> {outp}")
+    print(f"[OK] {meta['n_rec']} 行 -> {outp}")
 
 
 if __name__ == "__main__":

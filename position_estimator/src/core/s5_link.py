@@ -67,6 +67,24 @@ CF_YAW_VALID = 1 << 2
 CF_ALT_ABS   = 1 << 3
 CF_POS_CORR  = 1 << 4   # corr_n_m/corr_e_m を機体の pos_n/pos_e へ適用する
 
+# S5Cmd.h の Action。PID reset / IMU校正 / デバイス確認の単発指令
+# (通常の巡航指令 req とは別枠。send_command() の action/action_seq 引数で使う)
+ACT_NONE      = 0
+ACT_PID_RESET = 1
+ACT_IMU_CAL   = 2
+ACT_SELFTEST  = 3
+
+ACT_NAME = {ACT_NONE: "-", ACT_PID_RESET: "PID_RESET",
+            ACT_IMU_CAL: "IMU_CAL", ACT_SELFTEST: "SELFTEST"}
+
+# S5Telem.h の AckResult。Action の実行結果
+ACK_OK            = 0
+ACK_REFUSED_ARMED = 1
+ACK_CAL_REJECTED  = 2
+
+ACK_RESULT_NAME = {ACK_OK: "OK", ACK_REFUSED_ARMED: "拒否(アーム中)",
+                   ACK_CAL_REJECTED: "却下(妥当性チェック不合格)"}
+
 # XIAO の USB CDC。Windows では description で判別できないので VID:PID。
 # ★ 地上局を RP2040 -> ESP32C3 に移行済み。ESP32C3 はチップ内蔵のネイティブ
 #   USB (303A:1001) で列挙される。旧 RP2040 (2E8A:000A) も念のため残す。
@@ -107,7 +125,12 @@ class S5Link:
         flow_ok / range_valid / airborne
     """
 
-    def __init__(self, port=None, baud=115200, log_dir=None, autostart_csv=True):
+    def __init__(self, port=None, baud=115200, log_dir=None, autostart_csv=True,
+                 on_message=None):
+        # ★ 全画面で描き直すコンソール (console.py) から使うときは、ここが
+        #   勝手に print すると画面が崩れる。既定は print のままにして、
+        #   受け取りたい呼び出し側だけ on_message を渡す。
+        self._say = on_message if on_message is not None else print
         self.port = port or find_ground_port()
         self.ok = False
         self._state = {}
@@ -119,23 +142,26 @@ class S5Link:
         self._running = False
         self._n_sent = 0
         self._last_param_line = None
+        self._last_ack = None       # dict or None (まだ受けていない)
+        self._last_ack_ts = 0.0
+        self._action_seq = 0        # 次に使う action_seq (1..255 を循環。0は使わない)
 
         if self.port is None:
-            print("[S5Link] 地上局 (XIAO ESP32C3 303A:1001 / 旧RP2040 2E8A:000A) が見つかりません。")
+            self._say("[S5Link] 地上局 (XIAO ESP32C3 303A:1001 / 旧RP2040 2E8A:000A) が見つかりません。")
             self._print_port_hint()
             return
 
         try:
             self.ser = serial.Serial(self.port, baud, timeout=0.2)
         except Exception as e:
-            print(f"[S5Link] {self.port} を開けません: {e}")
-            print("         s5_logger.py を同時に起動していませんか? "
-                  "(同じポートは1プロセスしか開けません)")
+            self._say(f"[S5Link] {self.port} を開けません: {e}")
+            self._say("         s5_logger.py を同時に起動していませんか? "
+                      "(同じポートは1プロセスしか開けません)")
             return
 
         self.ok = True
         self._running = True
-        print(f"[S5Link] 地上局に接続: {self.port}")
+        self._say(f"[S5Link] 地上局に接続: {self.port}")
 
         if log_dir is not None:
             log_dir = Path(log_dir)
@@ -143,7 +169,7 @@ class S5Link:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             self._csv_path = log_dir / f"s5_link_{ts}.csv"
             self._csv = open(self._csv_path, "w", encoding="utf-8", newline="")
-            print(f"[S5Link] テレメトリ保存先: {self._csv_path}")
+            self._say(f"[S5Link] テレメトリ保存先: {self._csv_path}")
 
         self._thread = threading.Thread(target=self._rx_loop, daemon=True)
         self._thread.start()
@@ -153,25 +179,24 @@ class S5Link:
             self._write_raw("1\n")
 
     # ---------------------------------------------------------------- 受信
-    @staticmethod
-    def _print_port_hint():
+    def _print_port_hint(self):
         ports = list(serial.tools.list_ports.comports())
         if not ports:
-            print("         COM ポートが1つも見えていません。USB を挿し直してください。")
+            self._say("         COM ポートが1つも見えていません。USB を挿し直してください。")
             return
-        print("         接続中のポート:")
+        self._say("         接続中のポート:")
         for p in ports:
             tag = "  <- Teensy (機体側。地上局ではありません)" \
                   if (p.vid, p.pid) == VID_PID_TEENSY else ""
             vidpid = f"{p.vid:04X}:{p.pid:04X}" if p.vid is not None else "    -    "
-            print(f"           {p.device}  {vidpid}  {p.description}{tag}")
+            self._say(f"           {p.device}  {vidpid}  {p.description}{tag}")
 
     def _rx_loop(self):
         while self._running:
             try:
                 raw = self.ser.readline()
             except Exception as e:
-                print(f"[S5Link] 受信エラー: {e}")
+                self._say(f"[S5Link] 受信エラー: {e}")
                 time.sleep(0.2)
                 continue
             if not raw:
@@ -184,7 +209,8 @@ class S5Link:
             #   受信した瞬間の PC 時刻を1列目に足して保存する (解析の突き合わせキー)。
             #   足すのは保存する行だけ。解析用の列定義 (_cols) は素のまま扱う。
             if self._csv is not None:
-                if line.startswith("DATA,") or line.startswith("PARAM,"):
+                if (line.startswith("DATA,") or line.startswith("PARAM,")
+                        or line.startswith("ACK,")):
                     tag, _, rest = line.partition(",")
                     self._csv.write(f"{tag},{time.time():.3f},{rest}\n")
                 elif line.startswith("HEADER,"):
@@ -202,9 +228,17 @@ class S5Link:
                 self._last_param_line = line
                 continue
 
+            if line.startswith("ACK,"):
+                # S5Cmd.h の Action (PID reset / IMU校正 / デバイス確認) の実行結果。
+                #  ★ _state (DATA行由来) には混ぜない。DATA は 10Hz 前後で丸ごと
+                #    差し替わるので、混ぜると次の1行で ACK が消えてしまう。
+                #    別枠で保持し、last_ack() で取り出す。
+                self._parse_ack(line)
+                continue
+
             if line.startswith("#"):
                 # 受信機からの人間向けメッセージ。切り分けに効くのでそのまま出す。
-                print(f"[地上局] {line[1:].strip()}")
+                self._say(f"[地上局] {line[1:].strip()}")
 
     def _parse_data(self, line):
         if self._cols is None:
@@ -225,11 +259,54 @@ class S5Link:
             self._last_rx = time.time()
             self._n_data += 1
 
+    def _parse_ack(self, line):
+        # "ACK,<action>,<action_seq>,<result>,<imu_ok>,<i2c_found>"
+        #  s5_log.cpp の emitAck() と同じ順。壊れていたら黙って捨てる
+        #  (古いACKを誤表示するより、何も表示しない方が安全)。
+        parts = line[len("ACK,"):].split(",")
+        if len(parts) != 5:
+            return
+        try:
+            action, action_seq, result, imu_ok, i2c_found = (int(x) for x in parts)
+        except ValueError:
+            return
+        with self._lock:
+            self._last_ack = {"action": action, "action_seq": action_seq,
+                              "result": result, "imu_ok": bool(imu_ok),
+                              "i2c_found": i2c_found}
+            self._last_ack_ts = time.time()
+        self._say(f"[S5Link] ACK: {ACT_NAME.get(action, action)} -> "
+                  f"{ACK_RESULT_NAME.get(result, result)}")
+
     # ---------------------------------------------------------------- 状態
     def state(self):
         """最新テレメトリの dict (コピー)。未受信なら空 dict。"""
         with self._lock:
             return dict(self._state)
+
+    def last_ack(self):
+        """
+        最後に受けた Action 実行結果。
+
+        Returns: (dict または None, 受信からの秒数)
+            未受信なら (None, inf)。dict は
+            {"action", "action_seq", "result", "imu_ok", "i2c_found"}。
+        """
+        with self._lock:
+            if self._last_ack is None:
+                return None, float("inf")
+            return dict(self._last_ack), time.time() - self._last_ack_ts
+
+    def next_action_seq(self):
+        """
+        新しい Action を送るときの action_seq を1つ払い出す。
+
+        ★ 0 は「実行済み扱い」と衝突するので使わない (S5Cmd.h のコメント
+          参照)。呼ぶたびに 1..255 を循環する。
+        """
+        with self._lock:
+            self._action_seq = (self._action_seq % 255) + 1
+            return self._action_seq
 
     def age(self):
         """最後にテレメトリを受けてからの秒数。未受信なら inf。"""
@@ -256,10 +333,11 @@ class S5Link:
         try:
             self.ser.write(s.encode("utf-8"))
         except Exception as e:
-            print(f"[S5Link] 送信エラー: {e}")
+            self._say(f"[S5Link] 送信エラー: {e}")
 
     def send_command(self, req, vx_mps=0.0, vy_mps=0.0, alt_m=0.0,
-                     yaw_rate_dps=0.0, flags=0, corr_n_m=None, corr_e_m=None):
+                     yaw_rate_dps=0.0, flags=0, corr_n_m=None, corr_e_m=None,
+                     action=ACT_NONE, action_seq=0):
         """
         上りコマンドを 1 行送る。
 
@@ -275,6 +353,15 @@ class S5Link:
                 flags に CF_POS_CORR を含めること (呼び出し側の責任。
                 ここで勝手に足すと「補正のつもりがなかった0,0」を
                 誤って適用させかねない)。
+            action/action_seq: PID reset / IMU校正 / デバイス確認の単発指令
+                (ACT_*)。action_seq は next_action_seq() で払い出すこと
+                (0 だと機体側の重複排除の初期値と衝突して無視される。
+                S5Cmd.h のコメント参照)。action を送るときは corr_n_m/
+                corr_e_m が None でも 0,0 として自動で埋める
+                (ワイヤ上で action は corr の *後ろ* 固定位置にあるため)。
+                req は毎ループ上書きされる連続指令だが、action は
+                「値が変わった最初の1回」だけ機体側が実行するエッジ
+                トリガなので、呼び続けても何度も実行されたりはしない。
 
         ★ これを呼び続けるあいだだけ機体は GUIDED でいられる。呼ぶのを
           止めれば機体はホールド -> 自動着陸に落ちる (それが仕様)。
@@ -286,6 +373,9 @@ class S5Link:
         """
         if not self.ok:
             return
+        if action != ACT_NONE and action_seq == 0:
+            self._say("[S5Link] 警告: action_seq=0 は機体側で無視されます "
+                      "(next_action_seq() を使ってください)")
         self._n_sent += 1
         parts = [
             "CMD", str(int(req)),
@@ -295,10 +385,25 @@ class S5Link:
             str(int(round(yaw_rate_dps * 100.0))),
             str(int(flags)),
         ]
-        if corr_n_m is not None and corr_e_m is not None:
-            parts.append(str(int(round(corr_n_m * 1000.0))))
-            parts.append(str(int(round(corr_e_m * 1000.0))))
+        if corr_n_m is not None and corr_e_m is not None or action != ACT_NONE:
+            # action を送るなら、ワイヤ上その手前にある corr_n/corr_e も
+            # 必ず埋める (省略すると位置がずれて action が別の値として届く)。
+            cn = int(round(corr_n_m * 1000.0)) if corr_n_m is not None else 0
+            ce = int(round(corr_e_m * 1000.0)) if corr_e_m is not None else 0
+            parts.append(str(cn))
+            parts.append(str(ce))
+            if action != ACT_NONE:
+                parts.append(str(int(action)))
+                parts.append(str(int(action_seq)))
         self._write_raw(",".join(parts) + "\n")
+
+    def send_key(self, ch):
+        """地上局 XIAO のキー入力をそのまま送る (s5_log.cpp の handleKey)。
+
+        's' 状態表示 / 'd' 生データ / 'z' 統計クリア / '1','0' CSV 出力。
+        返事は '#' 行で返ってくるので on_message から拾える。
+        """
+        self._write_raw(str(ch) + "\n")
 
     def n_sent(self):
         return self._n_sent
@@ -323,5 +428,5 @@ class S5Link:
             pass
         if self._csv is not None:
             self._csv.close()
-            print(f"[S5Link] テレメトリを保存しました: {self._csv_path}")
-        print(f"[S5Link] 切断 (受信 {self._n_data} 行 / 送信 {self._n_sent} 行)")
+            self._say(f"[S5Link] テレメトリを保存しました: {self._csv_path}")
+        self._say(f"[S5Link] 切断 (受信 {self._n_data} 行 / 送信 {self._n_sent} 行)")

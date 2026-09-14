@@ -99,7 +99,11 @@ class FrameParser:
 class BinLogger:
     """受信したフレームを SD版と同じ LOGnnnn.BIN 形式で書き出す。"""
 
-    def __init__(self, outdir: Path):
+    # ★ on_event: ログの開閉を知らせる先。既定は print だが、全画面で
+    #   描き直す側 (position_estimator/src/console.py の BLE タップ) から
+    #   使うときに print されると画面が崩れるので差し替えられるようにした。
+    def __init__(self, outdir: Path, on_event=None):
+        self._say = on_event if on_event is not None else print
         self._outdir = outdir
         self._f = None
         self._path = None
@@ -120,8 +124,8 @@ class BinLogger:
         if self._f is None:
             return
         self._f.close()
-        print(f"[CLOSE] {self._path.name}  {self._bytes}B  "
-              f"{self._rec_count}rec  seq_gap={self._seq_gap}")
+        self._say(f"[CLOSE] {self._path.name}  {self._bytes}B  "
+                  f"{self._rec_count}rec  seq_gap={self._seq_gap}")
         self._f = None
 
     def on_frame(self, type_: int, seq: int, payload: bytes) -> None:
@@ -145,7 +149,7 @@ class BinLogger:
             self._bytes = BIN_HDR_LEN
             self._rec_count = 0
             self._seq_gap = 0
-            print(f"[OPEN]  {self._path.name}  t0={t0}")
+            self._say(f"[OPEN]  {self._path.name}  t0={t0}")
 
         elif type_ == T_REC:
             if self._f is None:
@@ -159,6 +163,12 @@ class BinLogger:
 
     def close(self) -> None:
         self._close()
+
+    def status(self) -> dict:
+        """今書いているファイルの状況。コンソールの表示用。"""
+        return {"path": self._path, "open": self._f is not None,
+                "bytes": self._bytes, "rec": self._rec_count,
+                "seq_gap": self._seq_gap, "t0": self._t0}
 
 
 async def run(args) -> None:

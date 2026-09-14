@@ -164,7 +164,12 @@ public:
     float getPitch() { return filter.getPitch(); }
     float getYaw()   { return filter.getYaw(); }
 
-    void recalibrate() {
+    // 戻り値: 採用されたら true。妥当性チェックで却下されたら false
+    //  (呼び出し側が discard しても既存の呼び方はそのまま動く)。
+    //  ★ 2026-09-14: 遠隔からの再キャリブレーション (drone_s5.cpp
+    //    handleRemoteAction()) が、拒否されたことを地上局へ伝えるために
+    //    戻り値を見る。シリアル 'k' は従来どおり画面のメッセージだけ見る。
+    bool recalibrate() {
         Serial.println("INFO: MPU6050 Recalibration (ax=0, ay=0, az=1 mode)...");
         
         // 却下したときに戻せるよう、今の値を退避しておく
@@ -258,7 +263,7 @@ public:
             Serial.println("   (az の符号は問わない。IMU 上下逆マウントでも az≈-1g で通る)");
             Serial.println("   → 水平な床に置き、手を離して静止させてから 'k' を押し直してください。");
             Serial.println("   キャリブレーション値は変更していません (前の値のまま)。");
-            return;
+            return false;
         }
 
         Config::sensor::s_ax_bias = m_ax;
@@ -277,5 +282,6 @@ public:
         Serial.printf("INFO: New Biases: ax=%.4f ay=%.4f az=%.4f gx=%.4f gy=%.4f gz=%.4f\n",
                       Config::sensor::s_ax_bias, Config::sensor::s_ay_bias, Config::sensor::s_az_bias,
                       Config::sensor::s_gx_bias, Config::sensor::s_gy_bias, Config::sensor::s_gz_bias);
+        return true;
     }
 };

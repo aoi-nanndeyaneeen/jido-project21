@@ -1054,6 +1054,12 @@ uint32_t last_param_ms = 0;
 bool     tx_drop_flag  = false;  // 直前の送信が捨てられたか (次パケットで通知)
 uint8_t  slot          = 0;      // A/B/C の送信枠カウンタ (tick 参照)
 
+// 単発メンテナンス指令 (S5Cmd.h の Action) の実行結果。1回きりの
+// イベントなので、P と同じく次の tick() で枠を borrow して送る。
+// handleRemoteAction() が requestAck() でここへ積む。
+bool          ack_pending = false;
+S5T::AckFrame pending_ack{};
+
 // A/B 共通のヘッダを埋める。
 inline void fillHeader(S5T::Header& h, uint8_t type) {
     h.type = type;
@@ -1164,6 +1170,29 @@ inline void sendAtt(int mode) {
     if (!s5tx.send(c)) tx_drop_flag = true;
 }
 
+// R: 単発メンテナンス指令の実行結果。handleRemoteAction() が積んだ
+//   pending_ack をそのまま送る。ヘッダは fillHeader() で埋め直す
+//   (t_cs/flags は「送信する今」の値にしたいので、実行時点のものを
+//   使い回さない)。
+inline void sendAck() {
+    fillHeader(pending_ack.h, S5T::TYPE_ACK);
+    if (!s5tx.send(pending_ack)) tx_drop_flag = true;
+}
+
+// handleRemoteAction() から呼ぶ。次の tick() で最優先に送られる。
+//  ★ 連続して 2 回呼ばれた場合 (ほぼ無いはずだが) は新しい方で上書きする。
+//    古い結果より「今の実行結果」を優先するのは自然な挙動。
+inline void requestAck(uint8_t action, uint8_t action_seq, uint8_t result,
+                       uint8_t imu_ok, uint8_t i2c_found) {
+    pending_ack = S5T::AckFrame{};
+    pending_ack.last_action     = action;
+    pending_ack.last_action_seq = action_seq;
+    pending_ack.result          = result;
+    pending_ack.imu_ok          = imu_ok;
+    pending_ack.i2c_found       = i2c_found;
+    ack_pending = true;
+}
+
 // P: 今どのゲインで飛んでいるか。数秒に1回。
 inline void sendParam() {
     S5T::ParamFrame p{};
@@ -1205,7 +1234,15 @@ inline void sendParam() {
 //    POSHOLD / AUTO … A,B,A,C の4枠巡回 (A 7.5Hz / B 3.75Hz / C 3.75Hz)
 //        位置ループは 0.3〜1Hz なので B は 3.75Hz で足りる。
 //  P(ゲイン一覧) は数秒に1回、その回の枠を borrow する。
+//  R(Action実行結果) は起きた回だけ最優先で枠を borrow する (P より優先。
+//    操作した本人が待っている応答なので、次のPARAM周期まで待たせない)。
 inline void tick(int mode, float thr_stick) {
+    if (ack_pending) {
+        ack_pending = false;
+        sendAck();
+        return;
+    }
+
     const uint32_t now = millis();
     if (now - last_param_ms >= S5::TELEM_PARAM_MS) {
         last_param_ms = now;
@@ -2046,7 +2083,8 @@ static void tuningMenu() {
 //  0x68 だけ見えて 0x29 が見えない → VL53L1X が配線に乗れていない
 //    (SDA/SCL 断線・VIN 断線・XSHUT が Low・センサ故障)。
 //  両方見えない → バスが Low に張り付いている (モジュール故障 or 電源ショート)。
-static void i2cScan() {
+// 戻り値: 見つかったデバイス数。handleRemoteAction() が AckFrame に載せる。
+static int i2cScan() {
     Serial.println("\n--- I2C scan (Wire: SDA=18 / SCL=19) ---");
     int found = 0;
     for (uint8_t addr = 0x08; addr <= 0x77; ++addr) {
@@ -2063,6 +2101,81 @@ static void i2cScan() {
     if (found == 0)
         Serial.println("  応答なし。SDA/SCL が Low 固着 or 全モジュール断線。");
     Serial.printf("--- %d device(s) ---\n", found);
+    return found;
+}
+
+// ============================================================
+//  地上局からの単発メンテナンス指令 (S5Cmd.h の Action)
+// ============================================================
+//  updateGuided() より前、かつその成否ゲート (SW_HOVER/フロー/測距の
+//  健全性など) を一切通さずに呼ぶ。PID reset / IMU校正 / デバイス確認は
+//  「GUIDEDに入れる状態か」とは無関係にいつでも試せてよい操作であり、
+//  むしろ GUIDED に入る *前* (地上で機体を整えている最中) にこそ使う。
+//
+//  ★ g_last_action_seq による重複排除は「action が ACT_NONE でない」
+//    ときだけ働く。req/vx/vy のように毎ループ ACT_NONE を送り続けても
+//    ここでは何も起きない。
+static uint8_t g_last_action_seq = 0;
+
+static void handleRemoteAction() {
+    if (!S5::USE_IM920 || !Q::GUIDED_ENABLE) return;
+    if (!s5rx.everReceived()) return;
+
+    const S5C::CmdFrame& c = s5rx.last();
+    if (c.action == S5C::ACT_NONE) return;
+    if (c.action_seq == g_last_action_seq) return;   // 既に実行済み (重複排除)
+    g_last_action_seq = c.action_seq;
+
+    switch (c.action) {
+        case S5C::ACT_PID_RESET:
+            // ★ シリアル 'r' キーと同じく非アーム/アーム問わず実行する
+            //   (既存のキー操作と挙動をそろえる)。PID内部状態のリセット
+            //   自体は積分器を0に戻すだけで、モーターを止めたりしない。
+            resetControllers();
+            Serial.println("\n>>> 地上局からの指令: PID reset");
+            S5Tel::requestAck(c.action, c.action_seq, S5T::ACK_OK, 0, 0);
+            break;
+
+        case S5C::ACT_IMU_CAL: {
+            // ★ シリアル 'k' と違い、遠隔操作者は機体に触れていない。
+            //   飛行中に誤って送られたら motors を止めて校正へ入るのは
+            //   致命的なので、'k' にはない「非アーム限定」ゲートを足す。
+            if (isArmed()) {
+                Serial.println("\n!! 地上局からの IMU_CAL を拒否: アーム中です");
+                S5Tel::requestAck(c.action, c.action_seq, S5T::ACK_REFUSED_ARMED, 0, 0);
+                break;
+            }
+            stopAllMotors();
+            Serial.println("\n>>> 地上局からの指令: CALIBRATE "
+                           "(機体を水平に置いて動かさないでください)");
+            bool ok = true;
+            if (S5::USE_MPU) ok = mpu.recalibrate();
+            resetControllers();
+            S5Tel::requestAck(c.action, c.action_seq,
+                              ok ? S5T::ACK_OK : S5T::ACK_CAL_REJECTED, 0, 0);
+            break;
+        }
+
+        case S5C::ACT_SELFTEST: {
+            // ★ i2cScan() は読み取りだけだが、ACK の無い addr ごとに
+            //   Wire のタイムアウト分だけループが伸びうる。1000Hzループを
+            //   乱さないよう、こちらも非アーム限定にする (同上の理由)。
+            if (isArmed()) {
+                Serial.println("\n!! 地上局からの SELFTEST を拒否: アーム中です");
+                S5Tel::requestAck(c.action, c.action_seq, S5T::ACK_REFUSED_ARMED, 0, 0);
+                break;
+            }
+            Serial.println("\n>>> 地上局からの指令: SELFTEST (I2C再走査)");
+            const int found = i2cScan();
+            const uint8_t imu_ok = (S5::USE_MPU && mpu.connected()) ? 1 : 0;
+            S5Tel::requestAck(c.action, c.action_seq, S5T::ACK_OK,
+                              imu_ok, (uint8_t)constrain(found, 0, 255));
+            break;
+        }
+
+        default:
+            break;
+    }
 }
 
 static void handleSerial() {
@@ -2249,6 +2362,11 @@ static void printStatus(uint32_t dt_us) {
                               (float)c.vy_mmps / S5C::SC_MMPS,
                               (float)c.alt_cm  / S5C::SC_CM,
                               (unsigned)c.flags);
+                if (c.action != S5C::ACT_NONE) {
+                    Serial.printf("         action=%s seq=%u (直近実行 seq=%u)\n",
+                                  S5C::actionName(c.action), (unsigned)c.action_seq,
+                                  (unsigned)g_last_action_seq);
+                }
             }
             static const char* PH[] = { "OFF", "HOLD", "TAKEOFF", "CRUISE", "LAND", "LANDED" };
             Serial.printf("GUIDED %s  phase=%-7s  目標 vx=%+.3f vy=%+.3f alt=%.2f m "
@@ -2642,6 +2760,9 @@ void loop() {
         if (Q::GUIDED_ENABLE) s5rx.poll();
         else                  telemetry.receive();
     }
+    // PID reset / IMU校正 / デバイス確認などの単発指令。GUIDEDに入って
+    // いるかとは無関係に処理する (updateGuided() の成否ゲートより前)。
+    handleRemoteAction();
     // 地上局の要求を「目標速度 / 目標高度」へ翻訳する (制御はしない)。
     updateGuided();
     const uint32_t _t5 = micros();
