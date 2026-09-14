@@ -24,7 +24,8 @@ from utils.config import (FIELD_POINTS, CALIB_POINT_LABELS, CALIB_PRESET,
 from core.remote_camera import RemoteCamera
 from core.geometry import (CameraCalib, solve_extrinsics, reprojection_error,
                            get_ray, intersect_rays)
-from utils.calib_store import save_calibration, load_calibration, ask_use_saved
+from utils.calib_store import (save_calibration, load_calibration,
+                               ask_use_saved, resolve_intrinsics)
 
 # クリック位置をサブピクセル補正する際、これ以上動いたら補正を却下する [px]
 SUBPIX_MAX_SHIFT_PX = 6.0
@@ -168,11 +169,11 @@ def _verify_pair(K1, dist1, R1, tvec1, pts1,
 
 
 # ============================================================
-# Camera1（PC直結）
+# 5点の取得（PC画面でクリック）
 # ============================================================
 
-def run_calibration_single(cam, cam_label: str):
-    """PC画面で5点クリックして外部パラメータを求める。"""
+def _click_five_points(cam, cam_label: str):
+    """PC画面で5点クリックし、サブピクセル補正した座標を返す。"""
     points_2d = []
     state = {"mouse": None}
     window_name = f"Calibration: {cam_label}"
@@ -237,23 +238,10 @@ def run_calibration_single(cam, cam_label: str):
     refined = [_refine_click(gray, p) for p in points_2d[:4]]
     refined.append([float(points_2d[4][0]), float(points_2d[4][1])])
 
-    K, dist = cam.get_intrinsics()
-    pts2d = np.array(refined, dtype=np.float32)
-    R, tvec, rvec = solve_extrinsics(FIELD_POINTS, pts2d, K, dist)
-    if R is None:
-        cv2.destroyWindow(window_name)
-        raise RuntimeError(f"[{cam_label}] solvePnP が失敗しました。")
-
-    cam_pos = -R.T.dot(tvec)
-    print(f"\n  [{cam_label}] カメラ位置: X={cam_pos[0,0]:.2f} "
-          f"Y={cam_pos[1,0]:.2f} Z={cam_pos[2,0]:.2f}m")
-    reproj = _report_reprojection(cam_label, FIELD_POINTS, pts2d,
-                                  K, dist, rvec, tvec)
-
     cv2.destroyWindow(window_name)
     for _ in range(5):
         cv2.waitKey(1)
-    return K, dist, R, tvec, refined, reproj
+    return refined
 
 
 def _dummy_calib(label, cam_pos_xyz):
@@ -301,8 +289,13 @@ def _connect_stream(w_default=1280, h_default=720, retries=5):
     return None
 
 
-def _run_camera2_fresh_calibration():
-    """RPi画面で5点クリック → 外部パラメータ算出 → 保存 → STREAM接続"""
+def _request_rpi_points():
+    """
+    RPiにCALIBを投げ、ラズパイ画面でクリックされた5点を受け取る。
+
+    Returns:
+        (pts, width, height) — 失敗時 pts は None
+    """
     print(f"\n  ─── Camera2 キャリブレーション (プリセット: {CALIB_PRESET}) ───")
     print("       ラズパイ画面でクリック:")
     for lbl in CALIB_POINT_LABELS:
@@ -317,50 +310,146 @@ def _run_camera2_fresh_calibration():
         info = json.loads(line)
         w2, h2 = info["width"], info["height"]
         sk.sendall(b"CALIB\n")
-        print("  [A] CALIB送信 - クリック待ち...")
+        print("  [Camera2] CALIB送信 - クリック待ち...")
         line, _ = _rline(sk, buf)
         pts = json.loads(line)["calib_pts"]
-        print(f"  [A] {len(pts)}点受信: {pts}")
+        print(f"  [Camera2] {len(pts)}点受信: {pts}")
     except Exception as e:
         print(f"  [FAIL] CALIB失敗: {e}")
     finally:
         sk.close()
 
-    if not pts or len(pts) != 5:
-        print("  [FAIL] 点データ不正 → ダミー")
-        K2, dist2, R2, tvec2 = _dummy_calib("Camera2", [8, -8, 2])
-        return K2, dist2, R2, tvec2, None, None, None
+    return pts, w2, h2
 
-    # 内部パラメータは Camera2 用の実測値を使う（無ければ公称画角から概算）
-    stub = RemoteCamera(RPI_HOST, RPI_PORT, label="Camera2")
-    stub.width, stub.height = w2, h2
-    K2, dist2 = stub.get_intrinsics()
 
-    p2d = np.array(pts, dtype=np.float32)
-    R2, tvec2, rvec2 = solve_extrinsics(FIELD_POINTS, p2d, K2, dist2)
-    if R2 is None:
-        print("  [FAIL] solvePnP失敗 → ダミー")
-        K2, dist2, R2, tvec2 = _dummy_calib("Camera2", [8, -8, 2])
-        return K2, dist2, R2, tvec2, None, None, None
+# ============================================================
+# カメラソース
+# ============================================================
+# 「5点をどうやって取るか」「ライブ映像をどうやって開くか」だけが
+# USB と RPi で違う。その2点だけをここに閉じ込め、キャリブの手順そのもの
+# (保存済みを使うか聞く → 内部パラメータを読む → 解く → 保存 → 接続) は
+# 両カメラ・両経路で完全に同じコードを通す。
+#
+# ★ 順序が重要: RPi のサーバーは1接続1モードなので、CALIB で点を受けてから
+#   STREAM で繋ぎ直す。USB は初期化時点で既に開いているので open_live は素通し。
 
-    cp = -R2.T.dot(tvec2)
-    print(f"\n  [Camera2] カメラ位置: X={cp[0,0]:.2f} "
-          f"Y={cp[1,0]:.2f} Z={cp[2,0]:.2f}m")
-    reproj2 = _report_reprojection("Camera2", FIELD_POINTS, p2d,
-                                   K2, dist2, rvec2, tvec2)
-    save_calibration("Camera2", K2, R2, tvec2, pts, w2, h2,
-                     dist=dist2, reproj_px=reproj2, preset=CALIB_PRESET)
+class _UsbSource:
+    """PCに直結したUSBカメラ。PC画面でクリックする。"""
 
-    time.sleep(0.3)
-    real_cam2 = _connect_stream(w2, h2, retries=1)
-    return K2, dist2, R2, tvec2, real_cam2, pts, reproj2
+    def __init__(self, cam):
+        self.cam = cam
+
+    def capture_points(self, label):
+        print(f"\n  ─── {label} (USB) キャリブレーション ───")
+        pts = _click_five_points(self.cam, label)
+        return pts, self.cam.width, self.cam.height
+
+    def open_live(self, width, height):
+        return self.cam
+
+
+class _RpiSource:
+    """ラズパイ経由。CALIB接続で5点を受け取り、STREAM接続に張り直す。"""
+
+    def capture_points(self, label):
+        return _request_rpi_points()
+
+    def open_live(self, width, height):
+        # CALIB 側の接続をサーバーが畳むまでの猶予
+        time.sleep(0.3)
+        return _connect_stream(width, height)
+
+
+# ============================================================
+# 1台分のキャリブレーション
+# ============================================================
+
+def _check_resolution(label, cam, w, h):
+    """外部パラメータを測った解像度と、いま開いている映像の解像度を突き合わせる。"""
+    live_w, live_h = getattr(cam, "width", None), getattr(cam, "height", None)
+    if not live_w or not live_h or (live_w, live_h) == (w, h):
+        return
+    print(f"  [{label}] [WARN] 外部パラメータは {w}x{h} で測られていますが、"
+          f"いまの映像は {live_w}x{live_h} です。")
+    print("             クリック座標の基準がずれるため、測り直してください。")
+
+
+def _verify_saved(label, points, K, dist, R, tvec, saved_reproj):
+    """
+    保存済みの外部パラメータを、いまの内部パラメータで検算する。
+
+    内部パラメータを測り直したあとは保存時の再投影誤差が当てにならない。
+    ここで計算し直すことで、K の入れ替わりに気づかないまま飛ばすのを防ぐ。
+    """
+    rvec, _ = cv2.Rodrigues(R)
+    reproj = _report_reprojection(label, FIELD_POINTS,
+                                  np.array(points, dtype=np.float32),
+                                  K, dist, rvec, tvec)
+    if saved_reproj is not None and abs(reproj - saved_reproj) > 0.5:
+        print(f"  [{label}] [WARN] 保存時 ({saved_reproj:.2f} px) と食い違っています。")
+        print("             内部パラメータを測り直した可能性があります。"
+              "誤差が悪化しているなら外部パラメータも測り直してください。")
+
+
+def _calibrate_camera(label, source, available, fallback_pos, fallback_cam):
+    """
+    1台分のキャリブレーションを行い (K, dist, R, tvec, points, cam) を返す。
+
+    保存済み利用 / 新規測定 / ダミー の3経路をここに集約する。
+    points は2カメラ整合の検証に使う。取れなかった場合は None。
+    """
+    def dummy(reason=None):
+        if reason:
+            print(f"  [{label}] {reason}")
+        K, dist, R, tvec = _dummy_calib(label, fallback_pos)
+        return K, dist, R, tvec, None, fallback_cam
+
+    if not available:
+        return dummy()
+
+    saved = load_calibration(label)
+    if saved is not None and ask_use_saved(label, saved):
+        points = saved.get("points")
+        w = saved.get("width") or 1280
+        h = saved.get("height") or 720
+        # ★ K は保存データからではなく、必ず intrinsics_<label>.json から読み直す。
+        K, dist = resolve_intrinsics(label, w, h)
+        R, tvec = saved["R"], saved["tvec"]
+        print(f"  [{label}] 保存済みの外部パラメータを使用")
+        if points and len(points) == 5:
+            _verify_saved(label, points, K, dist, R, tvec, saved.get("reproj_px"))
+    else:
+        points, w, h = source.capture_points(label)
+        if not points or len(points) != 5:
+            return dummy("[FAIL] 5点を取得できませんでした")
+
+        K, dist = resolve_intrinsics(label, w, h)
+        p2d = np.array(points, dtype=np.float32)
+        R, tvec, rvec = solve_extrinsics(FIELD_POINTS, p2d, K, dist)
+        if R is None:
+            return dummy("[FAIL] solvePnP が失敗しました")
+
+        cp = -R.T.dot(tvec)
+        print(f"\n  [{label}] カメラ位置: X={cp[0,0]:.2f} "
+              f"Y={cp[1,0]:.2f} Z={cp[2,0]:.2f}m")
+        reproj = _report_reprojection(label, FIELD_POINTS, p2d, K, dist, rvec, tvec)
+        # ★ ライブ接続より先に保存する。接続に失敗しても5点クリックは無駄にならない。
+        save_calibration(label, R, tvec, points, w, h,
+                         reproj_px=reproj, preset=CALIB_PRESET)
+
+    cam = source.open_live(w, h)
+    if cam is None:
+        return dummy("[WARN] 映像の接続に失敗しました")
+
+    _check_resolution(label, cam, w, h)
+    return K, dist, R, tvec, points, cam
 
 
 # ============================================================
 # フロー全体
 # ============================================================
 
-def run_calibration_phase(cam1, cam1_ok: bool, cam2_ok_rpi: bool, cam2_stub):
+def run_calibration_phase(cam1, cam1_ok: bool, cam2_ok: bool, cam2_stub):
     """
     Camera1・Camera2両方のキャリブレーションを実施し、
     (calib1, calib2, cam2) を返す。calib は CameraCalib。
@@ -369,49 +458,12 @@ def run_calibration_phase(cam1, cam1_ok: bool, cam2_ok_rpi: bool, cam2_stub):
     print(f"  使用プリセット: {CALIB_PRESET}")
     print(f"  基準点の3D座標:\n{FIELD_POINTS}")
 
-    pts1 = pts2 = None
+    K1, dist1, R1, tvec1, pts1, cam1 = _calibrate_camera(
+        "Camera1", _UsbSource(cam1), cam1_ok, [-8, -8, 2], cam1)
 
-    # ── Camera1 ──────────────────────────────────────────────
-    if cam1_ok and ask_use_saved("Camera1"):
-        saved = load_calibration("Camera1")
-        K1, dist1, R1, tvec1 = saved["K"], saved["dist"], saved["R"], saved["tvec"]
-        pts1 = saved.get("points")
-        print("  [Camera1] 保存済みデータを使用")
-    elif cam1_ok:
-        print("\n  ─── Camera1 キャリブレーション ───")
-        K1, dist1, R1, tvec1, pts1, reproj1 = run_calibration_single(cam1, "Camera1")
-        save_calibration("Camera1", K1, R1, tvec1, pts1,
-                         cam1.width, cam1.height,
-                         dist=dist1, reproj_px=reproj1, preset=CALIB_PRESET)
-    else:
-        K1, dist1, R1, tvec1 = _dummy_calib("Camera1", [-8, -8, 2])
-
-    # ── Camera2 ──────────────────────────────────────────────
-    cam2 = cam2_stub
-    if CAMERA2_SOURCE == "USB" and cam2_ok_rpi:
-        print("\n  ─── Camera2 (USB) キャリブレーション ───")
-        K2, dist2, R2, tvec2, pts2, reproj2 = run_calibration_single(cam2, "Camera2")
-    elif CAMERA2_SOURCE == "USB":
-        K2, dist2, R2, tvec2 = _dummy_calib("Camera2", [8, -8, 2])
-    elif cam2_ok_rpi and ask_use_saved("Camera2"):
-        saved = load_calibration("Camera2")
-        K2, dist2, R2, tvec2 = saved["K"], saved["dist"], saved["R"], saved["tvec"]
-        pts2 = saved.get("points")
-        print("  [Camera2] 保存済みデータを使用 → STREAM接続のみ実施")
-        real_cam2 = _connect_stream(saved.get("width", 1280), saved.get("height", 720))
-        if real_cam2 is not None:
-            cam2 = real_cam2
-        else:
-            print("  [WARN] Camera2 接続失敗 → ダミーで続行")
-            K2, dist2, R2, tvec2 = _dummy_calib("Camera2", [8, -8, 2])
-            pts2 = None
-
-    elif cam2_ok_rpi:
-        K2, dist2, R2, tvec2, real_cam2, pts2, _ = _run_camera2_fresh_calibration()
-        if real_cam2 is not None:
-            cam2 = real_cam2
-    else:
-        K2, dist2, R2, tvec2 = _dummy_calib("Camera2", [8, -8, 2])
+    source2 = _UsbSource(cam2_stub) if CAMERA2_SOURCE == "USB" else _RpiSource()
+    K2, dist2, R2, tvec2, pts2, cam2 = _calibrate_camera(
+        "Camera2", source2, cam2_ok, [8, -8, 2], cam2_stub)
 
     # ── 2カメラ整合の検証 ────────────────────────────────────
     if pts1 and pts2 and len(pts1) == 5 and len(pts2) == 5:
@@ -423,10 +475,13 @@ def run_calibration_phase(cam1, cam1_ok: bool, cam2_ok_rpi: bool, cam2_stub):
 
     # ── 露出の固定 ───────────────────────────────────────────
     # ここまでは自動露出で会場の明るさに合わせ、以降は固定して変動させない。
-    # Camera2（RPi側）は STREAM 開始時に自分で固定する。
-    if LOCK_EXPOSURE_AFTER_CALIB and cam1_ok and hasattr(cam1, "lock_exposure"):
+    # RPi 経由の Camera2 は STREAM 開始時に自分で固定するため、ここでは何もしない
+    # (lock_exposure を持たないので自然に飛ばされる)。
+    if LOCK_EXPOSURE_AFTER_CALIB:
         print()
-        cam1.lock_exposure()
+        for cam in (cam1, cam2):
+            if hasattr(cam, "lock_exposure"):
+                cam.lock_exposure()
 
     calib1 = CameraCalib(K=K1, dist=dist1, R=R1, tvec=tvec1)
     calib2 = CameraCalib(K=K2, dist=dist2, R=R2, tvec=tvec2)

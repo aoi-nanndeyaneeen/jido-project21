@@ -72,18 +72,29 @@ GUIDED 中でも、以下はすべて生きている。上から順に強い。
 | # | 操作 | 効果 |
 |---|---|---|
 | 1 | **THR_CUT** | 常にモーター停止。最終手段 |
-| 2 | **SW_HOVER を下げる** | 即 ANGLE（完全手動）。bail-out |
-| 3 | **SW_AUTO を下げる** | 即 POSHOLD（その場ホールド）。地上局だけ切れる |
+| 2 | **SW_HOVER を down** | 即 ANGLE（完全手動）。bail-out |
+| 3 | **SW_HOVER を cen に戻す** | 即 POSHOLD（その場ホールド）。地上局だけ切れる |
 | 4 | **ロール/ピッチスティックを動かす** | GUIDED から自動で抜けて POSHOLD へ |
 | 5 | **スロットルスティックを 15% 未満に落とす** | 高度ホールドもフローも手放す（完全手動） |
 
 ### プロポの割り当て
 
-`SW_AUTO` は **ch6**（`flight_controller/include/Config.h` の `enum Ch`）。
-2ポジションスイッチを ch6 に割り当てる。`SW_HOVER` は ch8（3ポジション）、
-`THR_CUT` は ch7 のまま。
+★ 2026-09-13 追記: ch6 に割り当てていた `SW_AUTO` スイッチが物理的に
+破損したため、GUIDED の入り口を `SW_HOVER`（ch8、3ポジション）1本に
+統合した。ALTHOLD 専用ポジションは廃止し、以下の割り当てに変更した。
+
+| SW_HOVER 位置 | モード |
+|---|---|
+| down（手前） | ANGLE（完全手動。bail-out） |
+| cen（中央） | POSHOLD（完全自動。フロー喪失時は ALTHOLD へ自動フォールバック） |
+| up（奥） | GUIDED（地上局ガイド飛行。入る資格が無い間は POSHOLD として動く） |
+
+`THR_CUT` は ch7 のまま。`SW_AUTO`（ch6）はコード上は残っているが
+GUIDED の判定には使われなくなった（`drone_s5.cpp` の `selectMode()` /
+`updateGuided()` 参照）。
 （2026-09-12 追記: 当初 ch9 だったが、プロポ側で ch9 に割り当てられない
-　ため ch6（未使用だった `SW_LEVEL` 枠）に変更した。）
+　ため ch6（未使用だった `SW_LEVEL` 枠）に変更した。→ その ch6 が
+　2026-09-13 に物理破損したため上記の再編に至った。）
 
 > ⚠️ **スイッチの「上」がどちらかは、プロポの設定とリバース次第で逆になる。**
 > コードの `up` は SBUS の生値が小さい側（`Ch_state()` は `des < -0.25` で `up`）。
@@ -229,12 +240,13 @@ GUIDED ----     phase=OFF     目標 vx=+0.000 vy=+0.000 alt=0.00 m (slew 0.00 m
 - [ ] 機体側シリアルで `m` を押してドライラン ON（ESC へは 0 しか出ない）
 - [ ] SW_HOVER=**down** でアーム（POSHOLD側ではアームできない仕様）
 - [ ] スロットルを 30% 以上に上げる
-- [ ] SW_HOVER を **up**、続けて SW_AUTO を **up**
+- [ ] SW_HOVER を **up**（ch6/SW_AUTO 破損に伴い、GUIDED の入り口は
+      SW_HOVER=up の1本に統合済み。SW_AUTO は操作不要）
 - [ ] 機体画面が `MODE = GUIDED (地上局ガイド)` / `GUIDED ENGAGED` になるか
 - [ ] PC 側に `[Mission] 機体が GUIDED に入りました -> 離陸` が出るか
 
 入れないときは、機体画面の `GUIDED ---- 直前の解除理由:` を読む。
-理由（ディスアーム / SW_AUTO が下 / フローが死んでいる / 測距が無い /
+理由（ディスアーム / SW_HOVER が下 / フローが死んでいる / 測距が無い /
 スティック操作を検出）がそのまま出る。
 
 - [ ] ロールスティックを少し動かす → `GUIDED 解除: スティック操作を検出`
@@ -253,8 +265,8 @@ MISSION_TAKEOFF_ALT_M = 0.50
 ```
 
 - [ ] ANGLE で普通に離陸し、安定ホバー
-- [ ] SW_HOVER を up（POSHOLD で安定を確認）
-- [ ] SW_AUTO を up → GUIDED
+- [ ] SW_HOVER を cen（POSHOLD で安定を確認）
+- [ ] SW_HOVER を up → GUIDED
 - [ ] `M` キー。目標高度へ 0.3 m/s で上がるか（`GUIDED_TAKEOFF_SLEW_MPS`）
 - [ ] 2秒保持したあと自動着陸に入り、0.2 m/s で降りるか
 - [ ] 対地 12cm を 400ms 下回ったところで出力が切れるか（`landed=1`）

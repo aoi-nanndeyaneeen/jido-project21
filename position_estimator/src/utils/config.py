@@ -363,13 +363,13 @@ YAW_ENTRY_MAX_DVY_BODY = 0.4   # |dvy_body| がこれ未満なら「ほぼ純前
 # ==========================================
 # 地上局リンク（機体との IM920 経由の双方向通信）
 # ==========================================
-# core/s5_link.py が XIAO RP2040 (ground_receiver の env:xiao_s5_log) を開く。
+# core/s5_link.py が XIAO ESP32C3 (ground_receiver の env:xiao_s5_log) を開く。
 #
 # ★ ground_receiver/tools/s5_logger.py を同時に起動しないこと。
 #   USB シリアルは1プロセスしか開けない。テレメトリの CSV 保存は
 #   S5Link 側がやる（logs/s5_link_*.csv）。
 GROUND_LINK_ENABLED = True
-GROUND_LINK_PORT    = None    # None = VID:PID (2E8A:000A) で自動検出
+GROUND_LINK_PORT    = None    # None = VID:PID (303A:1001 / 旧RP2040 2E8A:000A) で自動検出
 
 # ==========================================
 # ウェイポイント飛行ミッション

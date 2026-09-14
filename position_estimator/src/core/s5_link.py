@@ -1,6 +1,6 @@
 """
 core/s5_link.py
-地上局 (XIAO RP2040 / env:xiao_s5_log) との USB シリアルを一手に引き受ける。
+地上局 (XIAO ESP32C3 / env:xiao_s5_log) との USB シリアルを一手に引き受ける。
 
 --------------------------------------------------------------------------
 なぜ 1 つのクラスに下りと上りを両方持たせるのか
@@ -66,15 +66,19 @@ CF_POS_VALID = 1 << 1
 CF_YAW_VALID = 1 << 2
 CF_ALT_ABS   = 1 << 3
 
-# XIAO RP2040 の USB CDC。Windows では description で判別できないので VID:PID。
-VID_PID_RP2040 = (0x2E8A, 0x000A)
-VID_PID_TEENSY = (0x16C0, 0x0483)
+# XIAO の USB CDC。Windows では description で判別できないので VID:PID。
+# ★ 地上局を RP2040 -> ESP32C3 に移行済み。ESP32C3 はチップ内蔵のネイティブ
+#   USB (303A:1001) で列挙される。旧 RP2040 (2E8A:000A) も念のため残す。
+VID_PID_RP2040   = (0x2E8A, 0x000A)
+VID_PID_ESP32C3  = (0x303A, 0x1001)
+VID_PID_GROUND   = (VID_PID_RP2040, VID_PID_ESP32C3)
+VID_PID_TEENSY   = (0x16C0, 0x0483)
 
 
 def find_ground_port():
-    """XIAO RP2040 を VID:PID で探す。見つからなければ None。"""
+    """地上局 XIAO (ESP32C3 / 旧RP2040) を VID:PID で探す。見つからなければ None。"""
     for p in serial.tools.list_ports.comports():
-        if (p.vid, p.pid) == VID_PID_RP2040:
+        if (p.vid, p.pid) in VID_PID_GROUND:
             return p.device
     return None
 
@@ -116,7 +120,7 @@ class S5Link:
         self._last_param_line = None
 
         if self.port is None:
-            print("[S5Link] 地上局 (XIAO RP2040 2E8A:000A) が見つかりません。")
+            print("[S5Link] 地上局 (XIAO ESP32C3 303A:1001 / 旧RP2040 2E8A:000A) が見つかりません。")
             self._print_port_hint()
             return
 

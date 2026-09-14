@@ -14,10 +14,13 @@
 //    ・s5d で足したもの:
 //        1. 運用を SW_HOVER 1本だけで決める。
 //           ★ 2026-09-05: down/cen 兼用の2段階から3段階に変更。
+//           ★ 2026-09-13: ch6(旧SW_AUTO)の物理スイッチ破損により再編。
 //             down → ANGLE   完全手動 (スロットルも手動)。これが bail-out。
-//             cen  → ALTHOLD 姿勢は手動、高度だけ自動保持 (水平位置はまだ手動)。
-//             up   → POSHOLD 完全自動 (水平位置 + 高度 + ヘディングを同時)。
-//                    フロー喪失時は ALTHOLD へ自動フォールバック。
+//             cen  → POSHOLD 完全自動 (水平位置 + 高度 + ヘディングを同時)。
+//                    フロー喪失時は ALTHOLD (姿勢は手動、高度だけ自動保持) へ
+//                    自動フォールバック。
+//             up   → GUIDED  地上局ガイド飛行。入る資格が無い間は cen と同じ
+//                    POSHOLD として動く。
 //           SW_AUTO / 地上局AUTO / RATE は封印。実飛行では PC を繋げないので
 //           シリアル 'g' 等に依存しない運用にしてある。
 //        2. 位置積分を「地面固定フレーム (N/E)」化。s5c までは機体座標のまま
@@ -1340,11 +1343,17 @@ static const char* modeName(S5::Mode m) {
 // ------------------------------------------------------------
 //  モード判定  — 3段階。SW_HOVER の1本だけで決める。
 //
+//    ★ 2026-09-13: ch6 (旧 SW_AUTO) の物理スイッチが破損したため、
+//      GUIDED への入り口を SW_HOVER (ch8) の3段スイッチに統合した。
+//      ALTHOLD 専用ポジションは廃止 (ALTHOLD モード自体は POSHOLD の
+//      自動フォールバック先として内部的に残る)。
+//
 //    SW_HOVER=down(手前) → ANGLE   (完全手動。これが bail-out)
-//    SW_HOVER=cen (中央) → ALTHOLD (姿勢は手動、高度だけ自動保持)
-//    SW_HOVER=up  (奥)   → POSHOLD (完全自動: 水平位置 + 高度)。
+//    SW_HOVER=cen (中央) → POSHOLD (完全自動: 水平位置 + 高度)。
 //                          フローが死んでいるときは ALTHOLD に自動フォールバック
 //                          (ALTHOLDにも高度手段が無ければ ANGLE 相当の動作になる)
+//    SW_HOVER=up  (奥)   → GUIDED  (地上局ガイド飛行)。入る資格が無い間は
+//                          cen と同じ POSHOLD (フォールバック込み) として動く。
 //
 //  ・SW_AUTO / 地上局AUTO / RATE(アクロ) は使わない (封印)。
 //  ・スロットルカット (THR_CUT) は selectMode より上位で、常にモーターを止める。
@@ -1352,13 +1361,13 @@ static const char* modeName(S5::Mode m) {
 static S5::Mode selectMode() {
     if (!S5::USE_SBUS) return S5::MODE_ANGLE;
 
-    // ★ GUIDED (地上局ガイド飛行) は SW_HOVER=up かつ SW_AUTO=up のときだけ。
+    // ★ GUIDED (地上局ガイド飛行) は SW_HOVER=up のときだけ。
     //   入る資格の判定は全部 updateGuided() 側にあり、ここは結果を読むだけ。
     //   資格を失った瞬間に g_guided_engaged が落ちて POSHOLD へ戻る。
     if (g_guided_engaged) return S5::MODE_AUTO;
 
     const Sw sw = sbus.Ch_state(Ch::SW_HOVER);
-    if (sw == up) {
+    if (sw == up || sw == cen) {
         // ★ 2026-09-09: g_flow_ok は起動時 flow.begin() の 1 回きりのスナップ
         //   ショットなので、「フロー喪失時のフォールバック」と書いてあっても
         //   実際には起動時の初期化失敗しか拾えていなかった。飛行中に PMW3901
@@ -1372,7 +1381,6 @@ static S5::Mode selectMode() {
         if (S5::USE_FLOW && g_flow_ok && !flow.suspectDead()) return S5::MODE_POSHOLD;
         return S5::MODE_ALTHOLD;   // フロー未初期化 or 実行時に凍結
     }
-    if (sw == cen) return S5::MODE_ALTHOLD;
     return S5::MODE_ANGLE;
 }
 
@@ -1494,7 +1502,8 @@ static void updateAltHold(float dt_s) {
 //        FLOW_ENABLE_THR / ALT_ENABLE_THR (15%) を下回れば全部手放す。
 //        = スロットルを落とすだけで、いつでも即座に手動へ戻せる。
 //     2. SW_HOVER を下げれば ANGLE (完全手動)。これが最終の bail-out。
-//     3. SW_AUTO を下げれば POSHOLD (その場ホールド)。地上局だけ切れる。
+//     3. SW_HOVER を cen に戻せば POSHOLD (その場ホールド)。地上局だけ切れる。
+//        (ch6/SW_AUTO は物理破損のため、GUIDED の入り口は SW_HOVER=up に統合済み)
 //     4. ロール/ピッチスティックを動かせば GUIDED から自動で抜ける。
 //        「自動が変な方向へ行き始めた」ときに、スイッチを探さずに戻せる。
 //     5. リンクが切れたら 1秒でその場ホールド、4秒で自動着陸。
@@ -1522,7 +1531,8 @@ static void updateGuided() {
     // --- 0) 入る資格があるか (毎ループ全部見る) ----------------------
     if (!isArmed())                     { guidedDisengage("ディスアーム");        return; }
     if (!S5::USE_SBUS)                  { guidedDisengage("SBUS 無効");           return; }
-    if (sbus.Ch_state(Ch::SW_AUTO) != up)  { guidedDisengage("SW_AUTO が下");     return; }
+    // ★ 2026-09-13: ch6 (旧 SW_AUTO) の物理スイッチが破損したため、
+    //   GUIDED の入り口は SW_HOVER(ch8)=up の1本に統合した。
     if (sbus.Ch_state(Ch::SW_HOVER) != up) { guidedDisengage("SW_HOVER が下");    return; }
     if (!S5::USE_FLOW || !g_flow_ok || flow.suspectDead())
                                         { guidedDisengage("フローが死んでいる"); return; }
@@ -2184,9 +2194,9 @@ static void printStatus(uint32_t dt_us) {
                   (unsigned long)dt_us, 1000000.0f / (float)dt_us,
                   isArmed() ? "ARMED" : "DISARMED",
                   sbus.isSafe() ? "OK" : "LOST");
-    Serial.printf("MODE = %s   (SW_HOVER: down=ANGLE / cen=ALTHOLD / up=POSHOLD%s)\n",
+    Serial.printf("MODE = %s   (SW_HOVER: down=ANGLE / cen=POSHOLD / up=GUIDED%s)\n",
                   modeName(g_mode),
-                  Q::GUIDED_ENABLE ? " / +SW_AUTO up=GUIDED" : "");
+                  Q::GUIDED_ENABLE ? " (資格切れ中はPOSHOLD)" : "");
     SelfTest::printCompact(Serial);   // 起動時に何がつながっていたか (画面に残す)
 
     if (S5::USE_IM920) {
@@ -2375,7 +2385,7 @@ void setup() {
     while (!Serial && (millis() - start_ms < 2000)) { }
 
     Serial.println("\n\n=== Stage 5d : 1スイッチ完全自動ホバリング ===");
-    Serial.println("!! 2モード: SW_HOVER UP = POSHOLD(完全自動) / それ以外 = ANGLE(手動) !!");
+    Serial.println("!! SW_HOVER: down=ANGLE(手動) / cen=POSHOLD(完全自動) / up=GUIDED(地上局) !!");
     Serial.println("!! bail-out = SW_HOVER を下げる or THR_CUT。初回は広い床で指をスイッチに !!");
 
     // ★ 共有 SPI0: 全 CS を「最初に」HIGH へ固定する。

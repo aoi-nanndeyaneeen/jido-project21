@@ -1,9 +1,6 @@
 import socket, json, base64, cv2, time
 import numpy as np
 from core.camera import Candidate
-from core.geometry import approx_camera_matrix
-from utils.config import (USE_MEASURED_INTRINSICS, FALLBACK_HFOV_DEG,
-                          FALLBACK_HFOV_DEFAULT)
 
 RECONNECT_INTERVAL_S = 1.0   # 切断後、何秒おきに再接続を試みるか
 CONNECT_TIMEOUT_S    = 1.0   # 接続試行1回あたりの上限（呼び出し元スレッドを長時間止めないため）
@@ -64,50 +61,6 @@ class RemoteCamera:
                 except OSError:
                     pass
             self.sock = None
-
-    # ── キャリブレーション専用クラスメソッド ────────────────────
-    @classmethod
-    def request_calibration(cls, host: str, port: int,
-                            timeout: float = 120.0) -> tuple[list, int, int]:
-        """
-        RPiにCALIBモードで接続し、ユーザーがRPi画面で
-        クリックした5点の座標を受け取る。
-
-        Returns:
-            pts    : [[x,y], ...] 5点のリスト（フル解像度座標）
-            width  : カメラ幅
-            height : カメラ高さ
-        """
-        print(f"[RemoteCamera] キャリブレーション接続中 ({host}:{port})...")
-        sock = socket.socket()
-        sock.connect((host, port))
-        sock.settimeout(timeout)
-
-        buf = ""
-        # 解像度受信
-        while "\n" not in buf:
-            buf += sock.recv(1024).decode()
-        line, buf = buf.split("\n", 1)
-        info = json.loads(line)
-        w, h = info["width"], info["height"]
-
-        # CALIBモードを要求
-        sock.sendall(b"CALIB\n")
-        print("[RemoteCamera] ラズパイのディスプレイで5点をクリックしてください...")
-
-        # 5点データを待つ（タイムアウトまで待機）
-        while "\n" not in buf:
-            chunk = sock.recv(4096).decode()
-            if not chunk:
-                raise ConnectionError("RPiが切断されました")
-            buf += chunk
-        line, _ = buf.split("\n", 1)
-        data = json.loads(line)
-        sock.close()
-
-        pts = data["calib_pts"]
-        print(f"[RemoteCamera] キャリブ点受信: {pts}")
-        return pts, w, h
 
     def _readline(self) -> str:
         while "\n" not in self.buf:
@@ -217,18 +170,8 @@ class RemoteCamera:
         内部パラメータ (K, dist) を返す。
         事前実測値があればそれを使い、無ければ公称画角からの概算にフォールバック。
         """
-        if USE_MEASURED_INTRINSICS:
-            from utils.calib_store import load_intrinsics
-            m = load_intrinsics(self.label, self.width, self.height)
-            if m is not None:
-                return m["K"], m["dist"]
-
-        hfov = FALLBACK_HFOV_DEG.get(self.label, FALLBACK_HFOV_DEFAULT)
-        print(f"  [{self.label}] [WARN] 実測の内部パラメータがありません。"
-              f"公称画角 {hfov:.1f}° から概算します。")
-        print(f"             tools/calibrate_intrinsics.py --label {self.label} "
-              "で事前に実測してください。")
-        return approx_camera_matrix(self.width, self.height, hfov), None
+        from utils.calib_store import resolve_intrinsics
+        return resolve_intrinsics(self.label, self.width, self.height)
 
     def get_approx_camera_matrix(self):
         """後方互換。新しいコードは get_intrinsics() を使うこと。"""

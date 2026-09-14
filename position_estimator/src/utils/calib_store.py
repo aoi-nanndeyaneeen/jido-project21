@@ -15,7 +15,9 @@ calib_store.py
 
 import json
 import numpy as np
-from utils.config import LOG_DIR
+from core.geometry import approx_camera_matrix
+from utils.config import (LOG_DIR, USE_MEASURED_INTRINSICS,
+                          FALLBACK_HFOV_DEG, FALLBACK_HFOV_DEFAULT)
 
 CALIB_DIR = LOG_DIR.parent / "calib"
 CALIB_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,17 +80,40 @@ def load_intrinsics(label: str, width: int = None, height: int = None):
     return {"K": K, "dist": dist, "width": cw, "height": ch, "rms_px": rms}
 
 
+def resolve_intrinsics(label: str, width: int, height: int):
+    """
+    その解像度で使う内部パラメータ (K, dist) を決める。
+
+    カメラクラス・キャリブフローの双方がここを通る唯一の入口。
+    実測値が無い場合だけ公称画角から概算にフォールバックする。
+    """
+    if USE_MEASURED_INTRINSICS:
+        m = load_intrinsics(label, width, height)
+        if m is not None:
+            return m["K"], m["dist"]
+
+    hfov = FALLBACK_HFOV_DEG.get(label, FALLBACK_HFOV_DEFAULT)
+    print(f"  [{label}] [WARN] 実測の内部パラメータがありません。"
+          f"公称画角 {hfov:.1f}° から概算します。")
+    print(f"             tools/calibrate_intrinsics.py --label {label} "
+          "で事前に実測してください。")
+    return approx_camera_matrix(width, height, hfov), None
+
+
 # ============================================================
 # 外部パラメータ (当日測定)
 # ============================================================
+# ★ ここには K, dist を保存しない。
+#   以前は保存していたが、「保存済みを使う」を選ぶと当時の K がそのまま
+#   復元されてしまい、あとから intrinsics_<label>.json を測り直しても
+#   永久に反映されないという罠があった。内部パラメータの出所は
+#   intrinsics_<label>.json ただ一つに統一する。
 
-def save_calibration(label: str, K, R, tvec,
-                     points=None, w=None, h=None, dist=None,
+def save_calibration(label: str, R, tvec,
+                     points=None, w=None, h=None,
                      reproj_px=None, preset=None):
     path = CALIB_DIR / f"{label}.json"
     data = {
-        "K":      np.asarray(K).tolist(),
-        "dist":   np.asarray(dist).ravel().tolist() if dist is not None else None,
         "R":      np.asarray(R).tolist(),
         "tvec":   np.asarray(tvec).tolist(),
         "points": points,
@@ -99,26 +124,19 @@ def save_calibration(label: str, K, R, tvec,
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    print(f"  [SAVE] {label} キャリブレーションを保存: {path}")
+    print(f"  [SAVE] {label} 外部パラメータを保存: {path}")
 
 
 def load_calibration(label: str):
-    """保存済みデータがあれば dict を、なければ None を返す"""
+    """保存済みの外部パラメータがあれば dict を、なければ None を返す"""
     path = CALIB_DIR / f"{label}.json"
     if not path.exists():
         return None
     try:
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
-        K    = np.array(d["K"],    dtype=np.float32)
-        R    = np.array(d["R"],    dtype=np.float64)
-        tvec = np.array(d["tvec"], dtype=np.float64)
-
-        raw_dist = d.get("dist")
-        dist = (np.array(raw_dist, dtype=np.float32).reshape(-1, 1)
-                if raw_dist else None)
-
-        return {"K": K, "dist": dist, "R": R, "tvec": tvec,
+        return {"R":    np.array(d["R"],    dtype=np.float64),
+                "tvec": np.array(d["tvec"], dtype=np.float64),
                 "points": d.get("points"),
                 "width": d.get("width"), "height": d.get("height"),
                 "reproj_px": d.get("reproj_px"), "preset": d.get("preset")}
@@ -127,18 +145,26 @@ def load_calibration(label: str):
         return None
 
 
-def ask_use_saved(label: str) -> bool:
-    """保存データがあれば使うか確認。なければ False を返す"""
-    saved = load_calibration(label)
-    if saved is None:
-        return False
+def ask_use_saved(label: str, saved: dict) -> bool:
+    """保存済みデータの中身を見せて、使うかどうかを y/n で確認する。"""
     cam_pos = -saved["R"].T.dot(saved["tvec"])
     print(f"\n  [{label}] 保存済みキャリブレーションが見つかりました:")
     print(f"             位置: X={cam_pos[0,0]:.2f} "
           f"Y={cam_pos[1,0]:.2f} Z={cam_pos[2,0]:.2f}m")
+    if saved.get("width") and saved.get("height"):
+        print(f"             測定時の解像度: {saved['width']}x{saved['height']}")
     if saved.get("preset"):
         print(f"             使用プリセット: {saved['preset']}")
     if saved.get("reproj_px") is not None:
         print(f"             再投影誤差: {saved['reproj_px']:.2f} px")
-    ans = input(f"  [{label}] このデータを使いますか？ (y/n): ").strip().lower()
-    return ans == "y"
+
+    # 当日は急いでいる。打ち間違いを黙って「測り直し」に倒すと5点クリックが
+    # やり直しになるので、はっきり y か n が返るまで聞き直す。
+    while True:
+        ans = input(f"  [{label}] このデータを使いますか？ "
+                    "(y=使う / n=測り直す): ").strip().lower()
+        if ans in ("y", "yes"):
+            return True
+        if ans in ("n", "no"):
+            return False
+        print("             y か n で答えてください。")

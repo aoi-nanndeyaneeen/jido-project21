@@ -15,7 +15,7 @@
 //    (forward-fill)。frame 列が「今回どれが新しいか」= 0:A 1:B 2:C。
 //    列の意味は S5Telem.h を参照。
 //
-//  ビルド / 書き込み (XIAO RP2040 の地上局):
+//  ビルド / 書き込み (XIAO ESP32C3 の地上局):
 //      pio run -e xiao_s5_log -t upload
 //      pio device monitor -e xiao_s5_log      (手で見るだけならこれでも可)
 //
@@ -50,7 +50,12 @@
 // ------------------------------------------------------------
 //  ボードごとの UART 設定
 // ------------------------------------------------------------
-#if defined(ARDUINO_ARCH_RP2040)
+//  XIAO ESP32C3: シルクの TX = D6 = GPIO21、RX = D7 = GPIO20
+//  (RP2040 と番号が違うだけで配線の向きは同じ)
+#if defined(ARDUINO_ARCH_ESP32)
+constexpr int PIN_XIAO_TX = 21;  // D6 -> IM920 RXD
+constexpr int PIN_XIAO_RX = 20;  // D7 <- IM920 TXD
+#elif defined(ARDUINO_ARCH_RP2040)
 constexpr int PIN_XIAO_TX = 0;   // D6 -> IM920 RXD
 constexpr int PIN_XIAO_RX = 1;   // D7 <- IM920 TXD
 #endif
@@ -318,7 +323,7 @@ static void printStatus() {
         Serial.println("まだ1パケットも受信していません。");
         if (n_rx_bytes == 0) {
             Serial.println("  IM920 から1バイトも来ていません。無線ではなく配線側の問題です:");
-            Serial.println("   ・IM920 の TXD が D7(GP1) に来ているか (im920_passthrough の PINS)");
+            Serial.println("   ・IM920 の TXD が D7 に来ているか (im920_passthrough の PINS)");
             Serial.println("   ・IM920 の電源は 3V3 か (5Vピンだと書き込みも不安定になる)");
             Serial.println("   ・ボーレート 19200 か");
         } else {
@@ -684,11 +689,15 @@ static void handleKey(char c) {
 // ------------------------------------------------------------
 void setup() {
     Serial.begin(USB_BAUD);
-#if defined(ARDUINO_ARCH_RP2040)
+#if defined(ARDUINO_ARCH_ESP32)
+    Serial1.begin(IM_BAUD, SERIAL_8N1, PIN_XIAO_RX, PIN_XIAO_TX);
+#elif defined(ARDUINO_ARCH_RP2040)
     Serial1.setTX(PIN_XIAO_TX);
     Serial1.setRX(PIN_XIAO_RX);
-#endif
     IM->begin(IM_BAUD);
+#else
+    IM->begin(IM_BAUD);
+#endif
     rx_line.reserve(256);
 
     while (!Serial && millis() < 3000) {}

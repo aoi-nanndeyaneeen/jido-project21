@@ -14,7 +14,6 @@ from typing import NamedTuple
 import cv2
 import numpy as np
 
-from core.geometry import approx_camera_matrix
 from utils.config import (DETECT_MODE, BRIGHT_THRESHOLD, TRACKING_EXPOSURE,
                          BRIGHT_MIN_AREA_PX, BRIGHT_MAX_AREA_PX,
                          DIFF_THRESHOLD, MIN_AREA_PX, MAX_AREA_PX,
@@ -24,9 +23,7 @@ from utils.config import (DETECT_MODE, BRIGHT_THRESHOLD, TRACKING_EXPOSURE,
                           VIBRATION_REJECT_RATIO,
                           STATIC_BRIGHT_MASK, STATIC_MASK_LEARN_FRAMES,
                           STATIC_MASK_RATIO, STATIC_MASK_DILATE_PX,
-                          CAMERA_AUTOFOCUS, CAMERA_FOCUS_VALUE,
-                          USE_MEASURED_INTRINSICS,
-                          FALLBACK_HFOV_DEG, FALLBACK_HFOV_DEFAULT)
+                          CAMERA_AUTOFOCUS, CAMERA_FOCUS_VALUE)
 
 
 class Candidate(NamedTuple):
@@ -270,18 +267,8 @@ class CameraTracker:
         事前実測値（calib/intrinsics_<label>.json）があればそれを使い、
         無ければ公称画角からの概算にフォールバックする。
         """
-        if USE_MEASURED_INTRINSICS:
-            from utils.calib_store import load_intrinsics
-            m = load_intrinsics(self.label, self.width, self.height)
-            if m is not None:
-                return m["K"], m["dist"]
-
-        hfov = FALLBACK_HFOV_DEG.get(self.label, FALLBACK_HFOV_DEFAULT)
-        print(f"  [{self.label}] [WARN] 実測の内部パラメータがありません。"
-              f"公称画角 {hfov:.1f}° から概算します。")
-        print(f"             tools/calibrate_intrinsics.py --label {self.label} "
-              "で事前に実測してください。")
-        return approx_camera_matrix(self.width, self.height, hfov), None
+        from utils.calib_store import resolve_intrinsics
+        return resolve_intrinsics(self.label, self.width, self.height)
 
     def get_approx_camera_matrix(self):
         """後方互換。新しいコードは get_intrinsics() を使うこと。"""
