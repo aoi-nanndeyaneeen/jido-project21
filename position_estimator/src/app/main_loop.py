@@ -27,6 +27,8 @@ from core.mission import WaypointMission as Mission, Phase as MissionPhase
 from utils.logger import PerformanceLogger, MissionLogger
 from ui.dashboard import Dashboard
 from ui.view_velocity import ViewVelocity
+from ui.link_status import LinkStatusView
+from ui.window_layout import primary_display_size, flight_window_layout, apply_window_layout
 
 
 def run_main_loop(cam1, cam2,
@@ -72,11 +74,8 @@ def run_main_loop(cam1, cam2,
 
     # ── ウィンドウ作成 ──────────────────────────────────────
     cv2.namedWindow("Camera 1", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Camera 1", DISP_W, DISP_H)
-    cv2.moveWindow("Camera 1", 0, 0)
     cv2.namedWindow("Camera 2", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Camera 2", DISP_W, DISP_H)
-    cv2.moveWindow("Camera 2", 0, 0)
+    cv2.namedWindow("Velocity", cv2.WINDOW_NORMAL)
 
     def keyboard_thread():
         while not shared.get("quit", False):
@@ -113,6 +112,11 @@ def run_main_loop(cam1, cam2,
     dashboard      = Dashboard(field_points)
     controller     = AltitudeController(p_gain=5.0)
     velocity_view  = ViewVelocity(field_points)
+    link_view      = LinkStatusView()
+    screen_w, screen_h = primary_display_size()
+    apply_window_layout(flight_window_layout(screen_w, screen_h))
+    print(f"[UI] 主ディスプレイ {screen_w}x{screen_h}: "
+          "上段=Camera 1/2、下段=Velocity:Graph (2:1) に配置しました")
     # ── 地上局リンク (機体へ指令を送る唯一の経路) ───────────────
     #  ★ ここが None のままだと、機体は一切動かない (見ているだけ)。
     #    s5_logger.py を同時起動していると開けないので、その旨を出す。
@@ -162,10 +166,6 @@ def run_main_loop(cam1, cam2,
     else:
         print("[INIT] GROUND_LINK_ENABLED=False のため機体へは何も送りません。"
               "ダミー追跡を含む表示のみで続行します")
-
-    cv2.namedWindow("Velocity", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Velocity", VELOCITY_W, VELOCITY_H)
-    cv2.moveWindow("Velocity", 0, 0)
 
     # 「初期アラインメントで飛んでいます」の警告を1回だけ出すための箱
     _warned_fixed_yaw = [False]
@@ -335,14 +335,27 @@ def run_main_loop(cam1, cam2,
                 last_mpl_render = now
 
                 roll_deg, pitch_deg = 0.0, 0.0
-                imu_available = alt_sensor is not None
-                if imu_available:
+                imu_available = False
+                attitude_source = None
+                # 通常の自動飛行では SERIAL_ENABLED=False。IM920で届く実機の
+                # Roll/Pitch を優先してADIへ渡す。旧シリアル経路はフォールバック。
+                tel = link.state() if link is not None else {}
+                if link is not None and link.telemetry_ok() and "roll" in tel and "pitch" in tel:
+                    roll_deg = float(tel["roll"])
+                    pitch_deg = float(tel["pitch"])
+                    imu_available = True
+                    attitude_source = "IM920"
+                elif alt_sensor is not None:
                     roll_deg, pitch_deg = accel_to_angles(alt_sensor.get_accel())
+                    imu_available = True
+                    attitude_source = "serial accel"
 
                 velocity_start = time.perf_counter()
-                vel_img = velocity_view.get_image(P, roll_deg, pitch_deg, imu_available)
+                vel_img = velocity_view.get_image(
+                    P, roll_deg, pitch_deg, imu_available, attitude_source)
                 cv2.imshow("Velocity", vel_img)
                 velocity_ms = (time.perf_counter() - velocity_start) * 1000.0
+                link_view.render_and_show(link)
 
                 if O1 is not None:
                     target_alt = controller.get_target()
@@ -405,6 +418,7 @@ def run_main_loop(cam1, cam2,
         alt_sensor.stop()
     dashboard.close()
     velocity_view.close()
+    link_view.close()
     display_perf_log.close()
     cv2.destroyAllWindows()
     for _ in range(10):
