@@ -2744,15 +2744,19 @@ void loop() {
     const float thr_now  = S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f;
 
     // --- モード表示 LED (pin 5/6/9) -----------------------------------
-    //  赤=DISARM  青(点灯)=ARMED+ANGLE(手動)  緑(点滅)=ARMED+POSHOLD/ALTHOLD(自動系)  緑(点灯)=ARMED+その他。
+    //  赤=DISARM  青(点灯)=ARMED+ANGLE(手動)
+    //  緑(ゆっくり点滅)=POSHOLD/ALTHOLD  緑(速く点滅)=GUIDED  緑(点灯)=その他。
     //  ★ コモンアノード＋共通抵抗の配線なので混色(白/黄)は出せない。
     //    Vf 最小の赤ダイが電流を独占するため。単色3つで区別する。
     //  digitalWrite 3本だけなので毎ループ呼んでも制御ループへの影響は無視できる。
-    const bool auto_flight_mode = (g_mode == S5::MODE_POSHOLD || g_mode == S5::MODE_ALTHOLD);
     if (!armed_now) {
         StatusLed::red();
-    } else if (auto_flight_mode) {
-        const bool blink_on = (millis() / 250) % 2 == 0;   // 2Hz 点滅
+    } else if (g_mode == S5::MODE_AUTO) {
+        const bool blink_on = (millis() / 125) % 2 == 0;   // 4Hz 点滅: GUIDED
+        if (blink_on) StatusLed::green();
+        else          StatusLed::off();
+    } else if (g_mode == S5::MODE_POSHOLD || g_mode == S5::MODE_ALTHOLD) {
+        const bool blink_on = (millis() / 250) % 2 == 0;   // 2Hz 点滅: POSHOLD/ALTHOLD
         if (blink_on) StatusLed::green();
         else          StatusLed::off();
     } else if (g_mode == S5::MODE_ANGLE) {
