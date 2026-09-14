@@ -1585,6 +1585,15 @@ static void updateGuided() {
         if (g_gp == GP_CRUISE) g_gp = GP_HOLD;
     } else {
         // --- 3) 新鮮な指令に従う -------------------------------------
+
+        // 位置補正 (req に関係なく、フラグが立っていれば毎回適用)。
+        //  ★ GUIDED 巡航中は PositionHold 側で実質無効化される
+        //    (correctPosition() のコメント参照)。ここでは無条件に渡すだけでよい。
+        if (c.flags & S5C::CF_POS_CORR) {
+            poshold.correctPosition((float)c.corr_n_mm / S5C::SC_MM,
+                                    (float)c.corr_e_mm / S5C::SC_MM);
+        }
+
         const float cmd_alt = (c.alt_cm > 0) ? (float)c.alt_cm / S5C::SC_CM : 0.0f;
         switch (c.req) {
             case S5C::REQ_TAKEOFF:

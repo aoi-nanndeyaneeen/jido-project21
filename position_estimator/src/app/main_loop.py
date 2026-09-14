@@ -17,7 +17,7 @@ from utils.config import (DISP_W, DISP_H, VELOCITY_W, VELOCITY_H,
                           YAW_SEND_HZ, YAW_SEND_INITIAL_ALIGN,
                           GROUND_LINK_ENABLED, GROUND_LINK_PORT,
                           MISSION_WAYPOINTS, MISSION_TAKEOFF_ALT_M,
-                          MISSION_YAW_MODE, LOG_DIR)
+                          MISSION_YAW_MODE, MISSION_AUTOSTART, LOG_DIR)
 from core.tracker import camera_thread_func
 from core.controller import AltitudeController
 from core.geometry import accel_to_angles
@@ -25,7 +25,7 @@ from core.yaw_estimator import YawEstimator
 from core.autopilot import SquarePatrol, HoverHold, WaypointMission, RCCommand
 from core.s5_link import S5Link
 from core.mission import WaypointMission as Mission, Phase as MissionPhase
-from utils.logger import PerformanceLogger
+from utils.logger import PerformanceLogger, MissionLogger
 from ui.dashboard import Dashboard
 from ui.view_velocity import ViewVelocity
 from ui.view_rc import ViewRC
@@ -62,7 +62,8 @@ def run_main_loop(cam1, cam2,
     print("   ALL SYSTEMS GO  -  STEREO TRACKING STARTED")
     print("=" * 56)
     print()
-    print("  [M]     ★ミッション開始 (自動離陸 -> ウェイポイント -> 帰投 -> 自動着陸)")
+    print("  [M]     ミッション待機の開始/やり直し "
+          "(自動開始が有効なら押す必要はありません)")
     print("  [X]     ミッション中断 (その場から自動着陸)")
     print("  [B]     背景リセット (両カメラ)")
     print("  [H]     ホバリングモード")
@@ -137,6 +138,8 @@ def run_main_loop(cam1, cam2,
     #    s5_logger.py を同時起動していると開けないので、その旨を出す。
     link = None
     mission = None
+    mission_log = None
+    _last_n_tx = [0]
     if GROUND_LINK_ENABLED:
         print()
         print("[INIT] 地上局 (XIAO / xiao_s5_log) へ接続中...")
@@ -144,7 +147,19 @@ def run_main_loop(cam1, cam2,
         if link.ok:
             mission = Mission(link, MISSION_WAYPOINTS)
             mission.TAKEOFF_ALT_M = MISSION_TAKEOFF_ALT_M
-            print(f"  [OK] ミッション準備完了。[M] で開始します")
+            mission_log = MissionLogger(
+                log_path.with_name(log_path.stem.replace("flight_", "mission_")
+                                   + ".csv"))
+            print(f"       ミッションログ: {mission_log.path.name}")
+            if MISSION_AUTOSTART:
+                #  ★ 本番は離陸後に PC を触れない。起動時点で待機に入れておき、
+                #    プロポを GUIDED にして離陸した瞬間に走り出させる。
+                mission.start()
+                print("  [OK] 自動開始が有効です。プロポを GUIDED にして離陸すれば"
+                      "そのままミッションが走ります")
+                print("       ([X] で中断 / 着陸後にもう一度飛ばすなら [M])")
+            else:
+                print(f"  [OK] ミッション準備完了。[M] で開始します")
             for i, wp in enumerate(MISSION_WAYPOINTS):
                 print(f"       WP{i}: ({wp[0]:+.2f}, {wp[1]:+.2f}, {wp[2]:.2f})")
         else:
@@ -185,6 +200,7 @@ def run_main_loop(cam1, cam2,
             tracking_ok = plot_data.get("tracking_ok", False)
             frame_time  = plot_data.get("frame_time", 0.0)
             in_dummy    = plot_data.get("in_dummy", False)
+            residual    = plot_data.get("residual")
             if updated:
                 plot_data["updated"] = False
 
@@ -300,6 +316,35 @@ def run_main_loop(cam1, cam2,
                                pos_valid=pos_valid,
                                yaw_valid=m_yaw_valid)
 
+                # ── ミッションログ ──────────────────────────────
+                #  PC の判断・カメラの見立て・機体の言い分を1行にまとめる。
+                #  ★ 指令レートに合わせて書く (カメラの60Hzで書くと、同じ
+                #    指令が12行並ぶだけで差分が読めなくなる)。
+                if mission_log is not None and mission.n_tx() != _last_n_tx[0]:
+                    _last_n_tx[0] = mission.n_tx()
+                    tel = link.state()
+                    tel["age"] = link.age()
+                    cam = {"x": None if P is None else float(P[0]),
+                           "y": None if P is None else float(P[1]),
+                           "z": None if P is None else float(P[2]),
+                           "valid": pos_valid, "in_dummy": in_dummy,
+                           "residual": residual}
+                    #  機体フローの原点はフィールド原点ではない。両方が同時に
+                    #  信用できる最初の瞬間だけ、ずれの基準を取る。
+                    if (not mission_log.aligned and pos_valid
+                            and tel.get("fh_posn") is not None
+                            and bool(tel.get("flow_ok"))):
+                        mission_log.set_align((cam["x"], cam["y"]),
+                                              (tel["fh_posn"], tel["fh_pose"]))
+                        print("[Mission] カメラと機体フローの原点を合わせました "
+                              "(以後 Diff_* が機体側のドリフト量)")
+                    mission_log.write(
+                        mission.snapshot(), cam, tel,
+                        {"deg": None if m_yaw is None else math.degrees(m_yaw),
+                         "valid": m_yaw_valid,
+                         "src": "camera" if yaw_rad is not None else MISSION_YAW_MODE},
+                        event=mission.take_event())
+
             # ── 自律制御コマンドをground_receiver経由でドローンへ送信 ──
             if alt_sensor is not None:
                 alt_sensor.send_autopilot_command(_last_cmd)
@@ -389,6 +434,9 @@ def run_main_loop(cam1, cam2,
             time.sleep(0.1)
     if link is not None:
         link.close()
+    if mission_log is not None:
+        mission_log.close()
+        print(f"[Mission] ミッションログを保存しました: {mission_log.path}")
 
     patrol.close()
     if alt_sensor is not None:

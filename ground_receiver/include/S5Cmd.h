@@ -56,7 +56,7 @@
 namespace S5C {
 
 // 構造体を変えたら必ずインクリメントすること (相手側が不一致を検出する)
-constexpr uint8_t VERSION = 1;
+constexpr uint8_t VERSION = 2;
 
 // 下りテレメトリ (S5T) の type と衝突しない値。'K' = command
 constexpr uint8_t MAGIC = 0x4B;
@@ -91,8 +91,24 @@ inline const char* reqName(uint8_t r) {
 }
 
 // ------------------------------------------------------------
-//  コマンドパケット (14 byte + チェックサム 4 = 18 byte)
+//  コマンドパケット (18 byte + チェックサム 4 = 22 byte)
 // ------------------------------------------------------------
+//  ★ corr_n_mm/corr_e_mm (2026-09-14 追加): 地上局が周期的に送る
+//    「機体の自己位置(フロー積分)はここにいるはず」という絶対値の補正。
+//    床の模様が薄いフィールドではフローが流れやすく、機体単独の位置推定
+//    (PosFrame.pos_n_cm 等) がじわじわ真値からずれる。カメラの絶対位置
+//    (誤差 cm オーダー) で定期的に上書きして流れを消す。
+//
+//    ★★ 速度・姿勢のようにクローズドループへは絶対に混ぜない。
+//      IM920sL は往復 100〜200ms 遅れるので、この遅れを含んだ位置を
+//      毎ループ (100Hz) 使うと発振する。だから
+//        ・数秒に1回だけ (position_estimator/utils/config.py の
+//          POS_CORR_PERIOD_S)
+//        ・PositionHold._pos_n/_pos_e を書き換えるだけ (quad/PosHold.h)
+//        ・GUIDED 巡航中 (stick_active) は hold が pos に毎ループ
+//          追従するので実質無効。効くのは静止保持中だけ
+//        ・結果の速度は FLOW_POS_VEL_LIM で必ずクランプされる
+//      という「たまに位置をこっそり書き換えるだけ」に留める。
 struct __attribute__((__packed__)) CmdFrame {
     uint8_t  magic;         //  1  MAGIC
     uint8_t  ver;           //  2  VERSION
@@ -103,8 +119,10 @@ struct __attribute__((__packed__)) CmdFrame {
     int16_t  alt_cm;        // 10  目標対地高度 [cm] (0以下 = 現状維持)
     int16_t  yaw_rate_cdps; // 12  目標ヨーレート [0.01 deg/s] (0 = 機首固定)
     uint16_t flags;         // 14  CmdFlag
+    int16_t  corr_n_mm;     // 16  位置補正の絶対目標 pos_n [mm]。CF_POS_CORR 時のみ有効
+    int16_t  corr_e_mm;     // 18  同 pos_e [mm]
 };
-static_assert(sizeof(CmdFrame) == 14, "CmdFrame は 14 byte");
+static_assert(sizeof(CmdFrame) == 18, "CmdFrame は 18 byte");
 static_assert(sizeof(CmdFrame) + CHECKSUM_BYTES <= IM920SL_MAX_PAYLOAD,
               "IM920sL の 32 バイト制限を超えています");
 
@@ -113,12 +131,14 @@ enum CmdFlag : uint16_t {
     CF_POS_VALID = 1u << 1,  // カメラの自己位置推定が生きている
     CF_YAW_VALID = 1u << 2,  // ヘディング推定が収束している
     CF_ALT_ABS   = 1u << 3,  // alt_cm を絶対目標として扱う (落ちていれば現状維持)
+    CF_POS_CORR  = 1u << 4,  // corr_n_mm/corr_e_mm を pos_n/pos_e へ適用する
 };
 
 // スケール
 constexpr float SC_MMPS = 1000.0f;   // 1 mm/s
 constexpr float SC_CM   = 100.0f;    // 1 cm
 constexpr float SC_CDPS = 100.0f;    // 0.01 deg/s
+constexpr float SC_MM   = 1000.0f;   // 1 mm (位置補正用)
 
 inline int16_t q16(float v, float scale) {
     const float x = v * scale;

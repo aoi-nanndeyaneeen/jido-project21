@@ -32,16 +32,23 @@ def load_log(path: Path):
     pos_x, pos_y, pos_z = [], [], []
     residual = []
 
+    def num(row, key):
+        """未検知フレームは空欄。数値化できないものは None にする。"""
+        try:
+            return float(row[key])
+        except (TypeError, ValueError):
+            return None
+
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             times.append(row["Time"])
             is_detected = row["Detected"] == "1"
             detected.append(is_detected)
-            pos_x.append(float(row["Pos_X(m)"]) if is_detected else None)
-            pos_y.append(float(row["Pos_Y(m)"]) if is_detected else None)
-            pos_z.append(float(row["Pos_Z(m)"]))
-            residual.append(float(row["Residual(m)"]))
+            pos_x.append(num(row, "Pos_X(m)") if is_detected else None)
+            pos_y.append(num(row, "Pos_Y(m)") if is_detected else None)
+            pos_z.append(num(row, "Pos_Z(m)"))
+            residual.append(num(row, "Residual(m)"))
 
     return times, detected, pos_x, pos_y, pos_z, residual
 

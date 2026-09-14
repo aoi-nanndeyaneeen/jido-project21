@@ -39,9 +39,12 @@ import math
 import time
 from enum import Enum
 
-from utils.config import FIELD_W, FIELD_D, MISSION_TAKEOFF_ALT_M
+from utils.config import (MISSION_TAKEOFF_ALT_M,
+                          MISSION_FENCE_X, MISSION_FENCE_Y, MISSION_FENCE_Z,
+                          MISSION_FENCE_GRACE_S)
 from core.s5_link import (REQ_ABORT, REQ_GUIDED, REQ_HOLD, REQ_LAND,
-                          REQ_TAKEOFF, CF_ARMED_OK, CF_POS_VALID, CF_YAW_VALID,
+                          REQ_TAKEOFF, REQ_NAME,
+                          CF_ARMED_OK, CF_POS_VALID, CF_YAW_VALID,
                           CF_ALT_ABS)
 
 
@@ -118,15 +121,17 @@ class WaypointMission:
     # ---- 安全 ---------------------------------------------------------
     # 自己位置をこの秒数見失ったら着陸する
     POS_LOST_LAND_S = 1.5
-    # ミッション全体の上限時間 [s]
+    # 飛び始めてからの上限時間 [s]
+    #  ★ start() からではなく「離陸フェーズに入ってから」数える。
+    #    自動開始だと地上での待ち時間が読めず、start() 起点だと
+    #    離陸する前にタイムアウトして着陸指令が出てしまう。
     MISSION_TIMEOUT_S = 180.0
-    # ジオフェンス [m] (フィールド座標の絶対値)。超えたら即着陸。
-    #  ★ フィールド寸法から作る。ベタ値にしておくと FIELD_PROFILE を
-    #    small <-> large で切り替えたときに必ず食い違う
-    #    (1.4m のフィールドに 1.5m のフェンス = 事実上フェンス無し)。
-    FENCE_X = FIELD_W / 2.0 + 0.2
-    FENCE_Y = FIELD_D / 2.0 + 0.2
-    FENCE_Z = 2.5
+    # ジオフェンス [m]。config で 3Dゲートと一緒に定義している
+    # (両者の関係が壊れると誤検知1発でミッションが死ぬ。config 側の注記参照)。
+    FENCE_X = MISSION_FENCE_X
+    FENCE_Y = MISSION_FENCE_Y
+    FENCE_Z = MISSION_FENCE_Z
+    FENCE_GRACE_S = MISSION_FENCE_GRACE_S
 
     def __init__(self, link, waypoints, home=None, verbose=True):
         self.link = link
@@ -143,6 +148,22 @@ class WaypointMission:
         self._t_send = 0.0
         self._t_pos_ok = 0.0
         self._returning = False     # 最後の WP を終えて home へ戻っている
+
+        # ---- 安全判定の状態 --------------------------------------------
+        self._t_fly = None      # 離陸フェーズに入った時刻 (タイムアウトの起点)
+        self._t_fence = None    # ジオフェンスの外に出始めた時刻
+        self._airborne = False  # 機体が一度でも「浮いた」と言ったか
+
+        # ---- ログ用 ----------------------------------------------------
+        # ★ 「何を送ったか」は送った本人しか知らない。update() の中で
+        #   分岐した結果を外から再現しようとすると必ずズレるので、
+        #   送信と同時にここへ控える。
+        self._tx = {"req": "", "vx": 0.0, "vy": 0.0, "alt": 0.0, "flags": 0,
+                    "phase": Phase.IDLE.value}
+        self._n_tx = 0              # 送信回数。ログはこれが増えた時だけ書く
+        self._dist_h = None
+        # _say() したメッセージ。ログが1回読み出したら消える (イベント列)。
+        self._pending_event = ""
 
     # ---------------------------------------------------------------- 制御
     def start(self):
@@ -161,8 +182,11 @@ class WaypointMission:
         self._t_phase = now
         self._t_start = now
         self._t_pos_ok = now
-        self._say(f"ミッション開始: WP {len(self.waypoints)} 点 "
-                  f"-> 離陸地点へ戻って自動着陸")
+        self._t_fly = None
+        self._t_fence = None
+        self._airborne = False
+        self._say(f"待機開始: 機体が GUIDED に入ったら自動で離陸します "
+                  f"(WP {len(self.waypoints)} 点 -> 離陸地点へ戻って自動着陸)")
         return True
 
     def abort(self, reason="手動中断"):
@@ -178,8 +202,40 @@ class WaypointMission:
         self._t_phase = time.time()
 
     def _say(self, msg):
+        self._pending_event = msg
         if self.verbose:
             print(f"[Mission] {msg}")
+
+    def _send(self, req, vx_mps=0.0, vy_mps=0.0, alt_m=0.0, flags=0):
+        """送信と記録を必ずセットで行う。link.send_command() を直接呼ばないこと。"""
+        # ★ phase は「送った時点」のものを控える。update() は送信後に
+        #   フェーズを進めることがあるので、あとから self.phase を読むと
+        #   「HOLD を送った行が TAKEOFF になっている」というズレが出る。
+        self._tx = {"req": REQ_NAME.get(req, str(req)),
+                    "vx": vx_mps, "vy": vy_mps, "alt": alt_m, "flags": flags,
+                    "phase": self.phase.value}
+        self._n_tx += 1
+        self.link.send_command(req, vx_mps=vx_mps, vy_mps=vy_mps,
+                               alt_m=alt_m, flags=flags)
+
+    def n_tx(self):
+        return self._n_tx
+
+    def take_event(self):
+        """未読のイベント文字列を1回だけ返す。無ければ空文字。"""
+        ev, self._pending_event = self._pending_event, ""
+        return ev
+
+    def snapshot(self):
+        """ログ1行分のミッション内部状態。"""
+        tgt = self._target() if self.phase not in (Phase.IDLE, Phase.DONE) else None
+        return {"wp_idx": self.wp_idx,
+                "returning": self._returning, "tgt": tgt,
+                "dist_h": self._dist_h,
+                # phase = 送信時のフェーズ / phase_next = 送信後の今のフェーズ。
+                # 2つが違う行がフェーズ遷移そのもの。
+                "phase_next": self.phase.value,
+                **self._tx}
 
     # ---------------------------------------------------------------- 本体
     def update(self, pos=None, yaw_rad=None, pos_valid=False, yaw_valid=False):
@@ -198,6 +254,12 @@ class WaypointMission:
         now = time.time()
         if pos_valid and pos is not None:
             self._t_pos_ok = now
+
+        # 機体が一度でも「浮いた」と言ったら覚えておく。ジオフェンスは
+        # これが立ってからしか効かせない (着陸中に落ちても戻さない。
+        # LAND フェーズではそもそも安全判定を通らない)。
+        if self.link.flag("airborne"):
+            self._airborne = True
 
         # ---- 1) 安全側の打ち切り判定 (フェーズより先に見る) -------------
         if self.phase is not Phase.LAND:
@@ -221,25 +283,35 @@ class WaypointMission:
         st = self.link.state()
         h_agl = float(st.get("range_h", 0.0))    # 機体の測距による対地高度 [m]
 
+        # 今の目標までの水平距離。到達判定とログの両方がこれを見る
+        # (別々に計算すると、ログと判定が食い違って原因追跡が狂う)。
+        tgt_now = self._target()
+        self._dist_h = (math.hypot(tgt_now[0] - float(pos[0]),
+                                   tgt_now[1] - float(pos[1]))
+                        if pos is not None else None)
+
         # ---- 3) フェーズごとの指令 ------------------------------------
         if self.phase is Phase.ARMING:
             # 機体が GUIDED に入るまで HOLD を送り続ける。
             #  入れない理由 (SW_AUTO が下 / フローが死んでいる / 未アーム) は
             #  機体側のシリアル画面に出る。ここでは待つだけ。
-            self.link.send_command(REQ_HOLD, flags=flags)
+            self._send(REQ_HOLD, flags=flags)
             if self.link.flag("guided"):
                 self._say("機体が GUIDED に入りました -> 離陸")
+                self._t_fly = now        # 飛行時間はここから数える
                 self._goto(Phase.TAKEOFF)
-            elif now - self._t_phase > 15.0:
-                self._say("機体が GUIDED に入りません。"
-                          "SW_AUTO / SW_HOVER が上か、アーム済みか、"
+            elif self.link.flag("armed") and now - self._t_phase > 15.0:
+                # ★ 未アームのうちは出さない。自動開始だと離陸まで数分
+                #   待つことがあり、その間ずっと鳴っていると本当の
+                #   メッセージが流れて見えなくなる。
+                self._say("アーム済みですが GUIDED に入りません。"
+                          "SW_HOVER が上か、フロー/測距が生きているか、"
                           "スロットルが 15% 以上かを確認してください")
                 self._t_phase = now      # 15 秒ごとに出し直す
             return
 
         if self.phase is Phase.TAKEOFF:
-            self.link.send_command(REQ_TAKEOFF, alt_m=self.TAKEOFF_ALT_M,
-                                   flags=flags)
+            self._send(REQ_TAKEOFF, alt_m=self.TAKEOFF_ALT_M, flags=flags)
             if abs(h_agl - self.TAKEOFF_ALT_M) < self.TAKEOFF_TOL_M:
                 # 離陸地点を覚える (RTL の戻り先)。カメラが見えていれば実測。
                 if self.home is None and pos is not None:
@@ -260,20 +332,20 @@ class WaypointMission:
             # ヘディングが分からないと「前」がどっちか分からない。
             #  この状態で速度を出すと 90 度ずれた方向へ飛ぶので、必ず止める。
             if not yaw_valid or yaw_rad is None or not pos_valid or pos is None:
-                self.link.send_command(REQ_HOLD, alt_m=target[2], flags=flags)
+                self._send(REQ_HOLD, alt_m=target[2], flags=flags)
                 return
 
             if self.phase is Phase.DWELL:
-                self.link.send_command(REQ_HOLD, alt_m=target[2], flags=flags)
+                self._send(REQ_HOLD, alt_m=target[2], flags=flags)
                 if now - self._t_phase >= self.DWELL_S:
                     self._advance()
                 return
 
             vx, vy = self._velocity_command(pos, target, yaw_rad)
-            self.link.send_command(REQ_GUIDED, vx_mps=vx, vy_mps=vy,
-                                   alt_m=target[2], flags=flags)
+            self._send(REQ_GUIDED, vx_mps=vx, vy_mps=vy,
+                       alt_m=target[2], flags=flags)
 
-            dh = math.hypot(target[0] - float(pos[0]), target[1] - float(pos[1]))
+            dh = self._dist_h
             dz = abs(target[2] - h_agl)
             if dh < self.ARRIVE_R_M and dz < self.ARRIVE_Z_M:
                 label = "HOME" if self._returning else f"WP{self.wp_idx}"
@@ -282,7 +354,7 @@ class WaypointMission:
             return
 
         if self.phase is Phase.LAND:
-            self.link.send_command(REQ_LAND, flags=flags)
+            self._send(REQ_LAND, flags=flags)
             if self.link.flag("landed"):
                 self._goto(Phase.DONE)
                 self._say("着陸完了。THR_CUT でディスアームしてください"
@@ -344,25 +416,47 @@ class WaypointMission:
         return vx, vy
 
     def _safety_check(self, now, pos, pos_valid):
-        """着陸させるべき理由があれば文字列で返す。無ければ None。"""
+        """
+        着陸させるべき理由があれば文字列で返す。無ければ None。
+
+        ★ ARMING (まだ飛んでいない) では一切判定しない。
+          地上に置いてある機体を「着陸させる」ことに意味は無く、
+          むしろ 2026-09-14 のように、離陸前の誤検知1発でミッションが
+          再起不能 (LAND -> DONE) になる事故を生む。自動開始にすると
+          地上での待ち時間が数分になるので、時間切れ判定も同じ理由で外す。
+          地上にいるあいだの安全はパイロットのプロポが受け持つ。
+        """
+        if self.phase is Phase.ARMING:
+            return None
+
         if not self.link.telemetry_ok(max_age_s=2.0):
             return "機体からのテレメトリが途絶"
 
-        if now - self._t_start > self.MISSION_TIMEOUT_S:
-            return f"ミッション時間 {self.MISSION_TIMEOUT_S:.0f} 秒を超過"
+        if self._t_fly is not None and now - self._t_fly > self.MISSION_TIMEOUT_S:
+            return f"飛行時間 {self.MISSION_TIMEOUT_S:.0f} 秒を超過"
 
         # 離陸前はまだカメラが機体を捉えていなくてよい
         if self.phase in (Phase.CRUISE, Phase.DWELL):
             if now - self._t_pos_ok > self.POS_LOST_LAND_S:
                 return f"自己位置を {self.POS_LOST_LAND_S:.1f} 秒見失った"
 
-        if pos_valid and pos is not None:
-            if abs(float(pos[0])) > self.FENCE_X or \
-               abs(float(pos[1])) > self.FENCE_Y or \
-               float(pos[2]) > self.FENCE_Z:
-                return (f"ジオフェンス逸脱 "
-                        f"({float(pos[0]):+.2f}, {float(pos[1]):+.2f}, "
-                        f"{float(pos[2]):.2f})")
+        # ---- ジオフェンス ------------------------------------------------
+        #  ★ 「浮いてから」「逸脱が続いたら」の2条件。単発の誤検知では落とさない。
+        #    カメラは窓や反射を掴むことがあり、1フレームだけフィールド外へ
+        #    跳ぶことが実際にある。そのたびに着陸していては飛べない。
+        if self._airborne and pos_valid and pos is not None:
+            outside = (abs(float(pos[0])) > self.FENCE_X or
+                       abs(float(pos[1])) > self.FENCE_Y or
+                       float(pos[2]) > self.FENCE_Z)
+            if not outside:
+                self._t_fence = None
+            else:
+                if self._t_fence is None:
+                    self._t_fence = now
+                elif now - self._t_fence >= self.FENCE_GRACE_S:
+                    return (f"ジオフェンス逸脱が {self.FENCE_GRACE_S:.1f} 秒継続 "
+                            f"({float(pos[0]):+.2f}, {float(pos[1]):+.2f}, "
+                            f"{float(pos[2]):.2f})")
 
         # 機体が自分で GUIDED を降りた (パイロットがスイッチを戻した等)。
         #  この場合 機体は POSHOLD でその場に留まっているので、こちらも
@@ -373,7 +467,7 @@ class WaypointMission:
                 self._goto(Phase.ABORT)
                 self._say("機体が GUIDED を抜けました。"
                           "指令を停止して手動へ譲ります")
-                self.link.send_command(REQ_ABORT)
+                self._send(REQ_ABORT)
                 return None
         return None
 

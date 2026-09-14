@@ -173,6 +173,11 @@ def camera_thread_func(cam1, cam2,
                     status_color = (128, 128, 128)
 
                 # ── ダミーへのフォールバック ─────────────────────
+                #  ★ ダミーの円軌道で P_vec を上書きする前に、実測を控えておく。
+                #    ログに残すのは常にこちら。架空の座標を位置列に書くと、
+                #    後から「本当に見えていた区間」が分からなくなる。
+                P_real, res_real = P_vec, residual
+
                 if P_vec is not None:
                     if in_dummy_mode:
                         print("[Tracker] Camera detected again → REAL mode")
@@ -185,7 +190,6 @@ def camera_thread_func(cam1, cam2,
                             print(f"[Tracker] No detection for {DUMMY_FALLBACK_FRAMES} frames"
                                   f" → DUMMY mode (r={DUMMY_ORBIT_RADIUS}m "
                                   f"alt={DUMMY_ORBIT_ALT}m)")
-                            print("[Tracker] ※ダミーモード中はログを記録しません")
                             in_dummy_mode = True
                             dummy.reset()
                         P_vec    = dummy.get_position()
@@ -208,22 +212,17 @@ def camera_thread_func(cam1, cam2,
                         cv2.putText(frm, "-- DUMMY --", (10, 60),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (180, 255, 180), 2)
 
-                # ── ログ記録（ダミーモード中は記録しない） ────────
-                if not in_dummy_mode:
-                    current_z = float(P_vec[2]) if P_vec is not None else 0.0
-                    log.write(
-                        P_vec, current_z,
-                        residual if residual is not None else -1.0,
-                        bool(cands1),
-                        bool(cands2),
-                        pair_rejected
-                    )
-                else:
-                    current_z = float(P_vec[2]) if P_vec is not None else 0.0
+                # ── ログ記録 ─────────────────────────────────────
+                #  ダミー中も止めずに書く。In_Dummy 列で区別できるので、
+                #  「行が無い」= 停止中なのか落ちたのかを悩まなくて済む。
+                current_z = float(P_vec[2]) if P_vec is not None else 0.0
+                log.write(P_real, res_real,
+                          len(cands1), len(cands2), uv1, uv2,
+                          pair_rejected, in_dummy_mode)
 
                 frame_count += 1
                 if frame_count % 300 == 0:
-                    log_status = "ログ停止中(DUMMY)" if in_dummy_mode else "ログ書き込み中"
+                    log_status = "DUMMY" if in_dummy_mode else "REAL"
                     print(f"[Tracker] {frame_count}フレーム処理済み（{log_status}）")
 
                 # ── 背景リセット ─────────────────────────────────

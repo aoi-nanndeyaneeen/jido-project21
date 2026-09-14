@@ -430,7 +430,7 @@ static void printHelp() {
     Serial.println("#   d : IM920 の生の行をそのまま表示 (リンクの切り分け用)");
     Serial.println("#   z : 統計クリア");
     Serial.println("#   h : このヘルプ");
-    Serial.println("#   CMD,req,vx_mmps,vy_mmps,alt_cm,yawrate[,flags] : 上りコマンド");
+    Serial.println("#   CMD,req,vx_mmps,vy_mmps,alt_cm,yawrate[,flags[,corrN,corrE]] : 上りコマンド");
     Serial.println("#       req 0=IDLE 1=HOLD 2=TAKEOFF 3=GUIDED 4=LAND 5=ABORT");
     Serial.println("#       5Hz に間引いて無線へ流す。1.5秒来なければ送信停止");
     Serial.printf ("#   ver=%u  A=%u B=%u P=%u byte (+checksum4 = %u, IM920sL上限 %u)\n",
@@ -569,16 +569,18 @@ static void handleLine(String& line) {
 
 // ------------------------------------------------------------
 //  上りコマンド行のパース
-//    CMD,<req>,<vx_mmps>,<vy_mmps>,<alt_cm>,<yaw_rate_cdps>,<flags>
+//    CMD,<req>,<vx_mmps>,<vy_mmps>,<alt_cm>,<yaw_rate_cdps>,<flags>[,<corr_n_mm>,<corr_e_mm>]
 //  ★ 欠けているフィールドは 0 として扱わず、行ごと捨てる。数値が 1 個
 //    ずれただけで「目標高度」が「速度」になる。黙って飛ばすほうが危ない。
+//    ただし flags 以降 (flags, corr_n_mm, corr_e_mm) は後から足したぶんなので
+//    省略可 (旧PCとの互換ではなく、CF_POS_CORR を使わない指令行を短く保つため)。
 // ------------------------------------------------------------
 static void handleCmdLine(char* line) {
     n_cmd_lines++;
-    long v[6];
+    long v[8];
     int  n = 0;
     char* p = line + 4;              // "CMD," の次から
-    while (n < 6 && *p) {
+    while (n < 8 && *p) {
         char* end = nullptr;
         v[n] = strtol(p, &end, 10);
         if (end == p) break;          // 数字が無い
@@ -587,9 +589,9 @@ static void handleCmdLine(char* line) {
         if (*p == ',') p++;
         else break;
     }
-    if (n < 5) {                      // flags は省略可
+    if (n < 5) {                      // flags/corr_* は省略可
         n_cmd_bad++;
-        Serial.printf("# CMD 行が短い (%d 個)。CMD,req,vx,vy,alt,yawrate[,flags]\n", n);
+        Serial.printf("# CMD 行が短い (%d 個)。CMD,req,vx,vy,alt,yawrate[,flags[,corrN,corrE]]\n", n);
         return;
     }
 
@@ -601,6 +603,8 @@ static void handleCmdLine(char* line) {
     cmd_box.alt_cm        = (int16_t)constrain(v[3], -32768, 32767);
     cmd_box.yaw_rate_cdps = (int16_t)constrain(v[4], -32768, 32767);
     cmd_box.flags         = (uint16_t)((n >= 6) ? v[5] : 0);
+    cmd_box.corr_n_mm     = (int16_t)constrain((n >= 8) ? v[6] : 0, -32768, 32767);
+    cmd_box.corr_e_mm     = (int16_t)constrain((n >= 8) ? v[7] : 0, -32768, 32767);
     cmd_have       = true;
     cmd_last_pc_ms = millis();
 }

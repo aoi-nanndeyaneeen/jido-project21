@@ -179,10 +179,15 @@ class S5Link:
             if not line:
                 continue
 
-            if self._csv is not None and (line.startswith("DATA,")
-                                          or line.startswith("HEADER,")
-                                          or line.startswith("PARAM,")):
-                self._csv.write(line + "\n")
+            # ★ 機体の millis() しか無いと、カメラログと時刻で並べられない。
+            #   受信した瞬間の PC 時刻を1列目に足して保存する (解析の突き合わせキー)。
+            #   足すのは保存する行だけ。解析用の列定義 (_cols) は素のまま扱う。
+            if self._csv is not None:
+                if line.startswith("DATA,") or line.startswith("PARAM,"):
+                    tag, _, rest = line.partition(",")
+                    self._csv.write(f"{tag},{time.time():.3f},{rest}\n")
+                elif line.startswith("HEADER,"):
+                    self._csv.write("HEADER,Epoch_s," + line[len("HEADER,"):] + "\n")
 
             if line.startswith("HEADER,"):
                 self._cols = line[len("HEADER,"):].split(",")
