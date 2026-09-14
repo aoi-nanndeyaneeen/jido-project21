@@ -120,7 +120,7 @@ static String rx_line;
 //  上りコマンド (PC -> ここ -> IM920 -> 機体)
 // ------------------------------------------------------------
 //  PC (position_estimator) が USB へ 1 行ずつ投げてくる:
-//      CMD,<req>,<vx_mmps>,<vy_mmps>,<alt_cm>,<yaw_rate_cdps>,<flags>
+//      CMD,<req>,<vx_mmps>,<vy_mmps>,<alt_cm>,<yaw_rate_cdps>,<flags>[,<corr_n_mm>,<corr_e_mm>]
 //  ここは最新値を mailbox に持ち、CMD_TX_INTERVAL_MS ごとにだけ
 //  実際に無線へ流す。PC はカメラのフレームレートで送ってきてよい。
 //
