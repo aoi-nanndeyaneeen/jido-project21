@@ -1,7 +1,8 @@
 // ============================================================
-//  log_recorder / main.cpp  -  RP2040 を「SD ログ専用機」にする
+//  log_recorder / main.cpp  -  XIAO を「SD ログ専用機」にする
+//  対応ボード: Seeed XIAO RP2040 / Seeed XIAO ESP32C3 (どちらも同一フットプリント)
 // ============================================================
-//  Teensy(FC) --UART 2Mbaud--> RP2040 --SPI0--> HW-125 --> microSD
+//  Teensy(FC) --UART 2Mbaud--> XIAO --SPI--> HW-125 --> microSD
 //
 //  【なぜ分けたか】
 //    FC (Teensy4.0) では PMW3901 と HW-125 が SPI0 を共有していて共存できず、
@@ -10,42 +11,59 @@
 //    SD を丸ごとこちらへ引っ越すと、FC の SPI0 は PMW3901 専用になり、
 //    フロー使用中でも飛行まるごとのログが録れる。
 //
-//  【2 コアの分担】 ここがこのスケッチの肝
-//    core0 : UART を受けてフレームを検証し、リングへ積むだけ。SD に触らない。
-//    core1 : リングから取り出して SD へ書くだけ。UART の受信に触らない。
-//    SD カードは GC で 100ms 以上黙ることがある。同じコアでやると、その間の
-//    UART が確実に溢れる。分けておくと core0 は止まらず、停止はリングが
-//    吸収する (128KB = 500Hz なら約 2 秒ぶん)。
+//  【役割分担】 ここがこのスケッチの肝
+//    rx役 : UART を受けてフレームを検証し、リングへ積むだけ。SD に触らない。
+//    sd役 : リングから取り出して SD へ書くだけ。UART の受信に触らない。
+//    SD カードは GC で 100ms 以上黙ることがある。同じ実行文脈でやると、
+//    その間の UART が確実に溢れる。分けておけば rx 役は止まらず、停止は
+//    リングが吸収する (128KB = 500Hz なら約 2 秒ぶん)。
+//    ★ RP2040 は物理 2 コア (setup1()/loop1() = core1) でこれを実現しているが、
+//      ESP32C3 はシングルコアなので FreeRTOS の 2 タスクに役割分担させている。
+//      SD 書き込み中に UART の ISR 自体は止まらない (ドライバの受信バッファに
+//      ハードウェア割込みで積まれ続ける) ので、rx 側バッファ (UART_FIFO) が
+//      吸収できる範囲であれば ESP32C3 でもレコードロストしない。
 //
 //  【出来上がる BIN】
 //    SdLog.h が作っていたものと完全に同じ = 32B ヘッダ + Rec の連続。
 //    変換はこれまでどおり PC で flight_controller/scripts/bin2csv.py。
 //
-//  【配線 (XIAO RP2040)】
-//     D7 / GP1  RX  <---- Teensy TX17 (Serial4)
-//     D6 / GP0  TX  ----> Teensy RX16          ※状態返信用。省略可
-//     GND       <--------> Teensy GND          ※必須
-//     D8 / GP2  SCK ----> HW-125 SCK
-//     D10/ GP3  MOSI----> HW-125 MOSI
-//     D9 / GP4  MISO<---- HW-125 MISO
-//     D2 / GP28 CS  ----> HW-125 CS
-//     5V        ----> HW-125 VCC (モジュール上でレギュレータ + レベル変換)
-//     GND       ----> HW-125 GND
-//    ★ RP2040 の電源は FC と分ける。SD 書き込みの突入電流で FC を
+//  【配線】 XIAO は RP2040/ESP32C3 でフットプリント・D番号が共通なので、
+//    同じ位置に挿すだけで配線はそのまま使い回せる (実 GPIO 番号だけが違う。
+//    main.cpp 側で #if により吸収している)。
+//     D7  RX  <---- Teensy TX17 (Serial4)
+//     D6  TX  ----> Teensy RX16          ※状態返信用。省略可
+//     GND     <--------> Teensy GND      ※必須
+//     D8  SCK ----> HW-125 SCK
+//     D10 MOSI----> HW-125 MOSI
+//     D9  MISO<---- HW-125 MISO
+//     D2  CS  ----> HW-125 CS
+//     5V      ----> HW-125 VCC (モジュール上でレギュレータ + レベル変換)
+//     GND     ----> HW-125 GND
+//    ★ XIAO の電源は FC と分ける。SD 書き込みの突入電流で FC を
 //      巻き込まないため。GND だけ共通にすること。
 //
-//  【LED (XIAO RP2040 のオンボード、いずれも負論理)】
-//     緑 = 記録中     青 = 待機 (SD OK)     赤 = SD NG / ロスト発生
+//  【LED】
+//    XIAO RP2040 はオンボード RGB (いずれも負論理):
+//      緑 = 記録中     青 = 待機 (SD OK)     赤 = SD NG / ロスト発生
+//    XIAO ESP32C3 にはユーザー制御可能なオンボードLEDが無いため、
+//    LED 表示は行わない (状態は USB シリアルの 's' コマンドで確認する)。
 // ============================================================
 #include <Arduino.h>
 #include <SPI.h>
 #include <SdFat.h>
+#if defined(ARDUINO_ARCH_ESP32)
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 
 #include "quad/LogLinkProto.h"   // ★ flight_controller 側の実体を include
 
 namespace P = LogLinkProto;
 
-// ---- ピン ----------------------------------------------------------------
+// ---- ピン ------------------------------------------------------------
+//  XIAO は RP2040 版/ESP32C3 版でシルク印刷の D0-D10 は共通だが、実 GPIO
+//  番号はチップごとに違う。ボードごとに定数を切り替える。
+#if defined(ARDUINO_ARCH_RP2040)
 constexpr uint8_t PIN_UART_TX = 0;    // D6
 constexpr uint8_t PIN_UART_RX = 1;    // D7
 constexpr uint8_t PIN_SPI_SCK = 2;    // D8
@@ -53,9 +71,24 @@ constexpr uint8_t PIN_SPI_TX  = 3;    // D10 (MOSI)
 constexpr uint8_t PIN_SPI_RX  = 4;    // D9  (MISO)
 constexpr uint8_t PIN_SD_CS   = 28;   // D2
 
-constexpr uint8_t PIN_LED_RED   = 17;  // 負論理
+constexpr uint8_t PIN_LED_RED   = 17;  // 負論理 (オンボード RGB)
 constexpr uint8_t PIN_LED_GREEN = 16;
 constexpr uint8_t PIN_LED_BLUE  = 25;
+#define LOGREC_HAS_RGB_LED 1
+
+#elif defined(ARDUINO_ARCH_ESP32)
+constexpr uint8_t PIN_UART_TX = 21;   // D6
+constexpr uint8_t PIN_UART_RX = 20;   // D7
+constexpr uint8_t PIN_SPI_SCK = 8;    // D8
+constexpr uint8_t PIN_SPI_TX  = 10;   // D10 (MOSI)
+constexpr uint8_t PIN_SPI_RX  = 9;    // D9  (MISO)
+constexpr uint8_t PIN_SD_CS   = 4;    // D2
+// ★ XIAO ESP32C3 にはユーザー制御可能なオンボードLEDが無い。
+#define LOGREC_HAS_RGB_LED 0
+
+#else
+#error "log_recorder: unsupported board (RP2040 / ESP32C3 のみ対応)"
+#endif
 
 // ---- チューニング定数 ----------------------------------------------------
 constexpr uint32_t LINK_BAUD  = 2000000;   // LogLink::BAUD と一致させること
@@ -232,9 +265,13 @@ static void scanNextIndex() {
 }
 
 static bool init() {
+#if defined(ARDUINO_ARCH_RP2040)
     SPI.setSCK(PIN_SPI_SCK);
     SPI.setTX(PIN_SPI_TX);
     SPI.setRX(PIN_SPI_RX);
+#elif defined(ARDUINO_ARCH_ESP32)
+    SPI.begin(PIN_SPI_SCK, PIN_SPI_RX, PIN_SPI_TX);   // sck, miso, mosi (CS は SdFat が別途叩く)
+#endif
     // このバスには SD しか繋がっていないので DEDICATED_SPI にできる。
     // SdFat がマルチブロック書き込みを使えるようになり、FC 側 (SHARED_SPI)
     // より格段に速い。ここが「SD を別 MCU に出した」ことの副次的な利得。
@@ -394,15 +431,33 @@ static void service() {
     }
 }
 
+#if defined(ARDUINO_ARCH_ESP32)
+// ESP32C3 (シングルコア) では setup1()/loop1() が無いので、SD 書き込み役を
+// 専用 FreeRTOS タスクとして起動する。rx 側 (loop()) より低い優先度にして
+// あるので、UART 受信の処理が滞らないよう配慮している。
+static void task(void*) {
+    delay(50);   // core0/loop() 側の Serial 初期化と競合しないように
+    init();
+    for (;;) {
+        service();
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+#endif
+
 } // namespace Sd
 
 // ============================================================
 //  §3  LED / USB コンソール
 // ============================================================
 static void led(bool r, bool g, bool b) {   // 負論理
+#if LOGREC_HAS_RGB_LED
     digitalWrite(PIN_LED_RED,   r ? LOW : HIGH);
     digitalWrite(PIN_LED_GREEN, g ? LOW : HIGH);
     digitalWrite(PIN_LED_BLUE,  b ? LOW : HIGH);
+#else
+    (void)r; (void)g; (void)b;   // ESP32C3 にはオンボードLEDが無いので何もしない
+#endif
 }
 
 static void printStatus() {
@@ -432,21 +487,32 @@ static void printStatus() {
 }
 
 // ============================================================
-//  §4  core0  (UART 受信専用)
+//  §4  rx役 (UART 受信専用。RP2040 では core0、ESP32C3 では既定の loop タスク)
 // ============================================================
 void setup() {
+#if LOGREC_HAS_RGB_LED
     pinMode(PIN_LED_RED, OUTPUT); pinMode(PIN_LED_GREEN, OUTPUT);
     pinMode(PIN_LED_BLUE, OUTPUT);
     led(true, true, true);        // 起動中は白
+#endif
 
     Serial.begin(115200);         // USB (デバッグ用)
 
+#if defined(ARDUINO_ARCH_RP2040)
     Serial1.setRX(PIN_UART_RX);
     Serial1.setTX(PIN_UART_TX);
     Serial1.setFIFOSize(UART_FIFO);   // ★ begin() より前に呼ぶこと
     Serial1.begin(LINK_BAUD);
+#elif defined(ARDUINO_ARCH_ESP32)
+    Serial1.setRxBufferSize(UART_FIFO);   // ★ begin() より前に呼ぶこと
+    Serial1.begin(LINK_BAUD, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX);
+    // ESP32C3 (シングルコア) 版の sd 役。RP2040 の setup1()/loop1() に相当。
+    xTaskCreate(Sd::task, "sd_task", 4096, nullptr, 1, nullptr);
+#endif
 
+#if LOGREC_HAS_RGB_LED
     led(false, false, true);      // 青 = 待機
+#endif
 }
 
 void loop() {
@@ -475,10 +541,18 @@ void loop() {
                         g_st.orphan = 0; g_st.peak_ring = 0; g_st.worst_w_us = 0;
                         Serial.println("統計をリセットしました"); }
     }
+
+#if defined(ARDUINO_ARCH_ESP32)
+    // シングルコアなので sd タスク (と裏の idle/WDT) に実行機会を渡す。
+    // UART 受信バッファは割込みで積まれ続けるので、この程度の delay では
+    // 取りこぼさない (UART_FIFO のサイズで数十 ms ぶん吸収できる)。
+    vTaskDelay(pdMS_TO_TICKS(1));
+#endif
 }
 
+#if defined(ARDUINO_ARCH_RP2040)
 // ============================================================
-//  §5  core1  (SD 書き込み専用)
+//  §5  core1  (SD 書き込み専用。RP2040 のみ。ESP32C3 は Sd::task() を使う)
 // ============================================================
 void setup1() {
     // core0 が SPI ピンを触らないよう、SD の初期化はここに閉じる。
@@ -500,3 +574,4 @@ void loop1() {
         else                      led(lost, false, true);
     }
 }
+#endif
