@@ -895,6 +895,17 @@ constexpr float ALT_STICK_VZ   = 0.8f;
 // このスロットル以上で高度ホールドを有効化 (地上での暴走防止)
 constexpr float ALT_ENABLE_THR = 0.15f;
 
+// ホールド中 (POSHOLD/GUIDED) にスロットルが FLOW_ENABLE_THR / ALT_ENABLE_THR
+// を割ったとき、「手放し (bail-out)」と認めるまでの継続時間 [ms]。
+// ★ 2026-09-15 21:27 (LOG0007): 中心保持中に SBUS の THR が 1フレーム (8ms) で
+//   0.500 -> 0.064 へ飛び、その瞬間に高度ホールドが release → スロットルが
+//   6% になって 0.5m から 0.4秒で落ちた。スティック無操作 (roll/pitch/yaw
+//   すべて 0.000)、armed 継続、failsafe 無し。手で動かせば 50〜100ms の
+//   遷移が必ずログに残るが、それが無いので送信機側のスイッチ/ミックスか
+//   受信側の値飛び。パイロットの本物の bail-out は 200ms 以内に降りて
+//   くるので体感は変わらない。0 で従来動作 (即時)。
+constexpr uint32_t HOLD_THR_DROP_DEBOUNCE_MS = 200;
+
 // ---- 離陸検知 (地上での積分ワインドアップ対策) ----------------
 //  地上に置いたままだと フロー速度は常に 0、高度も上がらないので、
 //  PosHold の速度I項も AltHold のI項も「効かない誤差」を溜め続ける。

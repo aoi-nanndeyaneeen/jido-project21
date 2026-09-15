@@ -400,8 +400,16 @@ constexpr float ANG_I_LIMIT = 30.0f;
 //       ピッチ: 09-14 に トリム -0.85 で fh_leanp -1.23 -> +1.55 (感度 ≒ -3.3)
 //               必要な変化 -1.55 / -3.3 ≒ +0.47 -> -1.45 + 0.47 ≒ -1.00
 //   ★ 次便で fh_leanr / fh_leanp の平均が ±0.5度 に入るか確認。
+//
+// ★ 2026-09-15(2) LOG0007 (21:27, GUIDED 中心保持 15秒) で検証:
+//     fh_leanr = -0.08 (std 0.24)  ← ロールは確定。据え置き。
+//     fh_leanp = +2.30 (std 0.48)  ← 悪化 (+1.55 -> +2.30)。
+//   ピッチの感度符号を読み違えていた: トリム +0.45 で leanp +0.75 なので
+//   感度は +1.67 (負ではない)。2.30 / 1.67 = 1.38 を引く:
+//       -1.00 - 1.38 = -2.38 -> -2.35
+//   次便で fh_leanp が ±0.5度 に入らなければ、同じ感度でもう1巡。
 constexpr float ROLL_TRIM_DEG  = +0.33f;
-constexpr float PITCH_TRIM_DEG = -1.00f;
+constexpr float PITCH_TRIM_DEG = -2.35f;
 
 } // namespace Gain
 
@@ -1461,8 +1469,31 @@ static S5::Mode selectMode() {
 //     地上でスロットルを下げたままだとフロー制御は一切出力しない (安全)。
 //     ドライラン('m')で符号を確認するときも、スティックを上げる必要がある。
 // ------------------------------------------------------------
+// ホールドの enable ゲートに渡すスロットル。閾値を割る方向だけ
+//  HOLD_THR_DROP_DEBOUNCE_MS 続くまで直前の値で保持する (QuadConfig 参照)。
+//  上げる方向と、閾値より上での変化は素通し。ミキサーへ渡す thr_stick には
+//  使わない (ホールドが release された後のスロットルは生値のまま)。
+static float g_hold_thr_gate     = 0.0f;
+static uint32_t g_thr_low_since  = 0;
+static float holdGateThrottle() {
+    const float raw = S5::USE_SBUS ? constrain(sbus.des[Ch::THR], 0.0f, 1.0f) : 0.0f;
+    const float th  = fminf(Q::FLOW_ENABLE_THR, Q::ALT_ENABLE_THR);
+    const uint32_t now = millis();
+    if (raw > th || Q::HOLD_THR_DROP_DEBOUNCE_MS == 0) {
+        g_thr_low_since = 0;
+        g_hold_thr_gate = raw;
+        return raw;
+    }
+    if (g_thr_low_since == 0) g_thr_low_since = now;
+    if (now - g_thr_low_since >= Q::HOLD_THR_DROP_DEBOUNCE_MS) {
+        g_hold_thr_gate = raw;
+        return raw;
+    }
+    return g_hold_thr_gate;
+}
+
 static void updateFlowHold(float dt_s) {
-    const float thr = S5::USE_SBUS ? constrain(sbus.des[Ch::THR], 0.0f, 1.0f) : 0.0f;
+    const float thr = holdGateThrottle();
 
     // ★ 離陸するまでは効かせない (FLOW_REQUIRE_AIRBORNE)。
     //   地上ではフロー速度が常に 0 なので、位置積分がノイズを溜め、
@@ -1513,7 +1544,7 @@ static void updateFlowHold(float dt_s) {
 //     50Hz で無条件に PID を回すと同じ climb 値で D項がスパイクする。
 // ------------------------------------------------------------
 static void updateAltHold(float dt_s) {
-    const float thr = S5::USE_SBUS ? constrain(sbus.des[Ch::THR], 0.0f, 1.0f) : 0.0f;
+    const float thr = holdGateThrottle();
 
     // 前回の呼び出し以降にミキサーが実際に使ったスロットルの平均。
     // まだ1回も回っていなければ -1 (= 情報なし) を渡す。
