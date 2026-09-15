@@ -115,7 +115,7 @@ public:
         derot_y = _acc_raw_y + _acc_gyro_y;
 
         // 対地速度 [m/s] = (変位[px] / T) / PX_PER_RAD * height
-        const float k = _height_m / (Quad::FLOW_PX_PER_RAD * T);
+        const float k = Quad::FLOW_VEL_SCALE * _height_m / (Quad::FLOW_PX_PER_RAD * T);
         vx = derot_x * k;
         vy = derot_y * k;
 

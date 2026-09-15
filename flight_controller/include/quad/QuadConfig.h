@@ -265,6 +265,13 @@ constexpr float FLOW_SIGN_Y  = -1.0f;   // 右移動で + になる向き
 //                   flow_accx の読み ÷ D で現行値を補正。
 constexpr float FLOW_PX_PER_RAD = 600.0f;   // 2026-09-09 log_020 回帰で実測
 
+// 並進速度だけに掛ける倍率。FLOW_PX_PER_RAD は de-rotation と共用で、回転
+//  テストで正しく合っている (相関 0.97) ので、そちらは触らずにここで直す。
+// ★ 2026-09-15: 中心保持 165秒 (20:46) で、フロー速度 (fh_vxc/vyc) を
+//   カメラ位置の傾きと比べると 左右 0.85〜0.86倍 / 前後 0.81〜0.94倍
+//   (相関 0.96 / 0.83、遅れ 0.2秒)。平均 ~0.87倍の過小なので 1.15 倍する。
+constexpr float FLOW_VEL_SCALE = 1.15f;
+
 // de-rotation: 機体の角速度が作る「見かけの流れ」をジャイロで差し引く。
 //  pitch(Y軸まわり)レート → flow_x に乗る / roll(X軸まわり)レート → flow_y に乗る
 constexpr bool  FLOW_DEROTATE     = true;
