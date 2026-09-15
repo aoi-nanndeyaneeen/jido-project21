@@ -511,21 +511,20 @@ POS_CORR_MAX_STEP_M = 0.4
 POS_CORR_TRACK_TOL_M = 0.15  # この範囲に収まっていれば「同じズレ」とみなす
 POS_CORR_CONFIRM_S   = 1.0   # この秒数、同じズレが続いたら補正してよいと判断する
 
-# Phase 6: 1.8m x 2.6m フィールドでの正方形一周 (2026-09-14〜)。
+# Phase 4: WP なし。離陸 -> 中心 (0,0) -> 帰投 -> 着陸だけ (2026-09-15〜)。
 # 経路の先頭には core/mission.py が自動でフィールド中心 (0,0) を挟むので、
-# ここには中心を含めない。1周後に開始点へ戻ってくるよう最後にもう一度
-# 最初のコーナーを入れてある (ミッション5 = ミッション1)。
-MISSION_WAYPOINTS = [
-    ( 0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # ミッション1
-    ( 0.5,  0.5, MISSION_TAKEOFF_ALT_M),   # ミッション2
-    (-0.5,  0.5, MISSION_TAKEOFF_ALT_M),   # ミッション3
-    (-0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # ミッション4
-    ( 0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # ミッション5 (ミッション1と同一点で一周を閉じる)
-]
+# WP を空にすれば「中心へ行って1秒保持したら、そのまま着陸」になる。
+MISSION_WAYPOINTS = []
 # Phase 5 (中心から奥へ1点だけ) に戻すときはこちら:
 # MISSION_WAYPOINTS = [(0.0, 1.0, MISSION_TAKEOFF_ALT_M)]
-# Phase 4 (WP なし。離陸 -> 中心 -> 帰投 -> 着陸だけ) に戻すときはこちら:
-# MISSION_WAYPOINTS = []
+# Phase 6 (1.8m x 2.6m フィールドでの正方形一周) に戻すときはこちら:
+# MISSION_WAYPOINTS = [
+#     ( 0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # ミッション1
+#     ( 0.5,  0.5, MISSION_TAKEOFF_ALT_M),   # ミッション2
+#     (-0.5,  0.5, MISSION_TAKEOFF_ALT_M),   # ミッション3
+#     (-0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # ミッション4
+#     ( 0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # ミッション5 (ミッション1と同一点で一周を閉じる)
+# ]
 
 # ==========================================
 # ダミー飛行（カメラ未検出フォールバック）

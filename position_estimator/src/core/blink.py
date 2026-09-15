@@ -103,6 +103,14 @@ class BlinkTracker:
             while t.samples and ts - t.samples[0][0] > self.history_sec:
                 t.samples.popleft()
             self._update_score(t)
+            # ★ 点滅が確認できている間は、bright 検知の候補が出なくても
+            #   トラックを生かす。寿命を候補の有無だけで決めていたため、
+            #   しきい値ぎりぎり/静的マスクに一部欠けた LED だと候補が
+            #   途切れるたびに削除され、静止した機体でも
+            #   「1.2秒検知 -> 数秒見失い」を繰り返した (2026-09-15 Camera1)。
+            #   ROI の6Hz成分そのものが機体の証拠なので、それで延命する。
+            if t.confirmed:
+                t.last_seen_ts = ts
 
         self._last_output = [t.cand for t in self._tracks if t.confirmed]
         return self._last_output

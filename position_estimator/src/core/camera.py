@@ -153,6 +153,7 @@ class CameraTracker:
         self.exposure_locked = False
         self.last_frame_time = 0.0
         self.last_candidates = []
+        self._last_detect_seq = None
         self.vibration_rejected = False
         self._latest_lock = threading.Lock()
         self._latest_frame = None
@@ -453,12 +454,20 @@ class CameraTracker:
         else:
             ret, frame = self.cap.read()
             ts = time.time()
-            seq = 0
+            seq = None
             copy_ms = 0.0
             if not ret or frame is None:
                 return None, [], 0.0
 
-        candidates = self.detect(frame)
+        # ★ tracker のループはカメラより速い (Camera1 16fps に対し ~80Hz) ので、
+        #   同じフレームが何度も来る。そのたびに detect() すると静的輝点マスクの
+        #   学習が「呼び出し回数」で進み、120フレームのつもりが実時間 0.7 秒で
+        #   終わる上、同じ1枚を何度も数えて比率が偏る。新しいフレームだけ検知する。
+        if seq is not None and seq == self._last_detect_seq:
+            candidates = self.last_candidates
+        else:
+            candidates = self.detect(frame)
+            self._last_detect_seq = seq
         process_ms = (time.perf_counter() - process_start) * 1000.0
         with self._latest_lock:
             self._perf["process_count"] += 1
