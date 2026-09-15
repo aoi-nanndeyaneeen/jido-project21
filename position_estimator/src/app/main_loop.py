@@ -17,6 +17,7 @@ from utils.config import (DISP_W, DISP_H, VELOCITY_W, VELOCITY_H,
                           GROUND_LINK_ENABLED, GROUND_LINK_PORT,
                           MISSION_WAYPOINTS, MISSION_TAKEOFF_ALT_M,
                           MISSION_YAW_MODE, MISSION_AUTOSTART, LOG_DIR,
+                          YAW_CAMERA_MAX_DISAGREE_DEG,
                           BLE_LOG_ENABLED, BLE_LOG_NAME)
 from core.tracker import camera_thread_func
 from core.controller import AltitudeController
@@ -171,6 +172,7 @@ def run_main_loop(cam1, cam2,
     _warned_fixed_yaw = [False]
     # 機体の g_yaw_est がカメラの絶対ヨーで再基準済みか (アーム中のみ有効)
     _yaw_rebased = [False]
+    _yaw_reject_warned = [False]
     # 直近に yaw_est へ渡した D フレームの t_ms。同じ値を2回渡さないための重複排除。
     #  ★ S5Link.state() は「最新のCSV行」のスナップショットを返すだけで
     #    キューではない。ここのポーリング周期(カメラフレーム毎)は
@@ -301,6 +303,23 @@ def run_main_loop(cam1, cam2,
                 armed_now = bool(st_now.get("armed", 0))
                 if not armed_now:
                     _yaw_rebased[0] = False    # 機体はアーム時に g_yaw_est を 0 へ戻す
+                dev_yaw = st_now.get("yaw")
+                if m_yaw_valid and isinstance(dev_yaw, float):
+                    # ★ カメラ推定が機体のジャイロヨーと大きく食い違ったら使わない。
+                    #   2026-09-15 20:49: 推定が -86.3deg (実際は -2deg) に「収束」し、
+                    #   CF_YAW_VALID で機体の g_yaw_est を -86 に書き換えた結果、
+                    #   ヘディング保持が 60deg/s で機首を回し続け 0.6m 流れた。
+                    #   機体のヨーは今日一日 ±5deg 以内で正しかったので、そちらを信じる。
+                    base = 0.0 if _yaw_rebased[0] else YAW_INITIAL_ALIGN_DEG
+                    disagree = (math.degrees(yaw_rad) - (base + dev_yaw) + 180.0) % 360.0 - 180.0
+                    if abs(disagree) > YAW_CAMERA_MAX_DISAGREE_DEG:
+                        if not _yaw_reject_warned[0]:
+                            _yaw_reject_warned[0] = True
+                            print(f"[Yaw] カメラ推定 {math.degrees(yaw_rad):+.1f}deg が機体ヨー "
+                                  f"{base + dev_yaw:+.1f}deg と {disagree:+.0f}deg 食い違うため不採用")
+                        m_yaw, m_yaw_valid = None, False
+                    else:
+                        _yaw_reject_warned[0] = False
                 if m_yaw_valid and armed_now:
                     _yaw_rebased[0] = True     # この値が CF_YAW_VALID で機体へ送られる
                 if not m_yaw_valid and MISSION_YAW_MODE == "fixed":
