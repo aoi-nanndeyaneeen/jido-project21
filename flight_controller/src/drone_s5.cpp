@@ -103,6 +103,7 @@
 #include "quad/PosHold.h"
 #include "quad/AltHold.h"        // s5c: 高度ホールド (カスケード + engage 状態遷移)
 #include "quad/AltEstimator.h"   // s5c: 加速度Z×測距の相補フィルタ (高度・上昇速度の推定)
+#include "quad/BodyDv.h"         // 地上局ガイド飛行: ヨー推定用の機体Δv (重力除去)
 #include "quad/SdLog.h"          // 飛行まるごとSDへストリーミング (HW-125, CS=9)
 #include "quad/LogLink.h"        // 同じログを UART で RP2040 ロガーへ (SPI0 を空ける)
 #include "quad/StatusLed.h"      // モード表示用 RGB LED (pin 5/6/7)
@@ -574,6 +575,17 @@ bool  g_yaw_holding = false; // 表示用: いま保持中か
 
 // シリアルから調整できるようにゲインだけ変数で持つ
 float g_yaw_hold_kp = Gain::YAW_HOLD_KP;
+
+// ---- 地上局からのヨー補正 (カメラ絶対ヨー) ----
+//  applyGuidedCommand() 参照。g_yaw_est をカメラ真値へ再基準するだけで、
+//  g_yaw_hold (目標=まっすぐ奥) には触らない。戻す動きは §7-2 の
+//  ヘディングホールドPが Gain::YAW_HOLD_RATE_LIM でクランプしながら行う。
+bool    g_yaw_corr_seq_init = false;
+uint8_t g_yaw_corr_last_seq = 0;
+
+// 地上局(カメラ)がヨーを求めるための機体Δv (重力除去・FRD前+右+)。
+// S5Tel::sendDv() が送信のたびに drain して積算をゼロへ戻す。
+Quad::BodyDvAccumulator g_body_dv;
 
 // ---- ミキサーの報告 (ログ用) ----
 Q::MixInfo g_mix;
@@ -1164,6 +1176,21 @@ inline void sendAtt(int mode) {
     if (!s5tx.send(c)) tx_drop_flag = true;
 }
 
+// D: ヨー推定用の機体Δv。POSHOLD/AUTO でだけ送る (ANGLE/RATE では
+//  camera/GUIDED のループが動いていないので送っても無駄)。
+inline void sendDv() {
+    S5T::DvFrame d{};
+    fillHeader(d.h, S5T::TYPE_DV);
+
+    float dvx, dvy;
+    g_body_dv.drain(dvx, dvy);
+    d.dvx_mmps = S5T::q16(dvx, S5T::SC_MM);
+    d.dvy_mmps = S5T::q16(dvy, S5T::SC_MM);
+    d.yaw_dd   = S5T::q16(g_yaw_est, S5T::SC_DDEG);
+
+    if (!s5tx.send(d)) tx_drop_flag = true;
+}
+
 // P: 今どのゲインで飛んでいるか。数秒に1回。
 inline void sendParam() {
     S5T::ParamFrame p{};
@@ -1200,10 +1227,11 @@ inline void sendParam() {
 // telem_tick から呼ぶ。1回につき1パケットしか送れない (IM920sL は 32B 制限)。
 //  何を送るかはモードで変える:
 //    ANGLE / RATE  … A,C の交互 (各 7.5Hz)
-//        B(水平位置) は POSHOLD 以外では中身が全部 0 なので送るだけ無駄。
-//        その枠を C に回して、離陸時の転倒やモーター飽和を追えるようにする。
-//    POSHOLD / AUTO … A,B,A,C の4枠巡回 (A 7.5Hz / B 3.75Hz / C 3.75Hz)
-//        位置ループは 0.3〜1Hz なので B は 3.75Hz で足りる。
+//        B(水平位置)/D(Δv) は POSHOLD 以外では中身が意味を持たないので
+//        送るだけ無駄。その枠を C に回して、離陸時の転倒やモーター飽和を
+//        追えるようにする。
+//    POSHOLD / AUTO … A,B,D,A,C の5枠巡回 (A 6Hz / B,D,C 各3Hz)
+//        位置ループもヨー推定の窓も 0.3〜1Hz なので 3Hz あれば足りる。
 //  P(ゲイン一覧) は数秒に1回、その回の枠を borrow する。
 inline void tick(int mode, float thr_stick) {
     const uint32_t now = millis();
@@ -1213,20 +1241,21 @@ inline void tick(int mode, float thr_stick) {
         return;
     }
 
-    slot = (uint8_t)((slot + 1) & 0x03);   // 0,1,2,3 の巡回
-
     if (mode != (int)S5::MODE_POSHOLD && mode != (int)S5::MODE_AUTO) {
         // ANGLE / RATE: A と C の交互
+        slot = (uint8_t)((slot + 1) & 0x03);   // 4刻みのままでよい (0/2→A, 1/3→C)
         if (slot & 1) sendAtt(mode);
         else          sendAlt(mode, thr_stick);
         return;
     }
 
-    // POSHOLD: A,B,A,C
+    // POSHOLD/AUTO: A,B,D,A,C の5枠巡回
+    slot = (uint8_t)((slot + 1) % 5);
     switch (slot) {
-        case 0: case 2: sendAlt(mode, thr_stick); break;
+        case 0: case 3: sendAlt(mode, thr_stick); break;
         case 1:         sendPos(mode);            break;
-        default:        sendAtt(mode);            break;
+        case 2:         sendDv();                 break;
+        default:        sendAtt(mode);            break;   // case 4
     }
 }
 
@@ -1335,6 +1364,12 @@ static void resetControllers() {
     g_yaw_est     = 0.0f;
     g_yaw_hold    = 0.0f;
     g_yaw_holding = false;
+    g_yaw_corr_seq_init = false;   // 次に届いたパケットで即座に再基準する
+
+    // D フレームは POSHOLD/AUTO でしか送らない (S5Tel::tick)。ここで
+    // 捨てておかないと、ANGLE/RATE で溜まったままの古いΔvが、次に
+    // POSHOLD/AUTO へ入った瞬間の1発目にそのまま乗ってしまう。
+    g_body_dv.reset();
 
     // s5b/s5d: フロー水平ホールドも「今ここ」を基準に取り直す。
     poshold.reset();
@@ -1543,6 +1578,28 @@ static void applyGuidedCommand(const S5C::CmdFrame& c, uint32_t now) {
                                 (float)c.corr_e_mm / S5C::SC_MM);
     }
 
+    // ---- ヨー補正: カメラが実測した絶対ヨーで g_yaw_est を再基準する ----
+    //  ★ CF_YAW_VALID は「カメラのヨー推定が収束している」間ずっと立って
+    //    いるので、poshold の位置補正 (1回だけ乗るフラグ) と違い、同じ
+    //    値を何ループも受け続ける。ここで毎ループ適用すると、ジャイロの
+    //    高速積分 (dt_s ごとの g_yaw_est += rate*dt) を無線の低いレート
+    //    (5Hz) で踏みつぶしてしまう。c.seq が進んだ = 新しいパケットが
+    //    届いた瞬間だけ適用する。
+    //
+    //  ★ g_yaw_est だけを書き換え、g_yaw_hold (目標=機首をまっすぐ奥へ)
+    //    には触らない。PositionHold::correctPosition() と同じ考え方:
+    //    「今の推定値」を真値へ寄せるだけで、そのあと目標との差を埋める
+    //    速さは既存のヘディングホールドP (Gain::YAW_HOLD_RATE_LIM で
+    //    クランプ済み) に任せる。ここで角度を直接動かすと、無線の遅延
+    //    (100〜200ms) を姿勢ループに持ち込むことになり発振する
+    //    (S5Cmd.h 冒頭の設計方針と同じ理由)。
+    if ((c.flags & S5C::CF_YAW_VALID) &&
+        (!g_yaw_corr_seq_init || c.seq != g_yaw_corr_last_seq)) {
+        g_yaw_corr_seq_init  = true;
+        g_yaw_corr_last_seq  = c.seq;
+        g_yaw_est = (float)c.yaw_abs_cdeg / S5C::SC_CDEG;
+    }
+
     const float cmd_alt = (c.alt_cm > 0) ? (float)c.alt_cm / S5C::SC_CM : 0.0f;
     switch (c.req) {
         case S5C::REQ_TAKEOFF:
@@ -1710,6 +1767,11 @@ static void updateControl(float dt_s) {
     //  (AltHold の cos 補正など「生の姿勢」が要るところを壊さないため)。
     roll_axis.ang_meas   = g_att.roll  - Gain::ROLL_TRIM_DEG;
     pitch_axis.ang_meas  = g_att.pitch - Gain::PITCH_TRIM_DEG;
+
+    // 地上局ヨー推定用の機体Δv。他の測定値と同じく、アーム前から積んで
+    // おいて構わない (S5Tel::sendDv() は POSHOLD/AUTO でしか呼ばれない)。
+    g_body_dv.update(dt_s, g_att.roll, g_att.pitch,
+                     g_att.acc_x, g_att.acc_y, g_att.acc_z);
 
     if (!armed) { stopAllMotors(); return; }
 
@@ -2744,23 +2806,22 @@ void loop() {
     const float thr_now  = S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f;
 
     // --- モード表示 LED (pin 5/6/9) -----------------------------------
-    //  赤=DISARM  青(点灯)=ARMED+ANGLE(手動)
-    //  緑(ゆっくり点滅)=POSHOLD/ALTHOLD  緑(速く点滅)=GUIDED  緑(点灯)=その他。
-    //  ★ コモンアノード＋共通抵抗の配線なので混色(白/黄)は出せない。
-    //    Vf 最小の赤ダイが電流を独占するため。単色3つで区別する。
+    //  黄(点灯)=スロットルカット(DISARM)  赤(点灯)=ARMED+ANGLE(手動)
+    //  青(点滅)=POSHOLD/ALTHOLD  緑(点滅)=GUIDED  緑(点灯)=その他。
+    //  ★ 各色個別抵抗の配線に変更済みなので混色(黄)も問題なく出せる。
     //  digitalWrite 3本だけなので毎ループ呼んでも制御ループへの影響は無視できる。
     if (!armed_now) {
-        StatusLed::red();
+        StatusLed::yellow();
     } else if (g_mode == S5::MODE_AUTO) {
         const bool blink_on = (millis() / 125) % 2 == 0;   // 4Hz 点滅: GUIDED
         if (blink_on) StatusLed::green();
         else          StatusLed::off();
     } else if (g_mode == S5::MODE_POSHOLD || g_mode == S5::MODE_ALTHOLD) {
         const bool blink_on = (millis() / 250) % 2 == 0;   // 2Hz 点滅: POSHOLD/ALTHOLD
-        if (blink_on) StatusLed::green();
+        if (blink_on) StatusLed::blue();
         else          StatusLed::off();
     } else if (g_mode == S5::MODE_ANGLE) {
-        StatusLed::blue();
+        StatusLed::red();
     } else {
         StatusLed::green();
     }

@@ -38,14 +38,15 @@
 //    A = 高度ループ + 姿勢角
 //    B = 水平位置ループ
 //    C = 姿勢ループの内部 (モーター出力 / 角速度 実測・目標 / ミキサー飽和)
+//    D = ヨー推定用の機体Δv (地上局ガイド飛行のヨー保持に使う)
 //    P = ゲイン一覧 (数秒に1回、枠を1つ borrow する)
 //
 //  ★ 送る順番はモードで変える (drone_s5.cpp の S5Tel::tick):
 //      ANGLE / RATE  … A,C の交互          (各 7.5Hz)
-//        B(水平位置) は POSHOLD 以外では全部 0 なので送っても無駄。
+//        B(水平位置)/D(Δv) は POSHOLD 以外では意味が薄いので送らない。
 //        代わりに C を厚くして、離陸時の転倒やモーター飽和を追えるようにする。
-//      POSHOLD/AUTO  … A,B,A,C の4枠巡回   (A 7.5Hz / B 3.75Hz / C 3.75Hz)
-//        位置ループは 0.3〜1Hz なので 3.75Hz あれば足りる。
+//      POSHOLD/AUTO  … A,B,D,A,C の5枠巡回  (A 6Hz / B,D,C 各3Hz)
+//        位置ループは 0.3〜1Hz、ヨー推定も1Hz未満の窓なので 3Hz で足りる。
 //
 //  ★ 送信は必ず非同期 (S5T::Tx::service)。HardwareSerial::print を直接
 //    呼ぶと TXバッファ(40B)が溢れた時点でブロックし、1000Hz の制御
@@ -61,9 +62,12 @@
 namespace S5T {
 
 // 構造体を変えたら必ずインクリメントすること (地上局が不一致を検出する)
-// VERSION 7 (2026-09-14): TYPE_ACK / AckFrame を削除 (IM920での単発
-//   メンテナンス指令をやめ、BLE専用にしたため。詳細は S5Cmd.h 参照)。
-constexpr uint8_t VERSION = 7;
+// VERSION 8 (2026-09-15): TYPE_DV / DvFrame を追加 (ヨー推定用の機体Δv。
+//   position_estimator/YAW_HANDOFF.md §8-3, S5Cmd.h の yaw_abs_cdeg と対)。
+//   これに合わせて長さチェックを type ごとの可変長にした
+//   (payloadBytesFor())。固定 28 byte 前提の受信側コードを触るときは
+//   ここも見ること。
+constexpr uint8_t VERSION = 8;
 
 // IM920sL の実効ペイロード上限 [byte]。これを超えると黙って切られる。
 constexpr size_t IM920SL_MAX_PAYLOAD = 32;
@@ -73,6 +77,7 @@ constexpr size_t PACKET_BYTES        = IM920SL_MAX_PAYLOAD - CHECKSUM_BYTES;  //
 constexpr uint8_t TYPE_ALT   = 0x41;  // 'A'  高度ループ + 姿勢
 constexpr uint8_t TYPE_POS   = 0x42;  // 'B'  水平位置ループ
 constexpr uint8_t TYPE_ATT   = 0x43;  // 'C'  姿勢ループ内部 (モーター出力/レート)
+constexpr uint8_t TYPE_DV    = 0x44;  // 'D'  ヨー推定用の機体Δv
 constexpr uint8_t TYPE_PARAM = 0x50;  // 'P'  ゲイン一覧
 
 // ---- 量子化スケール (物理値 = 整数値 / SC_xxx) ----
@@ -199,6 +204,32 @@ struct __attribute__((__packed__)) AttFrame {
 static_assert(sizeof(AttFrame) == PACKET_BYTES, "AttFrame が 28 byte ではありません");
 
 // ------------------------------------------------------------
+//  D: ヨー推定用の機体Δv
+// ------------------------------------------------------------
+//  position_estimator の yaw_estimator が、カメラのΔv (フィールド座標) と
+//  この機体Δv (FRD の前+右+) を突き合わせて機首の絶対方位を求める
+//  (YAW_HANDOFF.md 参照)。中身は「重力を除去した水平加速度」を、
+//  直前にこのフレームを送ってからの経過時間ぶん積分した値 = 速度変化。
+//
+//  ★ 積分窓は固定 200ms ではなく可変長 (前回の D 送信から今回まで)。
+//    送信頻度はモードで変わる (S5Tel::tick) ため、固定長にすると実際の
+//    積分区間とズレる。地上側は h.t_cs (このフレームの送信時刻 = 窓の
+//    終端) をそのまま使えばよい (窓の開始は特に要らない。PC側
+//    yaw_estimator は複数フレームを跨いで合成する)。
+//  ★ yaw_dd は AltFrame と同じ量 (g_yaw_est) だが、Δv とちょうど同じ
+//    瞬間の値をペアで送る (旋回ゲート判定の精度のため。AltFrame は
+//    別の巡回スロットで届くので厳密に同時刻にならない)。
+//  ★ A/B/C と違って 28 byte ちょうどにしていない (中身が少ないので
+//    無駄に埋めない)。payloadBytesFor() が type ごとに正しい長さを返す。
+struct __attribute__((__packed__)) DvFrame {
+    Header  h;                 //  6
+    int16_t dvx_mmps;          //  8  重力除去後のΔv 前+ [mm/s]
+    int16_t dvy_mmps;          // 10  同 右+ [mm/s]
+    int16_t yaw_dd;            // 12  この瞬間の g_yaw_est [0.1 deg]
+};
+static_assert(sizeof(DvFrame) <= PACKET_BYTES, "DvFrame が 28 byte を超えています");
+
+// ------------------------------------------------------------
 //  P: ゲイン一覧  (28 byte)
 //    シリアル 'p' メニューで飛行中に変えられる値があるので、CSV だけ
 //    見て「どのゲインの結果か」が分かるようにするため数秒に1回混ぜる。
@@ -245,6 +276,24 @@ enum AckResult : uint8_t {
     ACK_CAL_REJECTED   = 2,  // IMU_CAL は実行したが、妥当性チェックで却下された
                              // (機体が水平/静止していなかった。値は変えていない)
 };
+
+// ------------------------------------------------------------
+//  type ごとの想定ペイロード長
+// ------------------------------------------------------------
+//  ★ 以前は「全フレーム固定 28 byte」を前提に、受信側が type を見る前に
+//    長さだけで弾いていた。DvFrame は 28 byte 未満なので、type を見て
+//    から期待長を引くようにした。未知の type には 0 を返すので、
+//    呼び出し側は 0 を「弾く」扱いにすること。
+inline size_t payloadBytesFor(uint8_t type) {
+    switch (type) {
+        case TYPE_ALT:   return sizeof(AltFrame);
+        case TYPE_POS:   return sizeof(PosFrame);
+        case TYPE_ATT:   return sizeof(AttFrame);
+        case TYPE_DV:    return sizeof(DvFrame);
+        case TYPE_PARAM: return sizeof(ParamFrame);
+    }
+    return 0;
+}
 
 // ------------------------------------------------------------
 //  量子化ヘルパ (飽和付き)

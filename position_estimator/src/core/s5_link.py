@@ -294,7 +294,8 @@ class S5Link:
             self._say(f"[S5Link] 送信エラー: {e}")
 
     def send_command(self, req, vx_mps=0.0, vy_mps=0.0, alt_m=0.0,
-                     yaw_rate_dps=0.0, flags=0, corr_n_m=None, corr_e_m=None):
+                     yaw_rate_dps=0.0, flags=0, corr_n_m=None, corr_e_m=None,
+                     yaw_abs_deg=None):
         """
         上りコマンドを 1 行送る。
 
@@ -337,6 +338,11 @@ class S5Link:
         if corr_n_m is not None and corr_e_m is not None:
             parts.append(str(int(round(corr_n_m * 1000.0))))
             parts.append(str(int(round(corr_e_m * 1000.0))))
+        if yaw_abs_deg is not None:
+            # yaw は末尾。位置補正を使わない回も、途中の2項を0で埋める。
+            while len(parts) < 9:
+                parts.append("0")
+            parts.append(str(int(round(yaw_abs_deg * 100.0))))
         self._write_raw(",".join(parts) + "\n")
 
     def send_key(self, ch):

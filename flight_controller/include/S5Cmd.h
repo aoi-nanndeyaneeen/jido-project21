@@ -59,7 +59,7 @@ namespace S5C {
 // VERSION 4 (2026-09-14): action/action_seq を削除 (IM920は操縦専用に戻し、
 //   単発メンテナンス指令はBLE経由に限定したため。下の Action 列挙子の
 //   コメント参照)。
-constexpr uint8_t VERSION = 4;
+constexpr uint8_t VERSION = 5;  // camera absolute-yaw field added
 
 // 下りテレメトリ (S5T) の type と衝突しない値。'K' = command
 constexpr uint8_t MAGIC = 0x4B;
@@ -157,8 +157,9 @@ struct __attribute__((__packed__)) CmdFrame {
     uint16_t flags;         // 14  CmdFlag
     int16_t  corr_n_mm;     // 16  位置補正の絶対目標 pos_n [mm]。CF_POS_CORR 時のみ有効
     int16_t  corr_e_mm;     // 18  同 pos_e [mm]
+    int16_t  yaw_abs_cdeg;  // 20  カメラ絶対ヨー [0.01 deg]。CF_YAW_VALID 時のみ
 };
-static_assert(sizeof(CmdFrame) == 18, "CmdFrame は 18 byte");
+static_assert(sizeof(CmdFrame) == 20, "CmdFrame は 20 byte");
 static_assert(sizeof(CmdFrame) + CHECKSUM_BYTES <= IM920SL_MAX_PAYLOAD,
               "IM920sL の 32 バイト制限を超えています");
 
@@ -175,6 +176,7 @@ constexpr float SC_MMPS = 1000.0f;   // 1 mm/s
 constexpr float SC_CM   = 100.0f;    // 1 cm
 constexpr float SC_CDPS = 100.0f;    // 0.01 deg/s
 constexpr float SC_MM   = 1000.0f;   // 1 mm (位置補正用)
+constexpr float SC_CDEG = 100.0f;    // 0.01 deg (カメラ絶対ヨー)
 
 inline int16_t q16(float v, float scale) {
     const float x = v * scale;

@@ -266,7 +266,8 @@ class WaypointMission:
         if self.verbose:
             print(f"[Mission] {msg}")
 
-    def _send(self, req, vx_mps=0.0, vy_mps=0.0, alt_m=0.0, flags=0):
+    def _send(self, req, vx_mps=0.0, vy_mps=0.0, alt_m=0.0, flags=0,
+              yaw_rad=None):
         """送信と記録を必ずセットで行う。link.send_command() を直接呼ばないこと。"""
         # 保留中の位置補正があれば、この送信1回にだけ乗せて消費する。
         # どのフェーズの _send() 呼び出しに乗るかは問わない
@@ -287,7 +288,10 @@ class WaypointMission:
         self._n_tx += 1
         self.link.send_command(req, vx_mps=vx_mps, vy_mps=vy_mps,
                                alt_m=alt_m, flags=flags,
-                               corr_n_m=corr_n, corr_e_m=corr_e)
+                               corr_n_m=corr_n, corr_e_m=corr_e,
+                               yaw_abs_deg=(math.degrees(yaw_rad)
+                                            if yaw_rad is not None and (flags & CF_YAW_VALID)
+                                            else None))
 
     def n_tx(self):
         return self._n_tx
@@ -377,7 +381,7 @@ class WaypointMission:
             # 機体が GUIDED に入るまで HOLD を送り続ける。
             #  入れない理由 (SW_AUTO が下 / フローが死んでいる / 未アーム) は
             #  機体側のシリアル画面に出る。ここでは待つだけ。
-            self._send(REQ_HOLD, flags=flags)
+            self._send(REQ_HOLD, flags=flags, yaw_rad=yaw_rad)
             if self.link.flag("guided"):
                 dev_yaw = st.get("yaw")
                 if self._yaw_src != "camera":
@@ -406,7 +410,8 @@ class WaypointMission:
             return
 
         if self.phase is Phase.TAKEOFF:
-            self._send(REQ_TAKEOFF, alt_m=self.TAKEOFF_ALT_M, flags=flags)
+            self._send(REQ_TAKEOFF, alt_m=self.TAKEOFF_ALT_M, flags=flags,
+                       yaw_rad=yaw_rad)
             if abs(h_agl - self.TAKEOFF_ALT_M) < self.TAKEOFF_TOL_M:
                 # 離陸地点を覚える (RTL の戻り先)。カメラが見えていれば実測。
                 if self.home is None and pos is not None:
@@ -427,18 +432,18 @@ class WaypointMission:
             # ヘディングが分からないと「前」がどっちか分からない。
             #  この状態で速度を出すと 90 度ずれた方向へ飛ぶので、必ず止める。
             if not yaw_valid or yaw_rad is None or not pos_valid or pos is None:
-                self._send(REQ_HOLD, alt_m=target[2], flags=flags)
+                self._send(REQ_HOLD, alt_m=target[2], flags=flags, yaw_rad=yaw_rad)
                 return
 
             if self.phase is Phase.DWELL:
-                self._send(REQ_HOLD, alt_m=target[2], flags=flags)
+                self._send(REQ_HOLD, alt_m=target[2], flags=flags, yaw_rad=yaw_rad)
                 if now - self._t_phase >= self.DWELL_S:
                     self._advance()
                 return
 
             vx, vy = self._velocity_command(pos, target, yaw_rad)
             self._send(REQ_GUIDED, vx_mps=vx, vy_mps=vy,
-                       alt_m=target[2], flags=flags)
+                       alt_m=target[2], flags=flags, yaw_rad=yaw_rad)
 
             dh = self._dist_h
             dz = abs(target[2] - h_agl)
@@ -449,7 +454,7 @@ class WaypointMission:
             return
 
         if self.phase is Phase.LAND:
-            self._send(REQ_LAND, flags=flags)
+            self._send(REQ_LAND, flags=flags, yaw_rad=yaw_rad)
             if self.link.flag("landed"):
                 self._goto(Phase.DONE)
                 self._say("着陸完了。THR_CUT でディスアームしてください"

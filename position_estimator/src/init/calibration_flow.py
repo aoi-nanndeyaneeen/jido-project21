@@ -441,6 +441,11 @@ def _calibrate_camera(label, source, available, fallback_pos, fallback_cam):
     if cam is None:
         return dummy("[WARN] 映像の接続に失敗しました")
 
+    # ★ 保存済みを使っても、静的フィルタは毎回ゼロから再学習する。
+    #   これにより、前回のマスクが残ったまま「y でスキップ」してしまうのを防ぐ。
+    cam.reset_background()
+    print(f"  [{label}] 静的フィルタを初期化して再学習を開始")
+
     _check_resolution(label, cam, w, h)
     return K, dist, R, tvec, points, cam
 

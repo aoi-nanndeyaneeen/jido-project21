@@ -53,9 +53,9 @@ def run_main_loop(cam1, cam2,
     if yaw_est is not None:
         print(f"[Yaw] 推定を有効化 (初期アラインメント "
               f"{YAW_INITIAL_ALIGN_DEG:+.1f}deg = 機首をフィールド奥+yへ)")
-        if alt_sensor is None:
-            print("[Yaw] [WARN] シリアル未接続のため機体Δvが届きません。"
-                  "ヨーは初期アラインメント値のまま固定されます。")
+        print("[Yaw] 機体Δvは地上局リンク (S5Link, IM920のDフレーム) から受け取ります。"
+              "GROUND_LINK_ENABLED=False またはリンク未接続だと収束しません "
+              "(この下の [INIT] 地上局... を見てください)")
 
     print()
     print("=" * 56)
@@ -169,6 +169,12 @@ def run_main_loop(cam1, cam2,
 
     # 「初期アラインメントで飛んでいます」の警告を1回だけ出すための箱
     _warned_fixed_yaw = [False]
+    # 直近に yaw_est へ渡した D フレームの t_ms。同じ値を2回渡さないための重複排除。
+    #  ★ S5Link.state() は「最新のCSV行」のスナップショットを返すだけで
+    #    キューではない。ここのポーリング周期(カメラフレーム毎)は
+    #    D フレームの送信周期(POSHOLD/AUTOで3Hz)よりずっと速いので、
+    #    取りこぼしはほぼ無い。
+    _last_dv_t_ms = [None]
 
     last_mpl_render = 0.0
     MPL_RENDER_HZ   = 5
@@ -194,6 +200,24 @@ def run_main_loop(cam1, cam2,
         if yaw_est is not None:
             if updated and frame_time > 0.0:
                 yaw_est.add_position(frame_time, P, tracking_ok)
+
+            # ★ 本命: S5Link (IM920 の D フレーム、drone_s5.cpp が計算)。
+            #   GROUND_LINK_ENABLED の通常運用ではこちらだけが動く。
+            if link is not None and link.ok:
+                st = link.state()
+                if st.get("frame") == 3:      # 0:A 1:B 2:C 3:D (s5_log.cpp)
+                    t_ms = st.get("t_ms")
+                    dvx  = st.get("dvx")
+                    dvy  = st.get("dvy")
+                    if (t_ms is not None and dvx is not None and dvy is not None
+                            and t_ms != _last_dv_t_ms[0]):
+                        _last_dv_t_ms[0] = t_ms
+                        yaw_est.add_body_dv(int(t_ms), float(dvx), float(dvy),
+                                            yaw_body=st.get("dv_yaw"))
+
+            # ★ 旧経路: main_pc.cpp 世代の別シリアル接続 (SERIAL_ENABLED)。
+            #   現行の drone_s5.cpp では使わないが、レガシー機体での
+            #   動作確認用に残している。
             if alt_sensor is not None:
                 body_yaw = alt_sensor.get_body_yaw()
                 for (t_ms, dvx, dvy, t_recv) in alt_sensor.drain_body_dv():
