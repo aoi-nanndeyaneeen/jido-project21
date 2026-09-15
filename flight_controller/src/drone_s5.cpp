@@ -680,6 +680,14 @@ enum GuidedPhase : uint8_t {
 GuidedPhase g_gp = GP_OFF;
 
 bool  g_guided_engaged = false;  // GUIDED に入っているか (selectMode が見る)
+// ★ 2026-09-16: 自動着陸完了のラッチ。GP_LANDED は guidedDisengage() で
+//   GP_OFF に消えるため、着陸後に地上でフローが「死んだ」判定になった瞬間に
+//   解除→再エンゲージ→高度ホールドが再起動→モーターが回って機体が跳ねる
+//   (00:33:30、roll 13度/pitch 18度)。このラッチは g_gp とは別に持ち、
+//   ディスアーム、または SW_HOVER を一度下げてから上げ直す (= 次の便の
+//   意思表示) まで解けない。立っている間は出力 0・GUIDED 再突入なし。
+bool  g_landed_latch   = false;
+bool  g_sw_hover_was_up = false;
 float g_guided_vx      = 0.0f;   // 機体座標の目標速度 前+ [m/s]
 float g_guided_vy      = 0.0f;   // 同 右+ [m/s]
 float g_guided_alt_m   = 0.0f;   // 目標対地高度 [m] (0 = 指令なし)
@@ -1723,7 +1731,21 @@ static void updateGuided() {
     const uint32_t now = millis();
 
     // --- 0) 入る資格があるか (毎ループ全部見る) ----------------------
-    if (!isArmed())                     { guidedDisengage("ディスアーム");        return; }
+    if (!isArmed())                     { guidedDisengage("ディスアーム");
+                                          g_landed_latch = false;              return; }
+    {
+        const bool sw_up = (sbus.Ch_state(Ch::SW_HOVER) == up);
+        if (g_landed_latch && sw_up && !g_sw_hover_was_up) {
+            g_landed_latch = false;      // 下げてから上げ直した = 次の便
+            Serial.println("\n>>> 着陸ラッチ解除 (SW_HOVER 上げ直し)");
+        }
+        g_sw_hover_was_up = sw_up;
+    }
+    if (g_landed_latch) {
+        g_gp = GP_LANDED;                // updateControl() が出力 0 にする
+        g_guided_vx = g_guided_vy = 0.0f;
+        return;
+    }
     if (!S5::USE_SBUS)                  { guidedDisengage("SBUS 無効");           return; }
     // ★ 2026-09-13: ch6 (旧 SW_AUTO) の物理スイッチが破損したため、
     //   GUIDED の入り口は SW_HOVER(ch8)=up の1本に統合した。
@@ -1802,6 +1824,7 @@ static void updateGuided() {
                              (now - g_land_start_ms >= Q::GUIDED_LAND_TIMEOUT_MS);
         if (touched || timeout) {
             g_gp = GP_LANDED;
+            g_landed_latch = true;
             g_guided_vx = g_guided_vy = 0.0f;
             Serial.printf("\n>>> 着陸完了 (%s)。出力を切りました。"
                           "THR_CUT でディスアームしてください\n",
