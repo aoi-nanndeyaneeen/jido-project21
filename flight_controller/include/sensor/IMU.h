@@ -211,7 +211,9 @@ public:
     //  ★ 2026-09-14: 遠隔からの再キャリブレーション (drone_s5.cpp
     //    handleRemoteAction()) が、拒否されたことを地上局へ伝えるために
     //    戻り値を見る。シリアル 'k' は従来どおり画面のメッセージだけ見る。
-    bool recalibrate() {
+    //  onProgress: サンプリング中に定期的に呼ばれる (LED演出などの視覚フィードバック用)。
+    //    省略可。呼び出し頻度は samples 内部で決める実装依存。
+    bool recalibrate(void (*onProgress)() = nullptr) {
         Serial.println("INFO: MPU6050 Recalibration (ax=0, ay=0, az=1 mode)...");
         
         // 却下したときに戻せるよう、今の値を退避しておく
@@ -250,6 +252,7 @@ public:
             min_gy = fminf(min_gy, gyv);  max_gy = fmaxf(max_gy, gyv);
             min_gz = fminf(min_gz, gzv);  max_gz = fmaxf(max_gz, gzv);
             if (i % 100 == 0) Serial.print(".");
+            if (onProgress && (i % 40 == 0)) onProgress();
             delay(2);
         }
         Serial.println(" Done.");

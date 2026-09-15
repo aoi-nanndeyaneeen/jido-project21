@@ -2544,6 +2544,18 @@ static void printStatus(uint32_t dt_us) {
 // ============================================================
 //  § 10  setup / loop
 // ============================================================
+// ---- 起動時レインボー演出 ----------------------------------------------
+//  StatusLed はコモンアノードRGB(PWM無し)なので出せる色は8色だけ。
+//  呼ばれるたびに次の色へ進めることで「何か処理が進行中」を示す疑似レインボー。
+//  自動キャリブレーション (setup() 末尾) の待機中・実行中に使う。
+static void statusLedRainbowStep() {
+    static void (*const colors[])() = { StatusLed::red,  StatusLed::yellow, StatusLed::green,
+                                         StatusLed::cyan, StatusLed::blue,   StatusLed::magenta };
+    static uint8_t idx = 0;
+    colors[idx]();
+    idx = (idx + 1) % (sizeof(colors) / sizeof(colors[0]));
+}
+
 void setup() {
     StatusLed::begin();   // 他の初期化より先に。起動直後から状態が見えるように
     BlinkLed::begin();
@@ -2681,6 +2693,40 @@ void setup() {
     SelfTest::printFull(Serial);
 
     resetControllers();
+
+    // ---- 電源投入 5秒後: 自動で 'k'+'r'+'z' を実行 ------------------------
+    //  毎回手で押していた「水平キャリブレーション → PIDリセット → フロー積算
+    //  ゼロ」を、機体を水平に置いたまま待つだけで済むようにする。
+    //  ★ 安全のため、待機中にアームされたら中止する ('k' はモーターを
+    //    止めて校正へ入るので、飛行中に走らせてはいけない)。
+    //  待機中〜実行中は StatusLed を疑似レインボーにして「何か処理中」を
+    //  分かりやすくする (完了後は通常のモード表示 LED に戻る)。
+    {
+        Serial.println("\n>>> 5秒後に自動キャリブレーション (k -> r -> z) を実行します。"
+                       "機体を水平に置いて動かさないでください (アームすると中止)");
+        const uint32_t wait_start = millis();
+        bool aborted = false;
+        while (millis() - wait_start < 5000) {
+            if (isArmed()) {
+                aborted = true;
+                Serial.println(">>> アーム検出: 自動キャリブレーションを中止します");
+                break;
+            }
+            statusLedRainbowStep();
+            delay(60);
+        }
+        if (!aborted) {
+            Serial.println(">>> 自動キャリブレーション実行中 (k -> r -> z)...");
+            stopAllMotors();
+            if (S5::USE_MPU) mpu.recalibrate(statusLedRainbowStep);   // 'k'
+            resetControllers();                                      // 'r'
+            g_flow_acc_raw_x = g_flow_acc_raw_y = 0.0;                // 'z'
+            g_flow_acc_px_x  = g_flow_acc_px_y  = 0.0;
+            g_flow_acc_m_x   = g_flow_acc_m_y   = 0.0;
+            Serial.println(">>> 自動キャリブレーション完了 (k/r/z)");
+        }
+        StatusLed::off();
+    }
 
     // 全 Ticker の基準時刻をここでそろえる。これが無いと初回 ready() の
     // dt_us が「起動からの経過時間」になり、その dt で積分が一気に進む。
@@ -2829,8 +2875,14 @@ void loop() {
 
     // --- 機体検出用 LED (pin 21/22/23): 白色 6Hz 点滅 --------------------
     // 6Hz は1周期約167ms、50% dutyなので約83msごとにON/OFFする。
-    const bool detection_led_on = (millis() % 167u) < 83u;
-    BlinkLed::white(detection_led_on);
+    // ★ ディスアーム中は点滅を止める (消灯)。動いていない機体が光り続ける
+    //   必要はなく、アームの目印としても分かりやすいため。
+    if (armed_now) {
+        const bool detection_led_on = (millis() % 167u) < 83u;
+        BlinkLed::white(detection_led_on);
+    } else {
+        BlinkLed::white(false);
+    }
 
     if (g_sd_ok) {
         static bool s_sd_was_armed = false;
