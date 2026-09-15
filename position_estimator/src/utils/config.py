@@ -528,18 +528,18 @@ POS_CORR_MAX_STEP_M = 0.4
 POS_CORR_TRACK_TOL_M = 0.15  # この範囲に収まっていれば「同じズレ」とみなす
 POS_CORR_CONFIRM_S   = 1.0   # この秒数、同じズレが続いたら補正してよいと判断する
 
-# Phase 6: 1.8m x 2.6m フィールドでの正方形一周 (2026-09-15 23:00〜 再開)。
+# Phase 6: 1.8m x 2.6m フィールドでの正方形 (2026-09-15 23:59 に1周成功)。
 # 経路の先頭には core/mission.py が自動でフィールド中心 (0,0) を挟むので、
-# ここには中心を含めない。1周後に開始点へ戻ってくるよう最後にもう一度
-# 最初のコーナーを入れてある (ミッション5 = ミッション1)。全部回ったら
+# ここには中心を含めない。MISSION_LAPS 周したあと最初のコーナーで閉じ、
 # 離陸地点 (アーム中に地上で見えていた位置) へ戻って自動着陸する。
-MISSION_WAYPOINTS = [
-    ( 0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # ミッション1
-    ( 0.5,  0.5, MISSION_TAKEOFF_ALT_M),   # ミッション2
-    (-0.5,  0.5, MISSION_TAKEOFF_ALT_M),   # ミッション3
-    (-0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # ミッション4
-    ( 0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # ミッション5 (ミッション1と同一点で一周を閉じる)
+MISSION_SQUARE_CORNERS = [
+    ( 0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # 1: 手前右
+    ( 0.5,  0.5, MISSION_TAKEOFF_ALT_M),   # 2: 奥右
+    (-0.5,  0.5, MISSION_TAKEOFF_ALT_M),   # 3: 奥左
+    (-0.5, -0.5, MISSION_TAKEOFF_ALT_M),   # 4: 手前左
 ]
+MISSION_LAPS = 3
+MISSION_WAYPOINTS = MISSION_SQUARE_CORNERS * MISSION_LAPS + [MISSION_SQUARE_CORNERS[0]]
 # Phase 5 (中心から奥へ1点だけ) に戻すときはこちら:
 # MISSION_WAYPOINTS = [(0.0, 1.0, MISSION_TAKEOFF_ALT_M)]
 # Phase 4 (WP なし。離陸 -> 中心 -> 帰投 -> 着陸だけ。2026-09-15 に成功率確認済み):
