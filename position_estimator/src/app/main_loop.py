@@ -7,6 +7,8 @@ app/main_loop.py
 import cv2
 import math
 import numpy as np
+import os
+import signal
 import threading
 import time
 import msvcrt
@@ -72,6 +74,18 @@ def run_main_loop(cam1, cam2,
 
     shared = {"do_bg_reset": False, "quit": False,
               "mission_request": None}
+
+    # ★ Ctrl+C は例外で抜けずに [Q] と同じ終了処理へ通す。例外で抜けると
+    #   ミッション中断・リンクの ABORT・カメラ解放が飛ばされ、2026-09-15 には
+    #   プロセスが裏に残ってカメラと COM を掴み続け、次の起動がカメラ2を
+    #   開けずに止まった。2回押したら終了処理を待たずに強制終了する。
+    def _on_sigint(signum, frame):
+        if shared["quit"]:
+            print("\n[Main] Ctrl+C 2回目 → 強制終了")
+            os._exit(1)
+        print("\n[Main] Ctrl+C → 終了処理に入ります (もう一度押すと強制終了)")
+        shared["quit"] = True
+    signal.signal(signal.SIGINT, _on_sigint)
 
     # ── ウィンドウ作成 ──────────────────────────────────────
     cv2.namedWindow("Camera 1", cv2.WINDOW_NORMAL)
@@ -481,6 +495,7 @@ def run_main_loop(cam1, cam2,
     velocity_view.close()
     link_view.close()
     display_perf_log.close()
+    cam_thread.join(timeout=2.0)   # カメラを解放する前に追跡スレッドを止める
     cv2.destroyAllWindows()
     for _ in range(10):
         cv2.waitKey(1)

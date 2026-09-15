@@ -308,7 +308,10 @@ class WaypointMission:
         self._t_phase = time.time()
 
     def _say(self, msg):
-        self._pending_event = msg
+        # ログが読み出す前に次の _say が来ても消さない (同じ送信周期で
+        # 「GUIDED に入りました」と「離陸完了」が続くと前者が消えていた)。
+        self._pending_event = (f"{self._pending_event} / {msg}"
+                               if self._pending_event else msg)
         if self.verbose:
             print(f"[Mission] {msg}")
 

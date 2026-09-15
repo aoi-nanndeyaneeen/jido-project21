@@ -60,9 +60,30 @@ def main():
         cam2.release()
         return
 
-    run_main_loop(cam1, cam2, calib1, calib2,
-                  log_path, alt_sensor, FIELD_POINTS)
+    try:
+        run_main_loop(cam1, cam2, calib1, calib2,
+                      log_path, alt_sensor, FIELD_POINTS)
+    finally:
+        for cam in (cam1, cam2):
+            try:
+                cam.release()
+            except Exception as e:
+                print(f"  [WARN] カメラ解放に失敗: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    import os
+    import sys
+    import traceback
+    exit_code = 0
+    try:
+        main()
+    except BaseException:
+        traceback.print_exc()
+        exit_code = 1
+    # ★ 後始末は main() で済んでいる。Windows ではカメラ読み込み中の daemon
+    #   スレッドがあるとインタプリタ終了が固まり、カメラ/COM を掴んだまま
+    #   プロセスが残ることがあった。ログは各行 flush 済みなので強制終了してよい。
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exit_code)
