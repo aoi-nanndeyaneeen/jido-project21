@@ -120,13 +120,28 @@ public:
     //    (log_037 で実測: fresh 116点の平均間隔 65.0ms)。
     //    ここで fresh 間の経過を自前で積算し、それを PID の dt にする。
     // ------------------------------------------------------------
+    //    ground_start: 測距が「近すぎて無効」(機体が地面に置かれている) で、
+    //                  かつ地上局から目標高度が来ている。h=0・climb=0 とみなして
+    //                  engage し、地上から自動離陸する (2026-09-15 23:21:
+    //                  REQ_TAKEOFF を 14秒送っても NoRange のまま engage せず、
+    //                  パイロットがスティックで浮かせて初めて引き継いだ)。
+    //                  測距が有効になった瞬間から通常動作。
     void update(float dt_s, bool enabled, bool armed, bool poshold,
                 bool range_valid, bool fresh,
                 float h_m, float climb_mps, float thr_stick,
-                float thr_applied = -1.0f) {
+                float thr_applied = -1.0f, bool ground_start = false) {
 
         // fresh 間の経過時間。release() されるまで積み続ける。
         if (dt_s > 0.0f) _dt_since_fresh += dt_s;
+
+        // 地上からの自動離陸: 測距が近すぎて無効な間は「高度 0 で静止」として扱う。
+        //  _airborne が立つ (= 一度でも測距で浮いたと分かった) 後は使わない。
+        if (!range_valid && ground_start && _cmd_on && !_airborne) {
+            range_valid = true;
+            fresh       = true;
+            h_m         = 0.0f;
+            climb_mps   = 0.0f;
+        }
 
         // --- 1) engage を外す条件を「理由つき」で順に見る -------------
         //   release() = スロットルをプロポの値に戻す。

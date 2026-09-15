@@ -130,6 +130,7 @@ public:
         _last_new_ms = now;
 
         // --- 外れ値判定 ---
+        _too_close = (status_ok && slant_m < _min_m);
         if (!status_ok || slant_m < _min_m || slant_m > _max_m) {
             if (_have_h) _bad_ms += (now - _last_ms);
             _last_ms = now;
@@ -137,6 +138,7 @@ public:
             return false;
         }
         _raw_m = slant_m;
+        _too_close = false;
 
         // --- 傾き補正: 斜め距離 → 鉛直高度 ---
         //  大きく傾いている間は測距点が横にずれて信用できないので前回値を保持。
@@ -183,6 +185,9 @@ public:
 
     // 直近の結果 -------------------------------------------------
     bool  valid()    const { return _ok_init && _have_h; }  // 高度が信用できるか
+    // 直近サンプルが「センサは応答しているが RANGE_MIN_M 未満」= 地面に置いてある。
+    // AltHold の地上からの自動離陸 (ground_start) に使う。失探とは区別できる。
+    bool  tooClose() const { return _ok_init && _too_close; }
     float heightM()  const { return _height_m; }            // 鉛直対地高度 [m]
     float climbMps() const { return _vz_mps; }              // 上昇速度 [m/s] (上 +)
     float rawM()     const { return _raw_m; }               // 傾き補正前の斜め距離 [m]
@@ -221,6 +226,7 @@ private:
     float    _height_m = 0.0f;
     float    _vz_mps   = 0.0f;
     float    _min_m    = 0.03f;
+    bool     _too_close = false;
     float    _max_m    = 3.5f;
     uint32_t _last_ms      = 0;   // 直近「サンプルを見た」時刻 (bad_ms の積算用)
     uint32_t _last_h_ms    = 0;   // 直近「_height_m を更新した」時刻 (climb 用 dt)

@@ -1587,7 +1587,11 @@ static void updateAltHold(float dt_s) {
                    g_range_h_m,
                    climb,
                    thr,
-                   thr_applied);
+                   thr_applied,
+                   // 地上からの自動離陸 (AltHold::update の ground_start 参照)。
+                   //  GUIDED で目標高度が来ていて、測距が「近すぎて無効」の間だけ。
+                   g_mode == S5::MODE_AUTO && g_guided_alt_m > 0.0f
+                       && rangefinder.tooClose());
 }
 
 // ------------------------------------------------------------
