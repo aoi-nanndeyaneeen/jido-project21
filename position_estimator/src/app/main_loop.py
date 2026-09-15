@@ -472,13 +472,18 @@ def run_main_loop(cam1, cam2,
     #  ★ リンクを閉じる前に必ずミッションを止める。close() が ABORT を
     #    送るので機体は自動着陸へ落ちるが、飛行中に Q を押した場合は
     #    それでも「降りてくるまで見ていること」。
-    if mission is not None and mission.phase not in (MissionPhase.IDLE,
-                                                     MissionPhase.DONE):
+    #  ★ 2026-09-16: 機体が既にディスアーム済み/地上なら待たない。以前は
+    #    着陸後に Q を押しても「着陸完了」が来ない (ディスアーム済みなので
+    #    landed が立たない) まま 20 秒待ち、その間 ACK を延々と表示していた。
+    in_air = (link is not None and link.ok and link.n_data() > 0
+              and link.flag("armed") and link.flag("airborne"))
+    if (mission is not None and in_air
+            and mission.phase not in (MissionPhase.IDLE, MissionPhase.DONE)):
         print("[Mission] 終了要求 → 自動着陸を指示します。着地を見届けてください")
         mission.abort("プログラム終了")
         for _ in range(200):                 # 最大 20 秒だけ着陸に付き合う
             mission.update()
-            if mission.phase is MissionPhase.DONE:
+            if mission.phase is MissionPhase.DONE or not link.flag("armed"):
                 break
             time.sleep(0.1)
     if link is not None:

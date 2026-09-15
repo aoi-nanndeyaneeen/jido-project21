@@ -220,7 +220,12 @@ class S5Link:
 
             if line.startswith("#"):
                 # 受信機からの人間向けメッセージ。切り分けに効くのでそのまま出す。
-                self._say(f"[地上局] {line[1:].strip()}")
+                #  ★ "OK"/"NG" (上り1コマンドごとの応答) は 5Hz で流れてコンソールを
+                #    埋めるので、NG だけ出す。件数は diagnostics() の STAT で分かる。
+                msg = line[1:].strip()
+                if msg == "OK":
+                    continue
+                self._say(f"[地上局] {msg}")
 
     def _parse_stat(self, line):
         """地上局が1秒ごとに出す通信カウンタを取り込む。"""

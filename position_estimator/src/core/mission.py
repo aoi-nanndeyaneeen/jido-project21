@@ -554,6 +554,11 @@ class WaypointMission:
 
         if self.phase is Phase.LAND:
             self._send(REQ_LAND, flags=flags, yaw_rad=yaw_rad)
+            if self.link.n_data() > 0 and not self.link.flag("armed"):
+                # 既にディスアーム済み (地上) なら降ろすものが無い。
+                self._goto(Phase.DONE)
+                self._say("機体はディスアーム済みです -> 終了")
+                return
             if self.link.flag("landed"):
                 self._goto(Phase.DONE)
                 self._say("着陸完了。THR_CUT でディスアームしてください"
