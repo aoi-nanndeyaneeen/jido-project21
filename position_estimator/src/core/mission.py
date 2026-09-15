@@ -59,6 +59,7 @@ from enum import Enum
 from utils.config import (MISSION_TAKEOFF_ALT_M, YAW_INITIAL_ALIGN_DEG,
                           MISSION_FENCE_X, MISSION_FENCE_Y, MISSION_FENCE_Z,
                           MISSION_FENCE_GRACE_S, MISSION_YAW_PROBE_VEL,
+                          MISSION_HOLD_AT_FIRST_WP,
                           POS_CORR_ENABLED, POS_CORR_PERIOD_S,
                           POS_CORR_MAX_STEP_M,
                           POS_CORR_TRACK_TOL_M, POS_CORR_CONFIRM_S)
@@ -185,6 +186,10 @@ class WaypointMission:
         self._t_send = 0.0
         self._t_pos_ok = 0.0
         self._returning = False     # 最後の WP を終えて home へ戻っている
+        # 保持試験モード (MISSION_HOLD_AT_FIRST_WP) の出入り記録
+        self._hold_inside = False
+        self._t_hold_in = None
+        self._t_hold_first = None
 
         # ---- 安全判定の状態 --------------------------------------------
         self._t_fly = None      # 離陸フェーズに入った時刻 (タイムアウトの起点)
@@ -245,6 +250,9 @@ class WaypointMission:
         #   より安全 (中心なら三方の壁から距離が最大になる)。
         self._path = [(0.0, 0.0, self.TAKEOFF_ALT_M)] + self.waypoints
         self._returning = False
+        self._hold_inside = False
+        self._t_hold_in = None
+        self._t_hold_first = None
         self._t_phase = now
         self._t_start = now
         self._t_pos_ok = now
@@ -468,7 +476,15 @@ class WaypointMission:
 
             dh = self._dist_h
             dz = abs(target[2] - h_agl)
-            if dh < self.ARRIVE_R_M and dz < self.ARRIVE_Z_M:
+            inside = dh < self.ARRIVE_R_M and dz < self.ARRIVE_Z_M
+            # 保持試験モード: 1点目 (CENTER) に着いても DWELL へ進まず、
+            #  カメラ位置で速度指令を出し続けてその場に留まる。DWELL は指令を
+            #  止めて機体のフロー保持に任せるので、留まれる能力の測定にならない。
+            #  抜けるのは ミッションタイムアウト / 異常検知 / [X] / スイッチ操作。
+            if MISSION_HOLD_AT_FIRST_WP and self.wp_idx == 0 and not self._returning:
+                self._note_hold(now, inside, dh)
+                return
+            if inside:
                 self._say(f"{self._label()} 到達 (残り {dh:.2f} m) -> "
                           f"{self.DWELL_S:.0f} 秒保持")
                 self._goto(Phase.DWELL)
@@ -518,6 +534,23 @@ class WaypointMission:
             self._say(f"次は {self._label()} "
                       f"({wp[0]:+.2f}, {wp[1]:+.2f}, {wp[2]:.2f})")
         self._goto(Phase.CRUISE)
+
+    def _note_hold(self, now, inside, dh):
+        """保持試験モードで、到達半径の出入りと滞在時間をイベントに残す。"""
+        if inside == self._hold_inside:
+            return
+        self._hold_inside = inside
+        if inside:
+            self._t_hold_in = now
+            if self._t_hold_first is None:
+                self._t_hold_first = now
+                self._say(f"{self._label()} 到達 (残り {dh:.2f} m) -> そのまま留まり続けます")
+            else:
+                self._say(f"{self._label()} 範囲内へ復帰 (残り {dh:.2f} m)")
+        else:
+            self._say(f"{self._label()} 範囲外へ (残り {dh:.2f} m)。"
+                      f"連続 {now - self._t_hold_in:.1f} 秒留まった / "
+                      f"初到達から {now - self._t_hold_first:.1f} 秒")
 
     def _velocity_command(self, pos, target, yaw_rad):
         """

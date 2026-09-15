@@ -524,6 +524,12 @@ POS_CORR_CONFIRM_S   = 1.0   # この秒数、同じズレが続いたら補正�
 # 経路の先頭には core/mission.py が自動でフィールド中心 (0,0) を挟むので、
 # WP を空にすれば「中心へ行って1秒保持したら、そのまま着陸」になる。
 MISSION_WAYPOINTS = []
+
+# 保持試験モード (一時的)。True だと 1点目 (CENTER) に到達したら帰投・着陸せず、
+# カメラ位置で速度指令を出し続けてその場に留まる。到達半径 (mission.py
+# ARRIVE_R_M) の出入りと滞在秒数をミッションログのイベントに残す。
+# 終了はミッションタイムアウト (MISSION_TIMEOUT_S) / 異常検知 / [X] / スイッチ。
+MISSION_HOLD_AT_FIRST_WP = True
 # Phase 5 (中心から奥へ1点だけ) に戻すときはこちら:
 # MISSION_WAYPOINTS = [(0.0, 1.0, MISSION_TAKEOFF_ALT_M)]
 # Phase 6 (1.8m x 2.6m フィールドでの正方形一周) に戻すときはこちら:
