@@ -140,6 +140,17 @@ class WaypointMission:
     # 指令レート [Hz]。XIAO が 5Hz に間引くので、それ以上送っても無駄。
     SEND_HZ = 5.0
 
+    # yaw_src が "fixed" のとき、機体自身の実測yaw(アーム基準)がこれ未満
+    # ならフル速度 (MAX_VEL) で飛ばしてよいとみなす閾値 [deg]。
+    #  ★ 2026-09-15(3): "yaw_src==camera かどうか" (=YawEstimatorが収束したか)
+    #    で速度を絞っていたが、実運用でこの推定器がほぼ収束しないため、
+    #    実害の無い(実測yawのズレが小さい)日でも巡航速度が0.15m/sに
+    #    貼り付いたままになり、中心までの到達に14秒かかった。
+    #    status_line() の「★機首ズレ疑い」と同じ 15度 を閾値に使い、
+    #    実際のズレの大きさで判断する (yaw_src の収束有無は間接的な代理
+    #    指標でしかなく、これが真に見たいリスクそのもの)。
+    YAW_FIXED_RISK_DEG = 15.0
+
     # ---- 安全 ---------------------------------------------------------
     # 自己位置をこの秒数見失ったら着陸する
     POS_LOST_LAND_S = 1.5
@@ -199,6 +210,9 @@ class WaypointMission:
         # ヨーの出所。"camera"(実測収束済み) か "fixed"(決め打ち)。
         # status_line() と GUIDED 進入時の警告で使う。
         self._yaw_src = "fixed"
+        # 機体自身の実測yaw [deg] (アーム基準の相対値)。_velocity_command が
+        # "fixed" 中の速度クランプに使う。未取得なら None (この場合は安全側)。
+        self._yaw_dev_deg = None
 
         # ---- ログ用 ----------------------------------------------------
         # ★ 「何を送ったか」は送った本人しか知らない。update() の中で
@@ -370,6 +384,9 @@ class WaypointMission:
 
         st = self.link.state()
         h_agl = float(st.get("range_h", 0.0))    # 機体の測距による対地高度 [m]
+        # 機体自身の実測yaw (アーム基準の相対値)。_velocity_command が
+        # "fixed" 中の速度クランプをここから直接判断する (下記コメント参照)。
+        self._yaw_dev_deg = st.get("yaw")
 
         self._maybe_correct_position(now, pos, pos_valid, st)
 
@@ -518,12 +535,21 @@ class WaypointMission:
         vx = self.KP_POS * fwd
         vy = self.KP_POS * right
 
-        # ★ カメラのヨー推定 (YawEstimator) がまだ収束していない
-        #   (yaw_src != "camera") あいだは、YAW_INITIAL_ALIGN_DEG の
-        #   決め打ちがズレていた場合に備えて速度を絞る。ここで稼いだ
-        #   低速の移動そのものが YawEstimator の収束用Δvにもなるので、
-        #   ただ待つだけの安全策ではなく収束を進める側にも効く。
-        max_vel = self.MAX_VEL if self._yaw_src == "camera" else MISSION_YAW_PROBE_VEL
+        # ★ 速度クランプは「yaw_src==camera か」ではなく、機体自身の実測yaw
+        #   (アーム基準の相対値) の大きさそのもので判断する。
+        #   2026-09-15(3): YawEstimator (camera) はほぼ収束しないため、
+        #   yaw_src だけで絞ると実害の無い日(実測yawのズレが小さい)でも
+        #   ずっと低速(MISSION_YAW_PROBE_VEL)に貼り付いたままになり、
+        #   中心到達に14秒かかった。実測yawが小さければ、それは
+        #   YAW_INITIAL_ALIGN_DEG の前提が壊れていないという直接の証拠
+        #   なので、camera実測(yaw_src=="camera")と同じくフル速度でよい。
+        #   実測yawが取れない/大きい ときだけ絞る (安全側)。
+        if self._yaw_src == "camera":
+            max_vel = self.MAX_VEL
+        elif self._yaw_dev_deg is not None and abs(self._yaw_dev_deg) < self.YAW_FIXED_RISK_DEG:
+            max_vel = self.MAX_VEL
+        else:
+            max_vel = MISSION_YAW_PROBE_VEL
 
         # 大きさでクランプする (成分ごとに切ると方向が曲がる)
         mag = math.hypot(vx, vy)
