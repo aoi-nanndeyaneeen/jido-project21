@@ -169,6 +169,8 @@ def run_main_loop(cam1, cam2,
 
     # 「初期アラインメントで飛んでいます」の警告を1回だけ出すための箱
     _warned_fixed_yaw = [False]
+    # 機体の g_yaw_est がカメラの絶対ヨーで再基準済みか (アーム中のみ有効)
+    _yaw_rebased = [False]
     # 直近に yaw_est へ渡した D フレームの t_ms。同じ値を2回渡さないための重複排除。
     #  ★ S5Link.state() は「最新のCSV行」のスナップショットを返すだけで
     #    キューではない。ここのポーリング周期(カメラフレーム毎)は
@@ -295,8 +297,24 @@ def run_main_loop(cam1, cam2,
                 #    いくのを見逃した)。ここでは yaw_src を渡すだけでよい。
                 m_yaw, m_yaw_valid = yaw_rad, (yaw_rad is not None)
                 yaw_src = "camera"
+                st_now = link.state() if (link is not None and link.ok) else {}
+                armed_now = bool(st_now.get("armed", 0))
+                if not armed_now:
+                    _yaw_rebased[0] = False    # 機体はアーム時に g_yaw_est を 0 へ戻す
+                if m_yaw_valid and armed_now:
+                    _yaw_rebased[0] = True     # この値が CF_YAW_VALID で機体へ送られる
                 if not m_yaw_valid and MISSION_YAW_MODE == "fixed":
-                    m_yaw = math.radians(YAW_INITIAL_ALIGN_DEG)
+                    # ★ 決め打ちの 0deg ではなく機体のジャイロ積分ヨーを使う。
+                    #   2026-09-15: アーム後に機首が -17.8deg 回っていたのに 0deg で
+                    #   飛ばし、目標と違う向きへ進んだ。機体の g_yaw_est はアーム時
+                    #   基準の相対値 (カメラで再基準された後は絶対値) なので、
+                    #   アーム時の向き = YAW_INITIAL_ALIGN_DEG を足して絶対方位にする。
+                    dev_yaw = st_now.get("yaw")
+                    if isinstance(dev_yaw, float):
+                        base = 0.0 if _yaw_rebased[0] else YAW_INITIAL_ALIGN_DEG
+                        m_yaw = math.radians(base + dev_yaw)
+                    else:
+                        m_yaw = math.radians(YAW_INITIAL_ALIGN_DEG)
                     m_yaw_valid = True
                     yaw_src = "fixed"
                     if not _warned_fixed_yaw[0]:

@@ -111,12 +111,14 @@ class CameraTracker:
         self.camera_url = camera_url
 
         if isinstance(camera_url, int):
-            self.cap = self._open_local_camera(camera_url)
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            self.cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+            self.cap = self._open_local_camera(camera_url, width, height)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            fourcc = int(self.cap.get(cv2.CAP_PROP_FOURCC))
+            fourcc_s = "".join(chr((fourcc >> 8 * i) & 0xFF) for i in range(4))
+            if fourcc_s != "MJPG":
+                print(f"  [{label}] [WARN] 転送形式が {fourcc_s!r} です (MJPG ではない)。"
+                      "非圧縮 YUY2 だと USB2.0 の帯域で 1280x720 は 10fps に落ち、"
+                      "露出も伸びて残像が出ます。")
         else:
             self.cap = cv2.VideoCapture(camera_url)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -174,8 +176,20 @@ class CameraTracker:
             "process_seq": 0,
         }
 
-    def _open_local_camera(self, requested_index):
-        """Open a Windows camera, tolerating backend and index differences."""
+    def _open_local_camera(self, requested_index, width, height):
+        """
+        Windows のカメラを開く。バックエンドや番号の違いには寛容にする。
+
+        ★ DirectShow では形式・解像度・FPS を「開くときのパラメータ」で渡すこと。
+          開いた後に set(FOURCC=MJPG) しても OpenCV 5.0 + C930e では YUY2 のまま
+          残り、1280x720 が 10fps (1枚 100ms) になっていた (2026-09-15 実測)。
+          パラメータ渡しなら MJPG 30fps (C930e の上限) / C920系 60fps が出る。
+          MSMF はパラメータ渡しだと開けないので、開いた後に set する。
+        """
+        open_params = [cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"),
+                       cv2.CAP_PROP_FRAME_WIDTH, width,
+                       cv2.CAP_PROP_FRAME_HEIGHT, height,
+                       cv2.CAP_PROP_FPS, CAMERA_FPS]
         attempts = []
         for index in [requested_index, 0, 1, 2, 3]:
             if index not in [item[0] for item in attempts]:
@@ -183,7 +197,12 @@ class CameraTracker:
                 attempts.append((index, cv2.CAP_MSMF))
 
         for index, backend in attempts:
-            cap = cv2.VideoCapture(index, backend)
+            if backend == cv2.CAP_DSHOW:
+                cap = cv2.VideoCapture(index, backend, open_params)
+            else:
+                cap = cv2.VideoCapture(index, backend)
+                for prop, value in zip(open_params[::2], open_params[1::2]):
+                    cap.set(prop, value)
             if cap.isOpened():
                 backend_name = "DSHOW" if backend == cv2.CAP_DSHOW else "MSMF"
                 if index != requested_index or backend != cv2.CAP_DSHOW:

@@ -834,7 +834,8 @@ inline void probe() {
         const bool sonar = (Q::RANGE_BACKEND == Q::RangeBackend::Sonar_EZ);
         devs[D_RANGE].bus = sonar ? "PW pin" : "I2C 0x29";
         devs[D_RANGE].st  = g_range_ok ? ST_OK : ST_FAIL;
-        strcpy(devs[D_RANGE].note, sonar ? "MaxBotix EZ" : "VL53L1X");
+        strcpy(devs[D_RANGE].note, sonar ? "MaxBotix EZ"
+                                          : (g_range_ok ? "VL53L1X" : "VL53L1X 応答なし/電源未接続"));
     }
 
     // --- PMW3901 (SPI CS10) ---

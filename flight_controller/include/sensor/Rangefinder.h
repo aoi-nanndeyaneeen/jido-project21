@@ -76,6 +76,20 @@ public:
         _sensor.setMeasurementTimingBudget(Quad::RANGE_TIMING_BUDGET_US);
         _sensor.startContinuous(Quad::RANGE_CONTINUOUS_MS);
 
+        // ★ 2026-09-15: ここまでの init() はレジスタ I/O が通るかしか
+        //   見ておらず、VIN 未接続でも SDA/SCL の漏れ電流だけで応答して
+        //   しまうことがある (実際のレンジングは電源不足で進まず、高度が
+        //   凍結したまま気づけない)。実サンプルが1回来るまで待って初めて
+        //   「電源も来ている」とみなす。QuadConfig の RANGE_PROBE_TIMEOUT_MS
+        //   参照。
+        const uint32_t t0 = millis();
+        bool got_sample = false;
+        while (millis() - t0 < Quad::RANGE_PROBE_TIMEOUT_MS) {
+            if (_sensor.dataReady()) { got_sample = true; break; }
+            delay(2);
+        }
+        if (!got_sample) { _ok_init = false; return false; }
+
         _ok_init = true;
         return true;
     }

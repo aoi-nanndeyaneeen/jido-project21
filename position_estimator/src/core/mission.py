@@ -58,7 +58,7 @@ from enum import Enum
 
 from utils.config import (MISSION_TAKEOFF_ALT_M, YAW_INITIAL_ALIGN_DEG,
                           MISSION_FENCE_X, MISSION_FENCE_Y, MISSION_FENCE_Z,
-                          MISSION_FENCE_GRACE_S,
+                          MISSION_FENCE_GRACE_S, MISSION_YAW_PROBE_VEL,
                           POS_CORR_ENABLED, POS_CORR_PERIOD_S,
                           POS_CORR_MAX_STEP_M,
                           POS_CORR_TRACK_TOL_M, POS_CORR_CONFIRM_S)
@@ -361,7 +361,11 @@ class WaypointMission:
         flags = CF_ARMED_OK | CF_ALT_ABS
         if pos_valid:
             flags |= CF_POS_VALID
-        if yaw_valid:
+        # ★ CF_YAW_VALID は「カメラで実測した絶対ヨー」のときだけ立てる。
+        #   機体はこのフラグ付きの値で g_yaw_est を上書きするので、"fixed"
+        #   (前提値) で立てると機体が正しく知っている自分の回転を消してしまう
+        #   (2026-09-15: -17.8deg が GUIDED 最初の指令で +1.2deg に飛んだ)。
+        if yaw_valid and yaw_src == "camera":
             flags |= CF_YAW_VALID
 
         st = self.link.state()
@@ -514,10 +518,17 @@ class WaypointMission:
         vx = self.KP_POS * fwd
         vy = self.KP_POS * right
 
+        # ★ カメラのヨー推定 (YawEstimator) がまだ収束していない
+        #   (yaw_src != "camera") あいだは、YAW_INITIAL_ALIGN_DEG の
+        #   決め打ちがズレていた場合に備えて速度を絞る。ここで稼いだ
+        #   低速の移動そのものが YawEstimator の収束用Δvにもなるので、
+        #   ただ待つだけの安全策ではなく収束を進める側にも効く。
+        max_vel = self.MAX_VEL if self._yaw_src == "camera" else MISSION_YAW_PROBE_VEL
+
         # 大きさでクランプする (成分ごとに切ると方向が曲がる)
         mag = math.hypot(vx, vy)
-        if mag > self.MAX_VEL:
-            k = self.MAX_VEL / mag
+        if mag > max_vel:
+            k = max_vel / mag
             vx, vy = vx * k, vy * k
         elif mag < self.MIN_VEL:
             vx, vy = 0.0, 0.0

@@ -270,7 +270,11 @@ GATE_X = (-_HW - GATE_MARGIN_M, _HW + GATE_MARGIN_M)
 GATE_Y = (-_HD - GATE_MARGIN_M, _HD + GATE_MARGIN_M)
 # 高度 [m]。下限は MISSION_TAKEOFF_ALT_M より必ず低くすること
 # （0.5m ホバリングを 0.5m 下限で切ると機体そのものが弾かれる）。
-GATE_Z = (0.15, 10.0) if FIELD_PROFILE != "large" else (0.5, 10.0)
+# ★ 下限を床より上 (旧 0.15m) にすると、離陸前に床に置いた機体の LED
+#   (高さ数cm) が「フィールド外」で必ず棄却され、位置が一切出ない
+#   (2026-09-15、両カメラで点滅確認済みなのに 3263 フレーム全棄却)。
+#   床面の鏡像反射は z≈-高度 に三角測量されるので、-0.10m でも浮上後は落ちる。
+GATE_Z = (-0.10, 10.0) if FIELD_PROFILE != "large" else (0.5, 10.0)
 
 # ==========================================
 # ジオフェンス (ミッションが「逸脱した」と判断する境界)
@@ -372,8 +376,14 @@ YAW_MEASURE_HZ     = 5.0    # PC内部で照合を試みる頻度 [Hz]
 YAW_SEND_HZ        = 1.0    # 機体へ送る頻度 [Hz]（速くしても通信ジッタが乗るだけ）
 
 # ゲート（これを満たさない窓は捨てる）
-YAW_MIN_DV_CAMERA    = 1.0   # カメラ側Δvの下限 [m/s]。小さいと方向が純ノイズ
-YAW_MIN_DV_BODY      = 1.0   # 機体側Δvの下限 [m/s]
+#  ★ 2026-09-15: 元は 1.0 だったが、MISSION_YAW_MODE="fixed" 運用での
+#    巡航速度上限 (mission.py MAX_VEL=0.4m/s) 以下では窓内Δvが1.0m/sへ
+#    絶対に届かず、ヨー推定が一度も収束しない状態だった (全飛行ログで
+#    Yaw_Src=camera が0件だったことで確認済み)。0.4m/s巡航でも届く値へ
+#    下げる。ノイズとの分離は YAW_DV_RATIO_TOL と YAW_CONFIRM_N/
+#    YAW_CONFIRM_TOL_DEG (連続5回±20度一致) 側で担保する。
+YAW_MIN_DV_CAMERA    = 0.2   # カメラ側Δvの下限 [m/s]。小さいと方向が純ノイズ
+YAW_MIN_DV_BODY      = 0.2   # 機体側Δvの下限 [m/s]
 YAW_DV_RATIO_TOL     = 0.5   # 大きさの食い違い許容比。超えたらどちらか異常
 YAW_MAX_TURN_DEG     = 20.0  # 窓の間に機体がこれ以上首を振っていたら捨てる
                              # （機体座標系が回ると1秒ぶんのΔv合成が無意味になる）
@@ -445,6 +455,13 @@ MISSION_SQUARE_M = 0.80
 #    のデッドロックになり、ウェイポイント飛行が永久に始まらない。
 #    最初の正方形飛行は "fixed" で通し、ヨーの自動補正はそのあと。
 MISSION_YAW_MODE = "fixed"
+
+# "fixed" のまま (=カメラのヨー推定が未収束のまま) 巡航しているあいだの
+# 速度上限 [m/s]。通常の MAX_VEL (mission.py, 0.4) より絞ることで、
+# 初期アラインメントがズレていた場合の被害を抑えつつ、YawEstimator が
+# 収束に必要なΔvをこの間に稼ぐ。収束して yaw_src="camera" になった
+# 瞬間から通常の MAX_VEL に戻る。
+MISSION_YAW_PROBE_VEL = 0.15
 
 # ---- ミッションの自動開始 ---------------------------------------------
 #  True : プロポの SW_HOVER を GUIDED (up) に上げるたびに、ミッションを
@@ -624,19 +641,23 @@ STATIC_MASK_DILATE_PX    = DETECTION["static_mask_dilate_px"]
 # 点滅しない静的な明点を積極的に落とす。tracker.py が2カメラそれぞれに
 # 1個ずつ BlinkTracker を持ち、PairSelector（幾何整合）より前段でかける。
 #
-# ★ LED_BLINK_HZ は「実効カメラFPSの半分未満」でなければ標本化定理に
-#   反し、点滅を復元できない（エイリアシング）。さらにフレーム取りこぼし
-#   を吸収するため、目安は実効FPSの1/4〜1/6程度にすること。
-#   例: 要求60fpsでも実測30fps前後のことが多い → LED_BLINK_HZ=5〜7Hz。
-#   実際の値は起動時ログの実効FPS表示 ([Camera] 初期化完了: ...@X.Xfps)
-#   を見て決め、BlinkTracker初期化時のナイキスト警告が出ないことを確認する。
+# 判定は候補位置まわりの平均輝度に対するロックイン検波 (6Hz 成分の割合)。
+# 実タイムスタンプで相関を取るので、fps が 12 未満でも位相が散っていれば検出できる。
 #
-# ★ LED本体の点滅は機体側 (flight_controller) で作る。ここはあくまで
-#   カメラ側の検出ロジック。点滅周波数はここの値と機体側を必ず一致させること。
-BLINK_DETECT_ENABLED = True    # True で bright/bright_or_motion 系候補に点滅整合フィルタをかける
+# ★ 効くのは露出時間。点灯/消灯は各 83ms なので、露出がそれに近いと
+#   1枚の中で平均されて振幅が消える。2026-09-15 の実測では Camera1 の
+#   read() が毎回 99ms (=自動露出が 1/10s 前後まで伸びて 10fps) だった。
+#   追跡時は TRACKING_EXPOSURE で 1/60s 以下に絞ること。
+#   フレーム間隔が半周期を超えていると起動後に [WARN] が出る。
+#
+# ★ 点滅周波数は flight_controller/src/drone_s5.cpp の検出用LED
+#   (millis() % 167 < 83) と一致させること。
+#
+# 画面上の各光点の横に「score/depth」を表示する。黄=点滅確認、灰=未確認。
+BLINK_DETECT_ENABLED = True
 LED_BLINK_HZ         = 6.0     # 機体LEDの点滅周波数 [Hz]
 BLINK_MATCH_DIST_PX  = 30      # フレーム間で同一光点とみなす最大移動量 [px]
-BLINK_HISTORY_SEC    = 1.2     # 立ち上がり間隔の判定に使う直近の時間窓 [s]
-BLINK_MIN_CYCLES     = 3       # スコアが満点になるまでに必要な整合周期数
-BLINK_PERIOD_TOL     = 0.35    # 周期のずれ許容比率 (目標周期の±35%まで「整合」とみなす)
-BLINK_MATURE_SEC     = 0.6     # この期間より若いトラックはスコア不足でも捨てない（判定猶予）
+BLINK_ROI_PX         = 8       # 輝度を測る ROI の半径 [px] (17x17)
+BLINK_HISTORY_SEC    = 1.2     # ロックインの窓 [s]。長いほど確実だが確定が遅い
+BLINK_MIN_SCORE      = 0.5     # 分散のうち 6Hz 成分の割合の下限 (矩形波で約0.81)
+BLINK_MIN_DEPTH      = 1.5     # ROI平均輝度の標準偏差の下限。静止光のノイズ相関を弾く

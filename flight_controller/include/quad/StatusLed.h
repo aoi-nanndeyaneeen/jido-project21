@@ -1,12 +1,12 @@
 // ============================================================
-//  StatusLed.h  -  モード表示LED (pin 5/6/9) と機体検出LED (pin 21/22/23)
+//  StatusLed.h  -  モード表示LED (pin 5/6/9) と機体検出LED (pin 20/22/23)
 // ============================================================
 //  配線は「コモンアノード」前提。
 //    3.3V ──┬── R アノード
 //           ├── G アノード
 //           └── B アノード
 //    StatusLed: pin5/6/9
-//    BlinkLed : pin21/22/23
+//    BlinkLed : pin20/22/23
 //  ピンを HIGH(3.3V) にすると LED 側と電位差ゼロ = 消灯、
 //  LOW(GND) にすると 3.3V→LED→pin(GND) に電流が流れて点灯する。
 //  なので各ピンは「点けたい色だけ LOW、他は HIGH」で使う (負論理)。
@@ -59,9 +59,9 @@ inline void magenta(){set(true,  false, true);  }
 
 namespace BlinkLed {
 
-constexpr uint8_t PIN_R = 21;
-constexpr uint8_t PIN_G = 22;
-constexpr uint8_t PIN_B = 23;
+constexpr uint8_t PIN_B = 17;
+constexpr uint8_t PIN_R = 22;
+constexpr uint8_t PIN_G = 23;
 
 inline void begin() {
     pinMode(PIN_R, OUTPUT);

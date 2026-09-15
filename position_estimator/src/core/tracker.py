@@ -33,11 +33,10 @@ from utils.config      import (MAX_RESIDUAL_M,
                                 BLINK_DETECT_ENABLED,
                                 LED_BLINK_HZ,
                                 BLINK_MATCH_DIST_PX,
+                                BLINK_ROI_PX,
                                 BLINK_HISTORY_SEC,
-                                BLINK_MIN_CYCLES,
-                                BLINK_PERIOD_TOL,
-                                BLINK_MATURE_SEC,
-                                CAMERA_FPS)
+                                BLINK_MIN_SCORE,
+                                BLINK_MIN_DEPTH)
 
 
 def _in_gate(P) -> bool:
@@ -63,6 +62,8 @@ class PairSelector:
     def __init__(self):
         self.last_P = None
         self.last_t = 0.0
+        # 採用ペアが無かったとき、最も惜しかったペアの (理由, P, residual)。画面表示用
+        self.last_reject = None
 
     def select(self, cands1, cands2, calib1, calib2):
         """
@@ -84,17 +85,29 @@ class PairSelector:
 
         best = (None, None, None, None)
         best_res = float("inf")
+        reject, reject_res = None, float("inf")
         for i, (O1, D1) in enumerate(rays1):
             for j, (O2, D2) in enumerate(rays2):
                 P, res = intersect_rays(O1, D1, O2, D2)
-                if P is None or res > MAX_RESIDUAL_M or not _in_gate(P):
+                if P is None:
                     continue
-                if reach is not None and np.linalg.norm(P - self.last_P) > reach:
+                if res > MAX_RESIDUAL_M:
+                    reason = "residual"
+                elif not _in_gate(P):
+                    reason = "gate"
+                elif reach is not None and np.linalg.norm(P - self.last_P) > reach:
+                    reason = "reach"
+                else:
+                    reason = None
+                if reason is not None:
+                    if res < reject_res:
+                        reject, reject_res = (reason, P, res), res
                     continue
                 if res < best_res:
                     best_res = res
                     best = (P, res, i, j)
 
+        self.last_reject = None if best[0] is not None else reject
         if best[0] is not None:
             self.last_P, self.last_t = best[0], now
         return best
@@ -120,20 +133,15 @@ def camera_thread_func(cam1, cam2,
 
     selector = PairSelector()
 
-    blink1 = BlinkTracker(cam1.label, LED_BLINK_HZ, camera_fps=CAMERA_FPS,
-                          match_dist_px=BLINK_MATCH_DIST_PX,
-                          history_sec=BLINK_HISTORY_SEC,
-                          min_cycles=BLINK_MIN_CYCLES,
-                          period_tol=BLINK_PERIOD_TOL,
-                          mature_sec=BLINK_MATURE_SEC,
-                          enabled=BLINK_DETECT_ENABLED)
-    blink2 = BlinkTracker(cam2.label, LED_BLINK_HZ, camera_fps=CAMERA_FPS,
-                          match_dist_px=BLINK_MATCH_DIST_PX,
-                          history_sec=BLINK_HISTORY_SEC,
-                          min_cycles=BLINK_MIN_CYCLES,
-                          period_tol=BLINK_PERIOD_TOL,
-                          mature_sec=BLINK_MATURE_SEC,
-                          enabled=BLINK_DETECT_ENABLED)
+    blink1, blink2 = (
+        BlinkTracker(cam.label, LED_BLINK_HZ,
+                     match_dist_px=BLINK_MATCH_DIST_PX,
+                     roi_px=BLINK_ROI_PX,
+                     history_sec=BLINK_HISTORY_SEC,
+                     min_score=BLINK_MIN_SCORE,
+                     min_depth=BLINK_MIN_DEPTH,
+                     enabled=BLINK_DETECT_ENABLED)
+        for cam in (cam1, cam2))
 
     no_detect_count = 0
     in_dummy_mode   = False
@@ -158,18 +166,17 @@ def camera_thread_func(cam1, cam2,
                 frame2, cands2, ts2 = cam2.read_and_detect()
                 cam2_ms = (time.perf_counter() - cam2_start) * 1000.0
 
-                # ── LED点滅パターンによる候補フィルタ（Phase A.5） ──
-                #  幾何整合より前に、点滅しない静的な明点（窓の反射・照明）
-                #  を落とす。BLINK_DETECT_ENABLED=False なら素通し。
-                if ts1:
-                    cands1 = blink1.filter(cands1, ts1)
-                if ts2:
-                    cands2 = blink2.filter(cands2, ts2)
+                # ── LED点滅 (6Hz) で候補を絞る。描画より前に呼ぶこと ──
+                #  ROI 輝度を測るので、候補枠が描き込まれる前の画像が要る。
+                cands1 = blink1.filter(frame1, cands1, ts1, cam1.width)
+                cands2 = blink2.filter(frame2, cands2, ts2, cam2.width)
 
                 # ── 候補ペアの幾何整合で機体を1組選ぶ（Phase B） ──
                 P_vec, residual, idx1, idx2 = selector.select(
                     cands1, cands2, calib1, calib2)
 
+                blink1.draw(frame1, cam1.width)
+                blink2.draw(frame2, cam2.width)
                 if frame1 is not None:
                     cam1.draw_candidates(frame1, cands1, idx1)
                 else:
@@ -199,6 +206,10 @@ def camera_thread_func(cam1, cam2,
                 elif pair_rejected:
                     status_label = (f"NO CONSISTENT PAIR "
                                     f"(cand {len(cands1)}/{len(cands2)})")
+                    if selector.last_reject is not None:
+                        why, Pr, rr = selector.last_reject
+                        status_label += (f" best:{why} X:{Pr[0]:.2f} Y:{Pr[1]:.2f} "
+                                         f"Z:{Pr[2]:.2f} err:{rr:.3f}m")
                     status_color = (0, 140, 255)
                 else:
                     status_label = f"NO TARGET (cand {len(cands1)}/{len(cands2)})"
