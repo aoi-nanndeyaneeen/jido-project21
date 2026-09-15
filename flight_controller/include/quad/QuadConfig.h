@@ -372,8 +372,19 @@ constexpr uint8_t FLOW_SQUAL_MIN = 20;
 //    モデルなので、実機での確認が前提)。
 //    ★ 代償: KI を下げたので CG ずれ・傾き取り付けの吸収が遅い (数秒)。
 //      揺れが残る/流れるならシリアル [p] の i/j/o で飛行中に変えて確認できる。
-constexpr float FLOW_VEL_KP      = 5.0f;
-constexpr float FLOW_VEL_KI      = 0.8f;    // 定常風・機体の取り付け傾きを吸収
+//    ★★ 2026-09-15(2): 4.0/2.0/0.6 に戻す (このコミットで revert)。
+//      s5-telemetry-ground-logging 18:19-18:20 の GUIDED 巡航で、地上局が
+//      持続的に手前 (-vx) を指令しているのに fh_vxc/fh_posn が奥方向へ
+//      加速し続ける現象が2回連続で再現した (PC側の符号は fh_vxt に正しく
+//      反映されており、body_frame_errors 自体は同じログの前の便
+//      (13:20, このゲイン変更より前) では収束していた実績がある)。
+//      ホバー単体 (log_043, スティック/位置ホールド経路) では揺れが
+//      小さくなったことを確認済みだが、GUIDEDの持続的な外部速度指令
+//      (setVelCommand 経由で _vx_pid/_vy_pid に直結する経路) は未検証
+//      だった。KP5/KI0.8/POS0.4 がこの経路でだけ不安定化した疑いが強い
+//      ため、実機で切り分けるまで安全側の値へ戻す。
+constexpr float FLOW_VEL_KP      = 4.0f;
+constexpr float FLOW_VEL_KI      = 2.0f;    // 定常風・機体の取り付け傾きを吸収
 constexpr float FLOW_VEL_KD      = 0.0f;
 constexpr float FLOW_VEL_I_LIMIT = 4.0f;    // I項の上限 [deg]
 constexpr float FLOW_VEL_D_ALPHA = 0.6f;
@@ -402,7 +413,8 @@ constexpr float FLOW_VEL_D_ALPHA = 0.6f;
 // ★ 2026-09-15: 0.6 -> 0.4。FLOW_VEL_KP のコメント参照 (KI と一緒に下げる
 //   ことで遅れ 0.45s に対する位相余裕を確保。単独で下げたときの
 //   「外乱復帰が遅くなりすぎる」は、KI を下げて減衰が増えたぶんで相殺)。
-constexpr float FLOW_POS_KP      = 0.4f;
+// ★★ 2026-09-15(2): 0.6 に戻す。FLOW_VEL_KP のコメント参照。
+constexpr float FLOW_POS_KP      = 0.6f;
 constexpr float FLOW_POS_VEL_LIM = 0.8f;    // 位置ループが出す目標速度の上限 [m/s]
 
 // 保持基準 (g_pos_hold) を「今の推定位置」へゆっくり緩和する時定数 [s]。
