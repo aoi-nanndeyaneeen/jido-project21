@@ -283,6 +283,24 @@ class CameraTracker:
             print(f"  [{self.label}] [WARN] 露出固定に失敗: {e}")
             return False
 
+    # 追跡中の露出の見張り。2026-09-16 00:17 の便で、前 2 便は 30fps だった
+    #  Camera1 が 15fps に戻っていた (lock_exposure 後にドライバ側で自動露出へ
+    #  戻ったか、設定が乗らなかった)。直近の read() 1 枚の所要時間が
+    #  長いままなら露出を設定し直す。露出値が読み戻せない場合は触らない。
+    def recheck_exposure(self, read_ms):
+        if TRACKING_EXPOSURE is None or not isinstance(self.camera_url, int):
+            return
+        if read_ms < 45.0:          # 30fps なら ~33ms、16fps だと ~62ms
+            return
+        try:
+            cur = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, DSHOW_EXPOSURE_MANUAL)
+            self.cap.set(cv2.CAP_PROP_EXPOSURE, float(TRACKING_EXPOSURE))
+            print(f"  [{self.label}] [WARN] read() が {read_ms:.0f}ms/枚 "
+                  f"(露出 {cur:.1f})。露出を {float(TRACKING_EXPOSURE):.1f} へ再設定しました")
+        except cv2.error as e:
+            print(f"  [{self.label}] [WARN] 露出の再設定に失敗: {e}")
+
     def get_intrinsics(self):
         """
         内部パラメータ (K, dist) を返す。

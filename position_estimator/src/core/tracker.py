@@ -323,6 +323,10 @@ def camera_thread_func(cam1, cam2,
                           f"reader=({perf_values['ReaderFPS1']:.1f},"
                           f"{perf_values['ReaderFPS2']:.1f})fps")
                     perf_print_time = time.time()
+                    for cam, st in ((cam1, stats1), (cam2, stats2)):
+                        fn = getattr(cam, "recheck_exposure", None)
+                        if fn is not None and st.get("reader_reads", 0) > 30:
+                            fn(st.get("reader_last_ms", 0.0))
 
             except Exception:
                 # 1フレームの例外でスレッド全体を落とさない
