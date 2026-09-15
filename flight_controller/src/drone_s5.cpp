@@ -1537,6 +1537,51 @@ static void guidedDisengage(const char* why) {
     g_touch_since_ms = 0;
 }
 
+static void applyGuidedCommand(const S5C::CmdFrame& c, uint32_t now) {
+    if (c.flags & S5C::CF_POS_CORR) {
+        poshold.correctPosition((float)c.corr_n_mm / S5C::SC_MM,
+                                (float)c.corr_e_mm / S5C::SC_MM);
+    }
+
+    const float cmd_alt = (c.alt_cm > 0) ? (float)c.alt_cm / S5C::SC_CM : 0.0f;
+    switch (c.req) {
+        case S5C::REQ_TAKEOFF:
+            g_gp = GP_TAKEOFF;
+            g_guided_vx = g_guided_vy = 0.0f;
+            if (cmd_alt > 0.0f) g_guided_alt_m = cmd_alt;
+            g_guided_slew = Q::GUIDED_TAKEOFF_SLEW_MPS;
+            break;
+
+        case S5C::REQ_GUIDED:
+            g_gp = GP_CRUISE;
+            g_guided_vx = constrain((float)c.vx_mmps / S5C::SC_MMPS,
+                                    -Q::GUIDED_MAX_VEL, Q::GUIDED_MAX_VEL);
+            g_guided_vy = constrain((float)c.vy_mmps / S5C::SC_MMPS,
+                                    -Q::GUIDED_MAX_VEL, Q::GUIDED_MAX_VEL);
+            if (cmd_alt > 0.0f) g_guided_alt_m = cmd_alt;
+            g_guided_slew = Q::GUIDED_CRUISE_SLEW_MPS;
+            break;
+
+        case S5C::REQ_LAND:
+            if (g_gp != GP_LAND) {
+                g_gp = GP_LAND;
+                g_land_start_ms = now;
+                g_touch_since_ms = 0;
+                Serial.println("\n>>> GUIDED 自動着陸を開始");
+            }
+            break;
+
+        case S5C::REQ_HOLD:
+        case S5C::REQ_ABORT:
+        case S5C::REQ_IDLE:
+        default:
+            if (g_gp == GP_CRUISE || g_gp == GP_TAKEOFF) g_gp = GP_HOLD;
+            g_guided_vx = g_guided_vy = 0.0f;
+            g_guided_slew = Q::GUIDED_CRUISE_SLEW_MPS;
+            break;
+    }
+}
+
 static void updateGuided() {
     if (!Q::GUIDED_ENABLE) { g_guided_engaged = false; g_gp = GP_OFF; return; }
 
@@ -1600,51 +1645,7 @@ static void updateGuided() {
     } else {
         // --- 3) 新鮮な指令に従う -------------------------------------
 
-        // 位置補正 (req に関係なく、フラグが立っていれば毎回適用)。
-        //  ★ GUIDED 巡航中は PositionHold 側で実質無効化される
-        //    (correctPosition() のコメント参照)。ここでは無条件に渡すだけでよい。
-        if (c.flags & S5C::CF_POS_CORR) {
-            poshold.correctPosition((float)c.corr_n_mm / S5C::SC_MM,
-                                    (float)c.corr_e_mm / S5C::SC_MM);
-        }
-
-        const float cmd_alt = (c.alt_cm > 0) ? (float)c.alt_cm / S5C::SC_CM : 0.0f;
-        switch (c.req) {
-            case S5C::REQ_TAKEOFF:
-                if (g_gp != GP_TAKEOFF) { g_gp = GP_TAKEOFF; }
-                g_guided_vx = g_guided_vy = 0.0f;
-                if (cmd_alt > 0.0f) g_guided_alt_m = cmd_alt;
-                g_guided_slew = Q::GUIDED_TAKEOFF_SLEW_MPS;
-                break;
-
-            case S5C::REQ_GUIDED:
-                g_gp = GP_CRUISE;
-                g_guided_vx = constrain((float)c.vx_mmps / S5C::SC_MMPS,
-                                        -Q::GUIDED_MAX_VEL, Q::GUIDED_MAX_VEL);
-                g_guided_vy = constrain((float)c.vy_mmps / S5C::SC_MMPS,
-                                        -Q::GUIDED_MAX_VEL, Q::GUIDED_MAX_VEL);
-                if (cmd_alt > 0.0f) g_guided_alt_m = cmd_alt;
-                g_guided_slew = Q::GUIDED_CRUISE_SLEW_MPS;
-                break;
-
-            case S5C::REQ_LAND:
-                if (g_gp != GP_LAND) {
-                    g_gp            = GP_LAND;
-                    g_land_start_ms = now;
-                    g_touch_since_ms = 0;
-                    Serial.println("\n>>> GUIDED 自動着陸を開始");
-                }
-                break;
-
-            case S5C::REQ_HOLD:
-            case S5C::REQ_ABORT:
-            case S5C::REQ_IDLE:
-            default:
-                if (g_gp == GP_CRUISE || g_gp == GP_TAKEOFF) g_gp = GP_HOLD;
-                g_guided_vx = g_guided_vy = 0.0f;
-                g_guided_slew = Q::GUIDED_CRUISE_SLEW_MPS;
-                break;
-        }
+        applyGuidedCommand(c, now);
     }
 
     // --- 4) 着陸フェーズの面倒を見る --------------------------------
@@ -2743,15 +2744,19 @@ void loop() {
     const float thr_now  = S5::USE_SBUS ? sbus.des[Ch::THR] : 0.0f;
 
     // --- モード表示 LED (pin 5/6/9) -----------------------------------
-    //  赤=DISARM  青(点灯)=ARMED+ANGLE(手動)  緑(点滅)=ARMED+POSHOLD/ALTHOLD(自動系)  緑(点灯)=ARMED+その他。
+    //  赤=DISARM  青(点灯)=ARMED+ANGLE(手動)
+    //  緑(ゆっくり点滅)=POSHOLD/ALTHOLD  緑(速く点滅)=GUIDED  緑(点灯)=その他。
     //  ★ コモンアノード＋共通抵抗の配線なので混色(白/黄)は出せない。
     //    Vf 最小の赤ダイが電流を独占するため。単色3つで区別する。
     //  digitalWrite 3本だけなので毎ループ呼んでも制御ループへの影響は無視できる。
-    const bool auto_flight_mode = (g_mode == S5::MODE_POSHOLD || g_mode == S5::MODE_ALTHOLD);
     if (!armed_now) {
         StatusLed::red();
-    } else if (auto_flight_mode) {
-        const bool blink_on = (millis() / 250) % 2 == 0;   // 2Hz 点滅
+    } else if (g_mode == S5::MODE_AUTO) {
+        const bool blink_on = (millis() / 125) % 2 == 0;   // 4Hz 点滅: GUIDED
+        if (blink_on) StatusLed::green();
+        else          StatusLed::off();
+    } else if (g_mode == S5::MODE_POSHOLD || g_mode == S5::MODE_ALTHOLD) {
+        const bool blink_on = (millis() / 250) % 2 == 0;   // 2Hz 点滅: POSHOLD/ALTHOLD
         if (blink_on) StatusLed::green();
         else          StatusLed::off();
     } else if (g_mode == S5::MODE_ANGLE) {

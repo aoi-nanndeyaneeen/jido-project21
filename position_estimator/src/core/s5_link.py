@@ -23,6 +23,7 @@ XIAO の USB シリアルは 1 本しかない。従来は
     "LOG_START" / "LOG_STOP"
     "DATA,<値...>"       テレメトリ 1 パケット = 1 行
     "PARAM,k=v,..."      機体のゲイン (数秒に1回)
+    "STAT,k=v,..."       地上局のUART/無線/上りコマンド診断 (毎秒)
     "# ..."              人間向けメッセージ
 
 送信 (PC -> XIAO):
@@ -129,6 +130,7 @@ class S5Link:
         self._running = False
         self._n_sent = 0
         self._last_param_line = None
+        self._diagnostics = {}
 
         if self.port is None:
             self._say("[S5Link] 地上局 (XIAO ESP32C3 303A:1001 / 旧RP2040 2E8A:000A) が見つかりません。")
@@ -212,9 +214,27 @@ class S5Link:
                 self._last_param_line = line
                 continue
 
+            if line.startswith("STAT,"):
+                self._parse_stat(line)
+                continue
+
             if line.startswith("#"):
                 # 受信機からの人間向けメッセージ。切り分けに効くのでそのまま出す。
                 self._say(f"[地上局] {line[1:].strip()}")
+
+    def _parse_stat(self, line):
+        """地上局が1秒ごとに出す通信カウンタを取り込む。"""
+        parsed = {}
+        for field in line[len("STAT,"):].split(","):
+            key, sep, value = field.partition("=")
+            if not sep:
+                continue
+            try:
+                parsed[key] = int(value)
+            except ValueError:
+                continue
+        with self._lock:
+            self._diagnostics = parsed
 
     def _parse_data(self, line):
         if self._cols is None:
@@ -254,6 +274,11 @@ class S5Link:
     def n_data(self):
         with self._lock:
             return self._n_data
+
+    def diagnostics(self):
+        """地上局で計数した IM920/UART/上りコマンドの最新スナップショット。"""
+        with self._lock:
+            return dict(self._diagnostics)
 
     def flag(self, name):
         """mode/armed/guided など 0/1 系の列を bool で取る。無ければ False。"""

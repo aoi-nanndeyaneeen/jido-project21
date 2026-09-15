@@ -10,7 +10,6 @@ import numpy as np
 import threading
 import time
 import msvcrt
-from collections import deque
 
 from utils.config import (DISP_W, DISP_H, VELOCITY_W, VELOCITY_H,
                           YAW_ENABLED, YAW_INITIAL_ALIGN_DEG,
@@ -23,13 +22,13 @@ from core.tracker import camera_thread_func
 from core.controller import AltitudeController
 from core.geometry import accel_to_angles
 from core.yaw_estimator import YawEstimator
-from core.autopilot import SquarePatrol, HoverHold, WaypointMission, RCCommand
 from core.s5_link import S5Link
 from core.mission import WaypointMission as Mission, Phase as MissionPhase
 from utils.logger import PerformanceLogger, MissionLogger
 from ui.dashboard import Dashboard
 from ui.view_velocity import ViewVelocity
-from ui.view_rc import ViewRC
+from ui.link_status import LinkStatusView
+from ui.window_layout import primary_display_size, flight_window_layout, apply_window_layout
 
 
 def run_main_loop(cam1, cam2,
@@ -67,25 +66,17 @@ def run_main_loop(cam1, cam2,
           "(自動開始が有効なら押す必要はありません)")
     print("  [X]     ミッション中断 (その場から自動着陸)")
     print("  [B]     背景リセット (両カメラ)")
-    print("  [H]     ホバリングモード")
-    print("  [W]     waypoint飛行モード (今後実装予定 → 現状はホバリングにフォールバック)")
-    print("  [C]     本番(競技)モード")
     print("  [Q]     終了")
     print()
 
-    shared = {"do_bg_reset": False, "quit": False, "mode_request": None,
+    shared = {"do_bg_reset": False, "quit": False,
               "mission_request": None}
 
     # ── ウィンドウ作成 ──────────────────────────────────────
     cv2.namedWindow("Camera 1", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Camera 1", DISP_W, DISP_H)
-    cv2.moveWindow("Camera 1", 0, 0)
-
     cv2.namedWindow("Camera 2", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Camera 2", DISP_W, DISP_H)
-    cv2.moveWindow("Camera 2", 0, 0)
+    cv2.namedWindow("Velocity", cv2.WINDOW_NORMAL)
 
-    # ── ターミナルフォーカス時のキー入力スレッド ────────────
     def keyboard_thread():
         while not shared.get("quit", False):
             if msvcrt.kbhit():
@@ -96,15 +87,6 @@ def run_main_loop(cam1, cam2,
                 elif key == b'b':
                     print("[KEY] B → 背景リセット")
                     shared["do_bg_reset"] = True
-                elif key == b'h':
-                    print("[KEY] H → ホバリングモード要求")
-                    shared["mode_request"] = "hover"
-                elif key == b'w':
-                    print("[KEY] W → waypoint飛行モード要求")
-                    shared["mode_request"] = "waypoint"
-                elif key == b'c':
-                    print("[KEY] C → 本番(競技)モード要求")
-                    shared["mode_request"] = "competition"
                 elif key == b'm':
                     print("[KEY] M → ミッション開始要求")
                     shared["mission_request"] = "start"
@@ -130,10 +112,11 @@ def run_main_loop(cam1, cam2,
     dashboard      = Dashboard(field_points)
     controller     = AltitudeController(p_gain=5.0)
     velocity_view  = ViewVelocity(field_points)
-    autopilot_mode = "hover"                    # 起動直後は最も安全なホバリングから開始
-    patrol         = HoverHold()
-    view_rc        = ViewRC()
-
+    link_view      = LinkStatusView()
+    screen_w, screen_h = primary_display_size()
+    apply_window_layout(flight_window_layout(screen_w, screen_h))
+    print(f"[UI] 主ディスプレイ {screen_w}x{screen_h}: "
+          "上段=Camera 1/2、下段=Velocity:Graph (2:1) に配置しました")
     # ── 地上局リンク (機体へ指令を送る唯一の経路) ───────────────
     #  ★ ここが None のままだと、機体は一切動かない (見ているだけ)。
     #    s5_logger.py を同時起動していると開けないので、その旨を出す。
@@ -178,27 +161,14 @@ def run_main_loop(cam1, cam2,
                 print(f"       WP{i}: ({wp[0]:+.2f}, {wp[1]:+.2f}, {wp[2]:.2f})")
         else:
             link = None
-            print("  [SKIP] 地上局に繋がりません。追跡の表示のみで続行します")
+            print("  [SKIP] 地上局に接続できません。ミッション指令は停止し、"
+                  "ダミー追跡を含む表示のみで続行します")
     else:
-        print("[INIT] GROUND_LINK_ENABLED=False のため機体へは何も送りません")
-
-    cv2.namedWindow("RC Command", cv2.WINDOW_NORMAL)
-    cv2.imshow("RC Command", np.zeros((ViewRC.H, ViewRC.W, 3), dtype=np.uint8))
-    cv2.waitKey(1)
-    cv2.resizeWindow("RC Command", ViewRC.W, ViewRC.H)
-    cv2.moveWindow("RC Command", 0, 0)
-    cv2.waitKey(1)
-
-    cv2.namedWindow("Velocity", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Velocity", VELOCITY_W, VELOCITY_H)
-    cv2.moveWindow("Velocity", 0, 0)
+        print("[INIT] GROUND_LINK_ENABLED=False のため機体へは何も送りません。"
+              "ダミー追跡を含む表示のみで続行します")
 
     # 「初期アラインメントで飛んでいます」の警告を1回だけ出すための箱
     _warned_fixed_yaw = [False]
-
-    _pos_hist = deque(maxlen=6)
-    _last_cmd = RCCommand()
-    _ap_time  = time.time()
 
     last_mpl_render = 0.0
     MPL_RENDER_HZ   = 5
@@ -245,37 +215,7 @@ def run_main_loop(cam1, cam2,
             if f2 is not None:
                 cv2.imshow("Camera 2", cv2.resize(f2, (DISP_W, DISP_H)))
 
-            # ── オートパイロット計算 ────────────────────────
             now_ap = time.time()
-            dt_ap  = now_ap - _ap_time
-            _ap_time = now_ap
-
-            if P is not None:
-                _pos_hist.append((now_ap, P.copy()))
-
-            vel_ap = np.zeros(3)
-            if len(_pos_hist) >= 2:
-                t0, p0 = _pos_hist[0]
-                t1, p1 = _pos_hist[-1]
-                dt_v = t1 - t0
-                if dt_v > 1e-4:
-                    vel_ap = (p1 - p0) / dt_v
-
-            # ── モード切替要求の反映（H/W/C キー） ──────────────
-            mode_req = shared.get("mode_request")
-            if mode_req is not None:
-                shared["mode_request"] = None
-                if mode_req != autopilot_mode:
-                    patrol.close()
-                    if mode_req == "hover":
-                        patrol = HoverHold(pos=P)
-                    elif mode_req == "waypoint":
-                        patrol = WaypointMission(pos=P)
-                    elif mode_req == "competition":
-                        # 本番のウェイポイントはフィールド固定座標なので原点基準で生成する
-                        patrol = SquarePatrol(start_x=0.0, start_y=0.0)
-                    autopilot_mode = mode_req
-                    print(f"[Mode] → {autopilot_mode}")
 
             # ── ヨー推定を1ステップ進める ───────────────────
             # ★ ここでの update() は1ループ1回だけ。参照は current() を使う
@@ -284,11 +224,6 @@ def run_main_loop(cam1, cam2,
                 ye = yaw_est.update(now_ap)
                 if ye.valid:
                     yaw_rad = math.radians(ye.yaw_deg)
-
-            if P is not None and dt_ap > 0:
-                _last_cmd = patrol.update(pos=P, vel=vel_ap, dt=dt_ap,
-                                          heading_rad=yaw_rad,
-                                          is_dummy=in_dummy)
 
             # ── ウェイポイントミッション ────────────────────
             #  ★ 順番が大事: 先にキー要求を処理し、そのあと update() する。
@@ -379,10 +314,8 @@ def run_main_loop(cam1, cam2,
                          "valid": m_yaw_valid, "src": yaw_src},
                         event=mission.take_event())
 
-            # ── 自律制御コマンドをground_receiver経由でドローンへ送信 ──
+            # ── ヨー推定値をground_receiver経由でドローンへ送信 ──
             if alt_sensor is not None:
-                alt_sensor.send_autopilot_command(_last_cmd)
-
                 # ヨーは 0.5〜1Hz でよい。速くしても通信ジッタが姿勢に乗るだけ
                 if yaw_est is not None and now_ap - last_yaw_send >= 1.0 / YAW_SEND_HZ:
                     last_yaw_send = now_ap
@@ -394,11 +327,6 @@ def run_main_loop(cam1, cam2,
                         # 機体側は valid=0 を完全に無視すること
                         alt_sensor.send_yaw(YAW_INITIAL_ALIGN_DEG, False)
 
-            rc_start = time.perf_counter()
-            rc_img = view_rc.get_image(_last_cmd)
-            cv2.imshow("RC Command", rc_img)
-            rc_ms = (time.perf_counter() - rc_start) * 1000.0
-
             # ── matplotlib系（レート制限） ──────────────────
             now = time.time()
             velocity_ms = 0.0
@@ -407,14 +335,27 @@ def run_main_loop(cam1, cam2,
                 last_mpl_render = now
 
                 roll_deg, pitch_deg = 0.0, 0.0
-                imu_available = alt_sensor is not None
-                if imu_available:
+                imu_available = False
+                attitude_source = None
+                # 通常の自動飛行では SERIAL_ENABLED=False。IM920で届く実機の
+                # Roll/Pitch を優先してADIへ渡す。旧シリアル経路はフォールバック。
+                tel = link.state() if link is not None else {}
+                if link is not None and link.telemetry_ok() and "roll" in tel and "pitch" in tel:
+                    roll_deg = float(tel["roll"])
+                    pitch_deg = float(tel["pitch"])
+                    imu_available = True
+                    attitude_source = "IM920"
+                elif alt_sensor is not None:
                     roll_deg, pitch_deg = accel_to_angles(alt_sensor.get_accel())
+                    imu_available = True
+                    attitude_source = "serial accel"
 
                 velocity_start = time.perf_counter()
-                vel_img = velocity_view.get_image(P, roll_deg, pitch_deg, imu_available)
+                vel_img = velocity_view.get_image(
+                    P, roll_deg, pitch_deg, imu_available, attitude_source)
                 cv2.imshow("Velocity", vel_img)
                 velocity_ms = (time.perf_counter() - velocity_start) * 1000.0
+                link_view.render_and_show(link)
 
                 if O1 is not None:
                     target_alt = controller.get_target()
@@ -424,7 +365,6 @@ def run_main_loop(cam1, cam2,
 
             display_values = {
                 "Display_ms": (time.perf_counter() - display_loop_start) * 1000.0,
-                "RC_ms": rc_ms,
                 "Velocity_ms": velocity_ms,
                 "Graph_ms": graph_ms,
             }
@@ -434,7 +374,7 @@ def run_main_loop(cam1, cam2,
                     print(f"[Mission] {mission.status_line()}")
                 print("[PERF] display "
                       f"total={display_values['Display_ms']:.1f}ms "
-                      f"rc={rc_ms:.1f}ms velocity={velocity_ms:.1f}ms "
+                      f"velocity={velocity_ms:.1f}ms "
                       f"graph={graph_ms:.1f}ms")
                 display_perf_time = time.time()
 
@@ -474,11 +414,11 @@ def run_main_loop(cam1, cam2,
     if ble_tap is not None:
         ble_tap.stop()
 
-    patrol.close()
     if alt_sensor is not None:
         alt_sensor.stop()
     dashboard.close()
     velocity_view.close()
+    link_view.close()
     display_perf_log.close()
     cv2.destroyAllWindows()
     for _ in range(10):

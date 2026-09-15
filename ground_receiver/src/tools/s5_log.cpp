@@ -35,6 +35,7 @@
 //      DATA,<値...>         ... 1パケット = 1行
 //      LOG_STOP
 //      PARAM,<ゲイン...>    ... 数秒に1回。どのゲインで飛んでいたかの記録
+//      STAT,k=v,...         ... 毎秒。PCの通信診断画面用（CSVには含めない）
 //      # ...                ... 人間向けのメッセージ (PC側は読み飛ばす)
 //
 //  ★ 配線は im920_passthrough.cpp と同じ (XIAO TX=D6/GP0 -> IM920 RXD,
@@ -137,6 +138,7 @@ static uint32_t cmd_last_pc_ms = 0;   // PC から最後に行が来た時刻
 static uint32_t cmd_last_tx_ms = 0;
 static uint32_t n_cmd_lines = 0, n_cmd_tx = 0, n_cmd_bad = 0;
 static uint8_t  cmd_seq = 0;
+static bool     im920_boot_ok = false;
 
 constexpr uint32_t CMD_TX_INTERVAL_MS = 200;   // 5Hz
 // PC からこの時間なにも来なければ送信を止める (機体はフェイルセーフへ)
@@ -236,6 +238,21 @@ static void emitParam(const S5T::ParamFrame& p) {
                   p.alt_rate_ki / S5T::SC_GAIN, p.alt_rate_kd / S5T::SC_GAIN,
                   p.alt_hover_thr / S5T::SC_GAIN, p.alt_target_m / S5T::SC_GAIN,
                   p.flow_max_lean / S5T::SC_GAIN, p.alt_thr_auth / S5T::SC_GAIN);
+}
+
+// PC の常時診断画面用。CSVとは別のため、CSV出力のON/OFFに関係なく送る。
+// 1秒ごとの短い行だけなので、USB側の帯域や無線パケットには影響しない。
+static void emitStat() {
+    Serial.printf("STAT,im920_ok=%d,rx_bytes=%lu,rx_lines=%lu,alt=%lu,pos=%lu,att=%lu,"
+                  "param=%lu,lost=%lu,badcs=%lu,badlen=%lu,cmd_lines=%lu,cmd_tx=%lu,"
+                  "cmd_bad=%lu,cmd_have=%d\n",
+                  im920_boot_ok ? 1 : 0,
+                  (unsigned long)n_rx_bytes, (unsigned long)n_rx_lines,
+                  (unsigned long)n_alt, (unsigned long)n_pos, (unsigned long)n_att,
+                  (unsigned long)n_param, (unsigned long)n_lost,
+                  (unsigned long)n_bad_cs, (unsigned long)n_bad_len,
+                  (unsigned long)n_cmd_lines, (unsigned long)n_cmd_tx,
+                  (unsigned long)n_cmd_bad, cmd_have ? 1 : 0);
 }
 
 // 量子化を物理値へ戻して 1行書く。CSV_HEADER と同じ順であること。
@@ -713,8 +730,10 @@ void imBootCheck() {
     got.trim();
 
     if (got.length() == 0) {
+        im920_boot_ok = false;
         Serial.println("# [BOOT CHECK] IM920 応答なし。配線/電源(3V3か)/ボーレート(19200)を確認してください。");
     } else {
+        im920_boot_ok = true;
         Serial.printf("# [BOOT CHECK] IM920 応答あり: %s\n", got.c_str());
     }
 }
@@ -778,6 +797,10 @@ void loop() {
     serviceCmdTx();
 
     const uint32_t now = millis();
+
+    // PC側の常時診断用。STAT は S5Link が受け取り、画面にだけ表示する。
+    static uint32_t last_stat = 0;
+    if (now - last_stat >= 1000) { last_stat = now; emitStat(); }
 
     // --- CSV を出していないときは、人間向けの状態を 1秒ごとに流す ---
     if (!csv_on) {

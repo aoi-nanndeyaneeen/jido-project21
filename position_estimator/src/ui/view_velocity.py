@@ -32,7 +32,8 @@ class ViewVelocity:
             return np.zeros(3)
         return (P1 - P0) / dt
 
-    def get_image(self, P, roll_deg=0.0, pitch_deg=0.0, imu_available=False):
+    def get_image(self, P, roll_deg=0.0, pitch_deg=0.0, imu_available=False,
+                  attitude_source=None):
         image = np.full((self.H, self.W, 3), (245, 245, 245), dtype=np.uint8)
         velocity = np.zeros(3)
         if P is not None:
@@ -43,7 +44,7 @@ class ViewVelocity:
         altitude = float(P[2]) if P is not None else 0.0
         self._draw_top(image, P, velocity)
         self._draw_metrics(image, speed_h, speed_3d, altitude_rate, altitude)
-        self._draw_adi(image, roll_deg, pitch_deg, imu_available)
+        self._draw_adi(image, roll_deg, pitch_deg, imu_available, attitude_source)
         return image
 
     def _top_point(self, x, y):
@@ -128,7 +129,7 @@ class ViewVelocity:
             cv2.putText(image, value, (x + 180, y), font, 0.65, (20, 20, 20), 2)
             cv2.line(image, (x, y + 12), (980, y + 12), (210, 210, 210), 1)
 
-    def _draw_adi(self, image, roll_deg, pitch_deg, imu_available):
+    def _draw_adi(self, image, roll_deg, pitch_deg, imu_available, attitude_source):
         font = cv2.FONT_HERSHEY_SIMPLEX
         center = (820, 355)
         radius = 95
@@ -174,6 +175,8 @@ class ViewVelocity:
         label = f"Attitude  R:{roll_deg:+.0f} deg  P:{pitch_deg:+.0f} deg"
         if not imu_available:
             label += "  (NO SENSOR)"
+        elif attitude_source:
+            label += f"  ({attitude_source})"
         cv2.putText(image, label, (660, 486), font, 0.46, (70, 70, 70), 1)
 
     def close(self):
