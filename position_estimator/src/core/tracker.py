@@ -20,6 +20,7 @@ from pathlib import Path
 
 from core.geometry     import intersect_rays
 from core.dummy_flight import DummyFlight
+from core.blink        import BlinkTracker
 from utils.logger      import FlightLogger, PerformanceLogger
 from utils.config      import (MAX_RESIDUAL_M,
                                 DUMMY_FALLBACK_FRAMES,
@@ -28,7 +29,15 @@ from utils.config      import (MAX_RESIDUAL_M,
                                 DUMMY_ORBIT_PERIOD,
                                 GATE_X, GATE_Y, GATE_Z,
                                 TRACK_COAST_SEC,
-                                TRACK_MAX_SPEED_MPS)
+                                TRACK_MAX_SPEED_MPS,
+                                BLINK_DETECT_ENABLED,
+                                LED_BLINK_HZ,
+                                BLINK_MATCH_DIST_PX,
+                                BLINK_HISTORY_SEC,
+                                BLINK_MIN_CYCLES,
+                                BLINK_PERIOD_TOL,
+                                BLINK_MATURE_SEC,
+                                CAMERA_FPS)
 
 
 def _in_gate(P) -> bool:
@@ -111,6 +120,21 @@ def camera_thread_func(cam1, cam2,
 
     selector = PairSelector()
 
+    blink1 = BlinkTracker(cam1.label, LED_BLINK_HZ, camera_fps=CAMERA_FPS,
+                          match_dist_px=BLINK_MATCH_DIST_PX,
+                          history_sec=BLINK_HISTORY_SEC,
+                          min_cycles=BLINK_MIN_CYCLES,
+                          period_tol=BLINK_PERIOD_TOL,
+                          mature_sec=BLINK_MATURE_SEC,
+                          enabled=BLINK_DETECT_ENABLED)
+    blink2 = BlinkTracker(cam2.label, LED_BLINK_HZ, camera_fps=CAMERA_FPS,
+                          match_dist_px=BLINK_MATCH_DIST_PX,
+                          history_sec=BLINK_HISTORY_SEC,
+                          min_cycles=BLINK_MIN_CYCLES,
+                          period_tol=BLINK_PERIOD_TOL,
+                          mature_sec=BLINK_MATURE_SEC,
+                          enabled=BLINK_DETECT_ENABLED)
+
     no_detect_count = 0
     in_dummy_mode   = False
     frame_count     = 0
@@ -128,11 +152,19 @@ def camera_thread_func(cam1, cam2,
                 loop_start = time.perf_counter()
                 # ── 両カメラからフレームを取得 ──────────────────
                 cam1_start = time.perf_counter()
-                frame1, cands1, _ = cam1.read_and_detect()
+                frame1, cands1, ts1 = cam1.read_and_detect()
                 cam1_ms = (time.perf_counter() - cam1_start) * 1000.0
                 cam2_start = time.perf_counter()
-                frame2, cands2, _ = cam2.read_and_detect()
+                frame2, cands2, ts2 = cam2.read_and_detect()
                 cam2_ms = (time.perf_counter() - cam2_start) * 1000.0
+
+                # ── LED点滅パターンによる候補フィルタ（Phase A.5） ──
+                #  幾何整合より前に、点滅しない静的な明点（窓の反射・照明）
+                #  を落とす。BLINK_DETECT_ENABLED=False なら素通し。
+                if ts1:
+                    cands1 = blink1.filter(cands1, ts1)
+                if ts2:
+                    cands2 = blink2.filter(cands2, ts2)
 
                 # ── 候補ペアの幾何整合で機体を1組選ぶ（Phase B） ──
                 P_vec, residual, idx1, idx2 = selector.select(
@@ -231,6 +263,8 @@ def camera_thread_func(cam1, cam2,
                     cam1.reset_background()
                     cam2.reset_background()
                     selector.reset()   # 追従の基準位置もリセット
+                    blink1.reset()
+                    blink2.reset()
                     print("[Tracker] Background reset")
 
                 # ── plot_data 更新 ────────────────────────────────

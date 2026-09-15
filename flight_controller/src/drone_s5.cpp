@@ -2546,6 +2546,7 @@ static void printStatus(uint32_t dt_us) {
 // ============================================================
 void setup() {
     StatusLed::begin();   // 他の初期化より先に。起動直後から状態が見えるように
+    BlinkLed::begin();
 
     Serial.begin(115200);
     const uint32_t start_ms = millis();
@@ -2825,6 +2826,11 @@ void loop() {
     } else {
         StatusLed::green();
     }
+
+    // --- 機体検出用 LED (pin 21/22/23): 白色 6Hz 点滅 --------------------
+    // 6Hz は1周期約167ms、50% dutyなので約83msごとにON/OFFする。
+    const bool detection_led_on = (millis() % 167u) < 83u;
+    BlinkLed::white(detection_led_on);
 
     if (g_sd_ok) {
         static bool s_sd_was_armed = false;

@@ -291,9 +291,9 @@ MISSION_FENCE_Z = 2.5
 
 # 逸脱がこの秒数続いたら中断する。1フレームの誤検知で落とさないため。
 #  ★ 代償: 本物の逸脱にはこの秒数だけ反応が遅れる。指令速度の上限が
-#    0.4m/s なので、2秒なら最大 0.8m 余分に出る。フェンスの外に
+#    0.4m/s なので、0.5秒なら最大 0.2m 余分に出る。フェンスの外に
 #    それだけの余地があることを確認してから伸ばすこと。
-MISSION_FENCE_GRACE_S = 2.0
+MISSION_FENCE_GRACE_S = 0.5
 
 for _n, _f, _g in (("X", MISSION_FENCE_X, GATE_X[1]),
                    ("Y", MISSION_FENCE_Y, GATE_Y[1]),
@@ -614,3 +614,29 @@ STATIC_BRIGHT_MASK       = DETECTION["static_bright_mask"]
 STATIC_MASK_LEARN_FRAMES = DETECTION["static_mask_learn_frames"]
 STATIC_MASK_RATIO        = DETECTION["static_mask_ratio"]
 STATIC_MASK_DILATE_PX    = DETECTION["static_mask_dilate_px"]
+
+# ==========================================
+# LED点滅パターンによる候補フィルタ (core/blink.py)
+# ==========================================
+# カメラ検知（motion/bright）は「明るい/動いた」としか言えず、1枚の画像
+# だけでは窓の反射や照明と機体を区別できない。機体のLEDを一定の周波数で
+# 点滅させておき、候補が時間方向にその周波数で明滅しているかを見て、
+# 点滅しない静的な明点を積極的に落とす。tracker.py が2カメラそれぞれに
+# 1個ずつ BlinkTracker を持ち、PairSelector（幾何整合）より前段でかける。
+#
+# ★ LED_BLINK_HZ は「実効カメラFPSの半分未満」でなければ標本化定理に
+#   反し、点滅を復元できない（エイリアシング）。さらにフレーム取りこぼし
+#   を吸収するため、目安は実効FPSの1/4〜1/6程度にすること。
+#   例: 要求60fpsでも実測30fps前後のことが多い → LED_BLINK_HZ=5〜7Hz。
+#   実際の値は起動時ログの実効FPS表示 ([Camera] 初期化完了: ...@X.Xfps)
+#   を見て決め、BlinkTracker初期化時のナイキスト警告が出ないことを確認する。
+#
+# ★ LED本体の点滅は機体側 (flight_controller) で作る。ここはあくまで
+#   カメラ側の検出ロジック。点滅周波数はここの値と機体側を必ず一致させること。
+BLINK_DETECT_ENABLED = True    # True で bright/bright_or_motion 系候補に点滅整合フィルタをかける
+LED_BLINK_HZ         = 6.0     # 機体LEDの点滅周波数 [Hz]
+BLINK_MATCH_DIST_PX  = 30      # フレーム間で同一光点とみなす最大移動量 [px]
+BLINK_HISTORY_SEC    = 1.2     # 立ち上がり間隔の判定に使う直近の時間窓 [s]
+BLINK_MIN_CYCLES     = 3       # スコアが満点になるまでに必要な整合周期数
+BLINK_PERIOD_TOL     = 0.35    # 周期のずれ許容比率 (目標周期の±35%まで「整合」とみなす)
+BLINK_MATURE_SEC     = 0.6     # この期間より若いトラックはスコア不足でも捨てない（判定猶予）
