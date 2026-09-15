@@ -183,6 +183,10 @@ class WaypointMission:
         self.link = link
         self.waypoints = [tuple(float(v) for v in wp) for wp in waypoints]
         self.home = tuple(home) if home is not None else None
+        # 呼び出し側が戻り先を固定したか。None なら毎フライト離陸地点から決め直す。
+        self._home_fixed = self.home
+        # アーム中に地上 (airborne=0) で最後に見えた位置 (x, y)。ディスアームで消す。
+        self._ground_pos = None
         self.verbose = verbose
 
         self.phase = Phase.IDLE
@@ -265,6 +269,9 @@ class WaypointMission:
         #   より安全 (中心なら三方の壁から距離が最大になる)。
         self._path = [(0.0, 0.0, self.TAKEOFF_ALT_M)] + self.waypoints
         self._returning = False
+        # 前のフライトの戻り先を持ち越さない (同じプログラムで2便目を飛ばすと、
+        # 1便目の離陸地点へ戻っていた)。
+        self.home = self._home_fixed
         self._vcam = None
         self._prev_cam = None
         self._hold_inside = False
@@ -370,6 +377,17 @@ class WaypointMission:
                        (2026-09-14: 複数回リトライする間に手動操作で機首が
                        30度以上ズレたまま気づかなかった事故を参照)。
         """
+        # ★ 離陸地点 (RTL の戻り先) は、ミッション開始前から見ておく必要がある。
+        #   自動開始は GUIDED に入った瞬間 = POSHOLD で手動離陸した後なので、
+        #   ミッションの TAKEOFF 時点の位置は「浮いてから流れた先」になる
+        #   (2026-09-15 20:20: 実際の離陸地点 (0,-1) 付近ではなく (-0.54,-0.70)
+        #   へ戻って着陸した)。アーム中に地上にいる間の最後の位置を覚える。
+        st_ground = self.link.state()
+        if not st_ground.get("armed"):
+            self._ground_pos = None
+        elif not st_ground.get("airborne") and pos_valid and pos is not None:
+            self._ground_pos = (float(pos[0]), float(pos[1]))
+
         if self.phase in (Phase.IDLE, Phase.DONE, Phase.ABORT):
             return
 
@@ -460,12 +478,21 @@ class WaypointMission:
             self._send(REQ_TAKEOFF, alt_m=self.TAKEOFF_ALT_M, flags=flags,
                        yaw_rad=yaw_rad)
             if abs(h_agl - self.TAKEOFF_ALT_M) < self.TAKEOFF_TOL_M:
-                # 離陸地点を覚える (RTL の戻り先)。カメラが見えていれば実測。
-                if self.home is None and pos is not None:
-                    self.home = (float(pos[0]), float(pos[1]), self.TAKEOFF_ALT_M)
-                    self._say(f"離陸地点を記録: "
-                              f"({self.home[0]:+.2f}, {self.home[1]:+.2f})")
-                self._say(f"離陸完了 (対地 {h_agl:.2f} m) -> WP0 へ")
+                # 離陸地点を覚える (RTL の戻り先)。地上にいた位置を優先し、
+                # 見えていなければ今の位置で代用する。
+                home_note = ""
+                if self._home_fixed is None:
+                    if self._ground_pos is not None:
+                        self.home = (self._ground_pos[0], self._ground_pos[1],
+                                     self.TAKEOFF_ALT_M)
+                        home_note = "地上の位置"
+                    elif pos is not None:
+                        self.home = (float(pos[0]), float(pos[1]), self.TAKEOFF_ALT_M)
+                        home_note = "地上で見えていなかったため今の位置"
+                if self.home is not None and home_note:
+                    home_note = (f"  戻り先=({self.home[0]:+.2f}, {self.home[1]:+.2f}) "
+                                 f"[{home_note}]")
+                self._say(f"離陸完了 (対地 {h_agl:.2f} m) -> WP0 へ{home_note}")
                 self._goto(Phase.CRUISE)
             elif now - self._t_phase > self.TAKEOFF_TIMEOUT_S:
                 self.reason = "離陸がタイムアウト"
