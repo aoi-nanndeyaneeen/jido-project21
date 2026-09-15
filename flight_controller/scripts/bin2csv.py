@@ -77,7 +77,8 @@ HEADER = (
     "alt_base,alt_corr,alt_thr,"
     "alt_used,"
     "accx,accy,accz,"
-    "acc_up,est_h,est_vz,est_bias"
+    "acc_up,est_h,est_vz,est_bias,"
+    "sbus_fs,sbus_lost,sbus_stale"
 )
 
 # flags のビット (RamLog::RFlag)
@@ -126,6 +127,7 @@ def _row(rec, hover_thr):
         f'{d["accx"]/1000:.4f}', f'{d["accy"]/1000:.4f}', f'{d["accz"]/1000:.4f}',
         f'{d["acc_up"]/1000:.3f}', f'{d["est_h"]/1000:.3f}',
         f'{d["est_vz"]/1000:.3f}', f'{d["est_bias"]/1000:.3f}',
+        1 if f & (1 << 6) else 0, 1 if f & (1 << 7) else 0, 1 if f & (1 << 8) else 0,
     ])
 
 

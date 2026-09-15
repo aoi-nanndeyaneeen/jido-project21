@@ -212,6 +212,10 @@ public:
         return false;
     }
 
+    // SBUS フレームの状態ビット (bfs::SbusData)。ログ/テレメトリの診断用。
+    bool failsafeFlag()  const { return _data.failsafe; }
+    bool lostFrameFlag() const { return _data.lost_frame; }
+
     bool isSafe() {
         return !_data.failsafe && !(connection_fail>3000);
     }

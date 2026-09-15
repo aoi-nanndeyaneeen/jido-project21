@@ -60,6 +60,10 @@ enum RFlag : uint16_t {
     RF_ALT_EN   = 1u << 3,
     RF_ALT_ACT  = 1u << 4,
     RF_HOLDING  = 1u << 5,   // poshold.holding()
+    // ★ 2026-09-15: スロットルが 1 フレームで 0.064 へ飛ぶ事象 (3便) の切り分け用。
+    RF_SBUS_FS    = 1u << 6, // 受信機がフェイルセーフビットを立てている
+    RF_SBUS_LOST  = 1u << 7, // 受信機が lost_frame ビットを立てている
+    RF_SBUS_STALE = 1u << 8, // このループで新しい SBUS フレームが取れていない
 };
 
 // ★ Rec の列を足す/型を変えたら +1 する。SdLog の BIN ヘッダに書き込まれ、
@@ -142,7 +146,8 @@ constexpr char HEADER[] =
     // --- 2026-09-07: 加速度Z×測距の相補フィルタ (quad/AltEstimator.h)。
     //     ALT_USE_ACC_FUSION=false の間は制御に未使用、記録のみ。
     //     est_vz が climb より何ms 速いかを analyze_alt_pid.py が判定する。
-    "acc_up,est_h,est_vz,est_bias";
+    "acc_up,est_h,est_vz,est_bias,"
+    "sbus_fs,sbus_lost,sbus_stale";
 
 // ============================================================
 //  formatRow  -  Rec を CSV 1 行にする「唯一のフォーマッタ」
@@ -170,7 +175,7 @@ inline void formatRow(Print& out, const Rec& r, bool with_prefix = true) {
         "%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.4f,%.3f,"
         "%.3f,"
         "%.4f,%.4f,%.4f,"
-        "%.3f,%.3f,%.3f,%.3f\n",
+        "%.3f,%.3f,%.3f,%.3f,%d,%d,%d\n",
         (unsigned long)r.t_ms, (unsigned long)r.dt_us, (int)r.mode,
         (r.flags & RF_ARMED) ? 1 : 0, r.thr / 250.0f,
         r.roll_stick / 100.0f, r.pitch_stick / 100.0f, r.yaw_stick / 100.0f,
@@ -198,7 +203,9 @@ inline void formatRow(Print& out, const Rec& r, bool with_prefix = true) {
         r.alt_used / 250.0f,
         r.accx / 1000.0f, r.accy / 1000.0f, r.accz / 1000.0f,
         r.acc_up / 1000.0f, r.est_h / S5T::SC_MM,
-        r.est_vz / S5T::SC_MM, r.est_bias / 1000.0f);
+        r.est_vz / S5T::SC_MM, r.est_bias / 1000.0f,
+        (r.flags & RF_SBUS_FS) ? 1 : 0, (r.flags & RF_SBUS_LOST) ? 1 : 0,
+        (r.flags & RF_SBUS_STALE) ? 1 : 0);
 }
 
 // ============================================================

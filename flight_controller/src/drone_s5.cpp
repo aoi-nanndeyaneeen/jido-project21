@@ -720,6 +720,11 @@ static void fillRec(FlightLog::Rec& r, uint32_t dt_us, int mode, bool armed, flo
     if (g_alt_hold_enable)   f |= FlightLog::RF_ALT_EN;
     if (althold.active())    f |= FlightLog::RF_ALT_ACT;
     if (poshold.holding())   f |= FlightLog::RF_HOLDING;
+    if (S5::USE_SBUS) {
+        if (sbus.failsafeFlag())    f |= FlightLog::RF_SBUS_FS;
+        if (sbus.lostFrameFlag())   f |= FlightLog::RF_SBUS_LOST;
+        if (sbus.failCount() > 0)   f |= FlightLog::RF_SBUS_STALE;
+    }
     r.flags = f;
 
     r.mode   = (uint8_t)mode;
@@ -1485,17 +1490,31 @@ static S5::Mode selectMode() {
 //  使わない (ホールドが release された後のスロットルは生値のまま)。
 static float g_hold_thr_gate     = 0.0f;
 static uint32_t g_thr_low_since  = 0;
+static bool  g_thr_glitch        = false;   // 1フレームで飛んだ下がり方だったか
 static float holdGateThrottle() {
     const float raw = S5::USE_SBUS ? constrain(sbus.des[Ch::THR], 0.0f, 1.0f) : 0.0f;
     const float th  = fminf(Q::FLOW_ENABLE_THR, Q::ALT_ENABLE_THR);
     const uint32_t now = millis();
     if (raw > th || Q::HOLD_THR_DROP_DEBOUNCE_MS == 0) {
         g_thr_low_since = 0;
+        g_thr_glitch    = false;
         g_hold_thr_gate = raw;
         return raw;
     }
-    if (g_thr_low_since == 0) g_thr_low_since = now;
-    if (now - g_thr_low_since >= Q::HOLD_THR_DROP_DEBOUNCE_MS) {
+    if (g_thr_low_since == 0) {
+        g_thr_low_since = now;
+        // ★ 直前の値からいきなり HOLD_THR_GLITCH_STEP 以上落ちた = 人の手では
+        //   出ない遷移 (LOG0007/0017/0018 で 3 回とも 1 フレームで 0.064 へ)。
+        //   受信機のプリセット値/再起動の疑いが強いので長めに保持する。
+        g_thr_glitch = (g_hold_thr_gate - raw) > Q::HOLD_THR_GLITCH_STEP;
+    }
+    // 他のスティックが動いた = パイロットが操作している → 通常の短い猶予に戻す
+    const bool pilot_active = S5::USE_SBUS &&
+        (fabsf(sbus.des[Ch::ROLL]) > 0.10f || fabsf(sbus.des[Ch::PITCH]) > 0.10f ||
+         fabsf(sbus.des[Ch::YAW])  > 0.10f);
+    const uint32_t hold_ms = (g_thr_glitch && !pilot_active)
+                           ? Q::HOLD_THR_GLITCH_HOLD_MS : Q::HOLD_THR_DROP_DEBOUNCE_MS;
+    if (now - g_thr_low_since >= hold_ms) {
         g_hold_thr_gate = raw;
         return raw;
     }

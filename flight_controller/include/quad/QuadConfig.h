@@ -905,6 +905,13 @@ constexpr float ALT_ENABLE_THR = 0.15f;
 //   受信側の値飛び。パイロットの本物の bail-out は 200ms 以内に降りて
 //   くるので体感は変わらない。0 で従来動作 (即時)。
 constexpr uint32_t HOLD_THR_DROP_DEBOUNCE_MS = 200;
+// 1 フレームでこれ以上落ちた「飛び」は受信機側の異常とみなし、他のスティックが
+// 動かない限り HOLD_THR_GLITCH_HOLD_MS までホールドを維持する。
+// ★ 2026-09-15 LOG0007/0017/0018: 3便とも 1 フレーム (8ms) で 0.50〜0.64 → 0.064
+//   (スティックの下端 0.000 とも違う、受信機のプリセットらしい値)。POSHOLD 単独
+//   でも起きたので地上局は無関係。手の操作なら数十 ms のランプが必ず残る。
+constexpr float    HOLD_THR_GLITCH_STEP    = 0.30f;
+constexpr uint32_t HOLD_THR_GLITCH_HOLD_MS = 2500;
 
 // ---- 離陸検知 (地上での積分ワインドアップ対策) ----------------
 //  地上に置いたままだと フロー速度は常に 0、高度も上がらないので、
