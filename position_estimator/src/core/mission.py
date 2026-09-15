@@ -158,8 +158,23 @@ class WaypointMission:
     TAKEOFF_TOL_M   = 0.15  # この差まで来たら離陸完了
     TAKEOFF_TIMEOUT_S = 20.0
 
-    # 指令レート [Hz]。XIAO が 5Hz に間引くので、それ以上送っても無駄。
-    SEND_HZ = 5.0
+    # 指令レート [Hz]。
+    #  ★ 2026-09-16: 5 -> 10。以前は XIAO が 200ms の格子で再度間引いて
+    #    いたので「5Hz より速く送っても無駄」だったが、地上局側を
+    #    「届いた順に、最短 125ms 間隔で流す」に変えた
+    #    (s5_log.cpp の CMD_MIN_GAP_MS)。今は PC が速く送るほど、
+    #    地上局の蓋が開いた瞬間に渡せる指令が新しくなる。
+    #    帯域の上限を決めるのは地上局側だけなので、ここを上げても
+    #    無線が混むことはない (PC が送った行は最新1件だけが生き残る)。
+    SEND_HZ = 10.0
+
+    # カメラ速度 (_vcam) を計算するときの最小の時間差 [s]。
+    #  ★ SEND_HZ を上げたぶん、そのままだと 0.1 秒ぶんの位置差分で
+    #    微分することになる。Camera1 は 15〜30fps しか出ていないので、
+    #    0.1 秒だと同じカメラサンプルを 2 回引いて速度 0 になる回が出る。
+    #    速度は従来と同じ 0.2 秒前後の差分から取り、指令レートとは
+    #    切り離す (指令は速く、微分は従来どおり)。
+    VEL_DT_MIN_S = 0.15
 
     # yaw_src が "fixed" のとき、機体自身の実測yaw(アーム基準)がこれ未満
     # ならフル速度 (MAX_VEL) で飛ばしてよいとみなす閾値 [deg]。
@@ -603,18 +618,28 @@ class WaypointMission:
         self._goto(Phase.CRUISE)
 
     def _update_camera_velocity(self, now, pos, pos_valid):
-        """送信ごと (5Hz) のカメラ位置差分から、フィールド座標の速度を平滑化して持つ。"""
+        """カメラ位置の差分から、フィールド座標の速度を平滑化して持つ。
+
+        ★ 送信のたび (SEND_HZ) に呼ばれるが、微分に使う時間差は
+          VEL_DT_MIN_S 以上が溜まるまで基準点を進めない。指令を速くしても
+          微分の刻みが細かくならないようにするため (Camera1 は 15〜30fps
+          しか無いので、0.1 秒だと同じサンプルを引いて速度 0 になる)。
+        """
         if not pos_valid or pos is None:
             self._prev_cam = None
             self._vcam = None
             return
         x, y = float(pos[0]), float(pos[1])
         prev = self._prev_cam
-        self._prev_cam = (x, y, now)
         if prev is None:
+            self._prev_cam = (x, y, now)
             return
         dt = now - prev[2]
-        if not (0.05 < dt < 0.6):
+        if dt < self.VEL_DT_MIN_S:
+            # まだ差分を取るには近すぎる。基準点は据え置き、前回の速度を保つ。
+            return
+        self._prev_cam = (x, y, now)
+        if dt > 0.6:
             self._vcam = None
             return
         vx, vy = (x - prev[0]) / dt, (y - prev[1]) / dt

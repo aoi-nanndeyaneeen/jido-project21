@@ -9,7 +9,7 @@ import numpy as np
 class LinkStatusView:
     """PC が得られる通信事実だけを、区間ごとに表示する。"""
 
-    W, H = 760, 300
+    W, H = 760, 344
 
     _GREEN = (55, 150, 70)
     _YELLOW = (30, 180, 230)
@@ -52,7 +52,8 @@ class LinkStatusView:
             self._line(image, 122, "Ground station - IM920 UART", "UNKNOWN", "idle")
             self._line(image, 166, "Drone -> PC telemetry", "UNKNOWN", "idle")
             self._line(image, 210, "PC -> Drone command", "UNKNOWN", "idle")
-            self._line(image, 254, "Flight controller", "UNKNOWN", "idle")
+            self._line(image, 254, "  ... as seen by aircraft", "UNKNOWN", "idle")
+            self._line(image, 298, "Flight controller", "UNKNOWN", "idle")
             cv2.imshow("Link Status", image)
             return
 
@@ -88,14 +89,44 @@ class LinkStatusView:
             down_state = "warn"
 
         cmd_tx = int(stat.get("cmd_tx", 0))
+        im_ng = int(stat.get("im_ng", 0))
         cmd_have = bool(stat.get("cmd_have", False))
         fc_fresh = bool(link.flag("cmd_fresh"))
+        up_detail = f"gs sent {cmd_tx}, IM920 refused {im_ng}"
         if not cmd_have:
             up_state, up_value, up_detail = "idle", "IDLE", "PC is not commanding the aircraft"
         elif fc_fresh:
-            up_state, up_value, up_detail = "ok", "OK", f"ground station sent {cmd_tx} commands"
+            up_state, up_value = "ok", "OK"
         else:
-            up_state, up_value, up_detail = "bad", "NOT ACKNOWLEDGED", f"ground station sent {cmd_tx} commands"
+            up_state, up_value = "bad", "NOT ACKNOWLEDGED"
+
+        # 機体が自分で数えた上りの受信状況 (D フレーム同乗。S5Telem.h)。
+        #  ★ 地上局の cmd_tx とは数え始めが違うので、絶対数の差は比較しない。
+        #    機体の good/lost だけで完結する欠落率と、最後に受けてからの
+        #    経過時間を見る。ここが「上りが遅いのか落ちているのか」の答え。
+        fc_good = stat.get("fc_cmd_good")
+        fc_lost = int(stat.get("fc_cmd_lost", 0))
+        fc_age_cs = int(stat.get("fc_cmd_age_cs", 0xFFFF))
+        if fc_good is None:
+            fc_up_state, fc_up_value = "idle", "NO D FRAME"
+            fc_up_detail = "waiting for the aircraft's uplink report"
+        elif fc_age_cs == 0xFFFF:
+            fc_up_state, fc_up_value = "bad", "NEVER RECEIVED"
+            fc_up_detail = "the aircraft has not seen a single command"
+        else:
+            fc_good = int(fc_good)
+            fc_total = fc_good + fc_lost
+            fc_loss = 100.0 * fc_lost / fc_total if fc_total else 0.0
+            fc_age_s = fc_age_cs / 100.0
+            fc_up_value = f"{fc_loss:.0f}% lost"
+            fc_up_detail = (f"got {fc_good}, lost {fc_lost}, "
+                            f"last {fc_age_s:.2f}s ago")
+            if fc_age_s > 1.0 or fc_loss >= 25.0:
+                fc_up_state = "bad"
+            elif fc_age_s > 0.5 or fc_loss >= 10.0:
+                fc_up_state = "warn"
+            else:
+                fc_up_state = "ok"
 
         st = link.state()
         if not st:
@@ -119,7 +150,9 @@ class LinkStatusView:
         self._line(image, 166, "Drone -> PC telemetry", down_value, down_state,
                    f"{down_detail}; {radio_detail}")
         self._line(image, 210, "PC -> Drone command", up_value, up_state, up_detail)
-        self._line(image, 254, "Flight controller", fc_value, fc_state, fc_detail)
+        self._line(image, 254, "  ... as seen by aircraft", fc_up_value, fc_up_state,
+                   fc_up_detail)
+        self._line(image, 298, "Flight controller", fc_value, fc_state, fc_detail)
         cv2.imshow("Link Status", image)
 
     def close(self):

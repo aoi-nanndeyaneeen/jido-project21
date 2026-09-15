@@ -43,10 +43,11 @@ IM920sL は半二重 19200bps、実効 15Hz、往復の遅れは 100〜200ms。
   カメラ (tracker)   -> フィールド座標の位置 P [m]
   yaw_estimator      -> 機首方位 psi [rad]
         |
-        v  position_estimator/src/core/mission.py   外側ループ 5Hz
+        v  position_estimator/src/core/mission.py   外側ループ 10Hz
    「機体座標の目標速度 [m/s]」 + 「目標対地高度 [m]」
         |
-        v  IM920 上り 5Hz  (S5Cmd.h / 14+4=18 バイト)
+        v  USB -> 地上局 (s5_log.cpp)。届いた順に無線へ。最短 125ms 間隔
+        v  IM920 上り 最大 8Hz  (S5Cmd.h / 20+4=24 バイト)
         |
   機体 PosHold  : 目標速度 -> 速度PID -> 目標リーン角     内側 100Hz
   機体 AltHold  : 目標高度 -> 位置/速度PID -> スロットル   内側  50Hz
@@ -316,7 +317,7 @@ MISSION_WAYPOINTS = [(0.3, 0.0, 0.50)]     # 右へ 0.3m だけ
 | `flight_controller/include/quad/AltHold.h` | `commandTarget(高度, スルーレート)` を追加。自動離陸・着陸の実体 |
 | `flight_controller/include/quad/PosHold.h` | `setVelCommand(vx, vy)` を追加。地上局の速度指令をスティック経路を通さず入れる |
 | `flight_controller/src/drone_s5.cpp` | § 6-4 に GUIDED 状態機械。旧 `GroundData` 経路を撤去。`MODE_AUTO` を GUIDED として復活 |
-| `ground_receiver/src/tools/s5_log.cpp` | PC からの `CMD,...` 行を 5Hz に間引いて無線へ中継。CSV に `guided/cmd_fresh/landed` 列を追加 |
+| `ground_receiver/src/tools/s5_log.cpp` | PC からの `CMD,...` 行を届いた順に無線へ中継 (最短 125ms 間隔)。CSV に `guided/cmd_fresh/landed` と上りリンク統計 `cmd_age/cmd_good/cmd_lost/cmd_bad` 列を追加 |
 | `position_estimator/src/core/s5_link.py` | **新規**。地上局 XIAO との双方向リンク（テレメトリ受信＋CSV保存＋コマンド送信） |
 | `position_estimator/src/core/mission.py` | **新規**。ミッション状態機械と外側位置ループ |
 | `position_estimator/src/app/main_loop.py` | `[M]` 開始 / `[X]` 中断 を配線 |
@@ -435,3 +436,77 @@ MISSION_WAYPOINTS = [
 
 **未検証。** 実機でこの経路と自動(再)開始の組み合わせを確認していない。
 低空・プロペラを外した状態から Phase 3 の手順で確認し直すこと。
+
+## 6. 2026-09-16 変更 — 上りの遅れを削る (F/A/B/C)
+
+### なぜ触ったか (実測)
+
+19 便ぶんの `mission_*.csv` で、PC が送った指令 `Cmd_Vx/Vy` と機体が返す
+目標速度 `Fh_Vxt/Vyt` を相互相関にかけたところ、**往復 0.75〜0.80 秒**
+(r ≒ 0.9) だった。内訳を切り分けると:
+
+| 区間 | 実測 / 推定 |
+|------|------|
+| 下り無線+地上局のばらつき (`rx_ms - t_ms`) | p99 で **±13ms**。ここに詰まりは無い |
+| 下りテレメトリ実効レート | 公称 12Hz に対し **10.5Hz** (12% 欠落) |
+| **B(水平位置)フレーム** | 公称 2.4Hz に対し **実測 1.5Hz**、間隔 p90 = **834ms** |
+| 上り (PC 5Hz + 地上局 5Hz の二重間引き) | 平均 200ms / 最悪 400ms の純粋な待ち |
+
+`fh_vxt` は B フレームにしか乗らない。つまり **体感していた遅れの半分以上は
+「機体が遅い」のではなく「機体がどうなったかが見えるまでが遅い」** だった。
+
+### 何を変えたか
+
+- **F: 上りリンクを機体側から観測できるようにした。**
+  `S5Telem.h` VERSION 8→9。`DvFrame` (12/28 byte しか使っていなかった) に
+  `cmd_age_cs / cmd_good / cmd_lost / cmd_bad / cmd_seq / cmd_rssi` を同乗。
+  **無線の帯域は 1 バイトも増えない。**
+  あわせて地上局が IM920 の `OK`/`NG` 応答を計数し (`n_im_ok` / `n_im_ng`)、
+  `STAT` と Link Status 画面に出す。`NG` = その上りコマンドは電波に出て
+  いない、という意味。
+- **A: 地上局の 200ms 格子を廃止。** `CMD_TX_INTERVAL_MS` を
+  `CMD_MIN_GAP_MS = 125` (帯域の蓋) と `CMD_KEEPALIVE_MS = 200`
+  (PC が黙ったときの再送) に分けた。新しい指令は蓋が開いていれば待たずに出る。
+  送信に失敗した回に時刻を進めていたバグ (その指令が黙って消える) も直した。
+- **B: 帯域を下りから上りへ付け替えた。** `TELEM_TX_HZ` 12→8、枠割りを
+  `A,B,D,A,C` (5枠) → `A,B,A,B,C,A,B,D` (8枠)。A 3Hz / B 3Hz / C 1Hz / D 1Hz。
+  UART 占有率は 58% → 53% と**むしろ軽くなる**のに B は 2.4→3Hz。
+- **C: PC 側の指令レートを 5→10Hz** (`mission.py` / `console.py`)。
+  帯域の蓋は地上局側だけなので、速く送るほど蓋が開いた瞬間に渡せる指令が
+  新しくなる。あわせて `_update_camera_velocity` は `VEL_DT_MIN_S = 0.15`
+  秒ぶん溜まるまで基準点を進めない (Camera1 は 15〜30fps しか無いので、
+  0.1 秒差分だと同じサンプルを引いて速度 0 になる)。
+
+### 焼き直しが要るもの
+
+**機体と地上局の両方**。`S5Telem.h` の VERSION が上がっているので、
+片方だけ焼くと `# 長さ不一致 type=0x44` と
+`# !! パケットバージョン不一致` が出る (出るように作ってある)。
+
+```bash
+cd flight_controller && pio run -e drone_s5     -t upload
+cd ground_receiver  && pio run -e xiao_s5_log   -t upload
+```
+
+### 飛ばした後に見る数字
+
+1. `s5_link_*.csv` の `frame==1` (B) の間隔 → **p50 330ms / p90 500ms 程度**に
+   なっていれば狙いどおり (旧: 420 / 834)。
+2. 同 CSV の `cmd_age` → 上りが 8Hz で届いていれば 0.00〜0.15 秒を行き来する。
+   ここが 0.3 秒を超えて張り付くなら上りが落ちている。
+3. `cmd_lost / (cmd_good + cmd_lost)` → 上りの欠落率。Link Status 画面の
+   `... as seen by aircraft` 行に同じものが出る。
+4. `STAT` の `im_ng` → 増え続けるなら半二重の取り合いで上りが弾かれている。
+   そのときは `TELEM_TX_HZ` をさらに下げる (8→6) のが先。
+5. `mission_*.csv` で `Cmd_Vx` vs `Fh_Vxt` の相互相関 → **0.35〜0.45 秒**まで
+   落ちていれば F/A/B/C は効いている。
+
+### まだ手を付けていない (次の候補)
+
+- **D: `_update_camera_velocity` の作り直し。** 今は 0.2 秒差分 + EMA(0.5) で、
+  この微分自体が 300ms 級の位相遅れを持つ。カメラは 30〜60fps 出ているので
+  直近 0.2 秒の最小二乗にすれば 1/3 以下になる。`KP_POS` / `MAX_VEL` を
+  上げられるかはここ次第で、**バッテリー時間に直結するのはこちら**。
+- **E: Camera1 の fps が便ごとに 10/15/16/30 と変わる。**
+  `TRACKING_EXPOSURE=-6` が効いた便だけ 30fps。露出を入れた後に実測 fps を
+  確認して、落ちていたら再設定＋警告する仕掛けが要る。

@@ -498,10 +498,25 @@ constexpr float I_ENABLE_THR = 0.15f;
 //  ★ 2026-09-11: GUIDED (上りコマンド 5Hz) を足したので 15 -> 12 に下げた。
 //    上り 18バイト = 43文字 = 22ms を 5Hz で足すと UART 占有率は
 //    55% + 11% = 66%。さらに IM920 は半二重なので、送信中は受信できない。
-//    15Hz のままだと上りが弾かれ、機体から見て「地上局が黙った」= 
+//    15Hz のままだと上りが弾かれ、機体から見て「地上局が黙った」=
 //    その場ホールドに落ちる現象が散発する。下りは 12Hz でも A/B/C の
 //    各フレームが 3〜6Hz 出るので、0.3〜2Hz の解析には足りる。
-constexpr int TELEM_TX_HZ = Quad::GUIDED_ENABLE ? 12 : 15;
+//
+//  ★ 2026-09-16: 12 -> 8 (GUIDED のときだけ)。帯域を下りから上りへ
+//    付け替える。理由:
+//      ・実測 (position_estimator/src/logs/s5_link_20260916_*.csv) では
+//        公称 12Hz に対して地上局に届いていたのは 10.5Hz = 12% 欠落。
+//        電波を使って捨てていた。
+//      ・その 12Hz を 5 枠 (A,B,D,A,C) で割っていたので B(水平位置) は
+//        公称 2.4Hz / 実測 1.5Hz、間隔 p90 = 834ms。PC が「自分の指令が
+//        効いたか」を見るのがこの B なので、**上りの遅れではなく下りの
+//        観測遅れ**が体感 1.5 秒の主犯だった。
+//      ・上り (CmdFrame 24B = 55文字 = 28.6ms) を 8Hz に上げても、
+//        UART 占有率は 下り 30% + 上り 23% = 53%。12Hz+5Hz の 58% より
+//        むしろ軽い。1秒あたりのパケット数も 17 -> 16 で減る。
+//    枠割りは下の tick() で A,B,A,B,C,A,B,D の 8 枠にしてあるので、
+//    8Hz でも A=3Hz / B=3Hz が出る (B は 2.4 -> 3Hz)。
+constexpr int TELEM_TX_HZ = Quad::GUIDED_ENABLE ? 8 : 15;
 
 // ゲイン一覧 (S5T::Param) を送る周期 [秒]。
 //  シリアル 'p' メニューで飛行中にゲインを変えられるので、CSV だけ見て
@@ -1217,8 +1232,13 @@ inline void sendAtt(int mode) {
     if (!s5tx.send(c)) tx_drop_flag = true;
 }
 
-// D: ヨー推定用の機体Δv。POSHOLD/AUTO でだけ送る (ANGLE/RATE では
-//  camera/GUIDED のループが動いていないので送っても無駄)。
+// D: ヨー推定用の機体Δv + 上りリンクの統計。POSHOLD/AUTO でだけ送る
+//  (ANGLE/RATE では camera/GUIDED のループが動いていないので送っても無駄)。
+//
+//  ★ 上りリンクの統計をここに同乗させている理由は S5Telem.h の DvFrame
+//    のコメント参照。要するに A/B/C は 28 byte 満杯で、空いているのが
+//    ここしか無い。地上局はこれを見て「PC が送った回数」と「機体が実際に
+//    受け取った回数」を突き合わせる。
 inline void sendDv() {
     S5T::DvFrame d{};
     fillHeader(d.h, S5T::TYPE_DV);
@@ -1228,6 +1248,17 @@ inline void sendDv() {
     d.dvx_mmps = S5T::q16(dvx, S5T::SC_MM);
     d.dvy_mmps = S5T::q16(dvy, S5T::SC_MM);
     d.yaw_dd   = S5T::q16(g_yaw_est, S5T::SC_DDEG);
+
+    // ---- 上りリンク (S5C::Rx) の言い分 ----
+    //  ageMs() は未受信のとき 0xFFFFFFFF を返す。10ms 単位に落とすときに
+    //  そのまま割ると値が化けるので、飽和させてから詰める。
+    const uint32_t age_ms = s5rx.ageMs();
+    d.cmd_age_cs = (age_ms > 655340u) ? 0xFFFFu : (uint16_t)(age_ms / 10u);
+    d.cmd_good   = (uint16_t)s5rx.nGood();
+    d.cmd_lost   = (uint16_t)s5rx.nLost();
+    d.cmd_bad    = (uint16_t)(s5rx.nBadCs() + s5rx.nBadLen() + s5rx.nBadVer());
+    d.cmd_seq    = s5rx.last().seq;
+    d.cmd_rssi   = (int8_t)constrain(s5rx.rssi(), -128, 127);
 
     if (!s5tx.send(d)) tx_drop_flag = true;
 }
@@ -1271,8 +1302,17 @@ inline void sendParam() {
 //        B(水平位置)/D(Δv) は POSHOLD 以外では中身が意味を持たないので
 //        送るだけ無駄。その枠を C に回して、離陸時の転倒やモーター飽和を
 //        追えるようにする。
-//    POSHOLD / AUTO … A,B,D,A,C の5枠巡回 (A 6Hz / B,D,C 各3Hz)
-//        位置ループもヨー推定の窓も 0.3〜1Hz なので 3Hz あれば足りる。
+//    POSHOLD / AUTO … A,B,A,B,C,A,B,D の8枠巡回
+//        8Hz で A(高度+姿勢) 3Hz / B(水平位置) 3Hz / C(姿勢ループ内部) 1Hz
+//        / D(Δv+上りリンク統計) 1Hz。
+//        ★ 2026-09-16 に A,B,D,A,C (5枠) から変えた。B は「PC が自分の
+//          指令の効きを見る唯一の枠」なので、C/D より優先して増やす。
+//          C は解析専用 (ADI に出す roll/pitch は A に乗っている)、
+//          D の統計は STAT と同じ 1Hz 粒度で足りる。
+//          Δv を使う YawEstimator は実運用でほぼ収束していない
+//          (core/mission.py の YAW_FIXED_RISK_DEG のコメント参照) ので、
+//          D を 3Hz -> 1Hz に落とす影響は現状の運用では出ない。
+//          もしヨー推定を本気で使う日が来たら、ここの枠割りを戻すこと。
 //  P(ゲイン一覧) は数秒に1回、その回の枠を borrow する。
 inline void tick(int mode, float thr_stick) {
     const uint32_t now = millis();
@@ -1290,13 +1330,13 @@ inline void tick(int mode, float thr_stick) {
         return;
     }
 
-    // POSHOLD/AUTO: A,B,D,A,C の5枠巡回
-    slot = (uint8_t)((slot + 1) % 5);
+    // POSHOLD/AUTO: A,B,A,B,C,A,B,D の8枠巡回
+    slot = (uint8_t)((slot + 1) & 0x07);
     switch (slot) {
-        case 0: case 3: sendAlt(mode, thr_stick); break;
-        case 1:         sendPos(mode);            break;
-        case 2:         sendDv();                 break;
-        default:        sendAtt(mode);            break;   // case 4
+        case 0: case 2: case 5: sendAlt(mode, thr_stick); break;
+        case 1: case 3: case 6: sendPos(mode);            break;
+        case 4:                 sendAtt(mode);            break;
+        default:                sendDv();                 break;   // case 7
     }
 }
 

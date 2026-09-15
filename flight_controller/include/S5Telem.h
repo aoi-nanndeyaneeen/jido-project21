@@ -67,7 +67,13 @@ namespace S5T {
 //   これに合わせて長さチェックを type ごとの可変長にした
 //   (payloadBytesFor())。固定 28 byte 前提の受信側コードを触るときは
 //   ここも見ること。
-constexpr uint8_t VERSION = 8;
+// VERSION 9 (2026-09-16): DvFrame に上りリンクの統計 (cmd_age_cs /
+//   cmd_good / cmd_lost / cmd_bad / cmd_seq) を足した。地上局から
+//   「上りコマンドが機体にどれだけ遅れて・どれだけ落ちて届いているか」
+//   を見る手段が cmd_fresh (1秒以内か) しか無く、遅延の切り分けができ
+//   なかったため。DvFrame は 12/28 byte しか使っていなかったので、
+//   無線の帯域は 1 バイトも増えない。
+constexpr uint8_t VERSION = 9;
 
 // IM920sL の実効ペイロード上限 [byte]。これを超えると黙って切られる。
 constexpr size_t IM920SL_MAX_PAYLOAD = 32;
@@ -221,11 +227,26 @@ static_assert(sizeof(AttFrame) == PACKET_BYTES, "AttFrame が 28 byte ではあ�
 //    別の巡回スロットで届くので厳密に同時刻にならない)。
 //  ★ A/B/C と違って 28 byte ちょうどにしていない (中身が少ないので
 //    無駄に埋めない)。payloadBytesFor() が type ごとに正しい長さを返す。
+//
+//  ★ VERSION 9: 空いていた後半に「上りリンクの言い分」を同乗させた。
+//    ここ以外に置き場所が無い (A/B/C/P は 28 byte ちょうどで満杯)。
+//    D は巡回の中で一番遅い枠 (1Hz 前後) だが、この統計は STAT と同じ
+//    粒度で見られれば足りるので問題ない。
+//    ★ 「Δv のフレーム」ではなく「機体→地上の状態報告のうち、位置・姿勢
+//      以外を運ぶ枠」だと思うこと。ここに足すぶんには帯域は増えない。
 struct __attribute__((__packed__)) DvFrame {
-    Header  h;                 //  6
-    int16_t dvx_mmps;          //  8  重力除去後のΔv 前+ [mm/s]
-    int16_t dvy_mmps;          // 10  同 右+ [mm/s]
-    int16_t yaw_dd;            // 12  この瞬間の g_yaw_est [0.1 deg]
+    Header   h;                //  6
+    int16_t  dvx_mmps;         //  8  重力除去後のΔv 前+ [mm/s]
+    int16_t  dvy_mmps;         // 10  同 右+ [mm/s]
+    int16_t  yaw_dd;           // 12  この瞬間の g_yaw_est [0.1 deg]
+    // ---- 上りリンク (S5C::Rx) の統計。すべて「機体が実際に見た値」 ----
+    uint16_t cmd_age_cs;       // 14  最後に受けた上りコマンドからの経過 [10ms]
+                               //     0xFFFF = 一度も受けていない / 655秒以上
+    uint16_t cmd_good;         // 16  受信成功した上りコマンド数 (下位16bit)
+    uint16_t cmd_lost;         // 18  seq の飛びから数えた欠落 (下位16bit)
+    uint16_t cmd_bad;          // 20  チェックサム+長さ+バージョン不一致 (下位16bit)
+    uint8_t  cmd_seq;          // 21  最後に受けたコマンドの seq (地上の送信seqと対)
+    int8_t   cmd_rssi;         // 22  そのコマンドの RSSI (未受信なら -1)
 };
 static_assert(sizeof(DvFrame) <= PACKET_BYTES, "DvFrame が 28 byte を超えています");
 
