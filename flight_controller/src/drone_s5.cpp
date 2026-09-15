@@ -1791,7 +1791,21 @@ static void updateControl(float dt_s) {
         resetControllers();
         g_prev_armed = armed;
         Serial.println(armed ? "\n>>> ARMED" : "\n>>> DISARMED");
+        // アームの瞬間にスティック中央を取り直す (ディスアーム中に
+        //  trackCenter() で溜めた直近フレーム。棄却規則は起動時と同じ)。
+        if (armed && S5::USE_SBUS && Q::STICK_CENTER_ENABLE) {
+            const Sbus::CenterCal cc = sbus.applyTrackedCenter(
+                Q::STICK_CENTER_MAX_OFS, Q::STICK_CENTER_MAX_MOVE);
+            if (cc.st == Sbus::CC_OK)
+                Serial.printf("    スティック中央 再取込: R%+.3f P%+.3f Y%+.3f (%d frames)\n",
+                              cc.roll, cc.pitch, cc.yaw, cc.n);
+            else
+                Serial.printf("    !! スティック中央 再取込 棄却 (%s) — 前の値のまま !!\n",
+                              cc.st == Sbus::CC_MOVING ? "動いていた" :
+                              cc.st == Sbus::CC_TOOFAR ? "ずれ過大" : "フレーム不足");
+        }
     }
+    if (!armed && S5::USE_SBUS) sbus.trackCenter();
     if (g_mode != g_prev_mode) {
         resetControllers();
         g_prev_mode = g_mode;

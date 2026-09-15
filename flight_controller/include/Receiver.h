@@ -23,6 +23,7 @@ private:
     // des[] は中央を引いた「後」の値なので、これで取ると自分の補正が入って
     // しまう。生値を別に持っておく。
     float _raw[16];
+    float _tr[3][64]; int _tr_i = 0; int _tr_n = 0;   // trackCenter() のリング
 
     // 中央付近を 0.0 へスナップする幅 (des[] の単位)。
     //  元の実装は 0..1 スケールで abs(val-0.50)<0.02 だった。-1..+1 では 0.04。
@@ -155,6 +156,45 @@ public:
         _center[CH[0]] = m0;
         _center[CH[1]] = m1;
         _center[CH[2]] = m2;
+        return r;
+    }
+
+    // ---- 非ブロッキングの中央追跡 (ディスアーム中に毎 update() 後に呼ぶ) ----
+    //  起動時の calibrateCenter() は「起動時に送信機が入っていた」ときしか
+    //  走らず、棄却されるとその日ずっとオフセット 0 のままになる
+    //  (2026-09-15 22:51: pitch が -0.07 のまま GUIDED に 47ms しか居られなかった)。
+    //  直近 TRACK_N フレームの生値を持っておき、アームした瞬間に同じ棄却規則で
+    //  適用する。ブロックしないので制御ループの中で使える。
+    static constexpr int TRACK_N = 64;
+    void trackCenter() {
+        if (connection_fail != 0) return;
+        const int CH[3] = { Ch::ROLL, Ch::PITCH, Ch::YAW };
+        for (int k = 0; k < 3; ++k) _tr[k][_tr_i] = _raw[CH[k]];
+        _tr_i = (_tr_i + 1) % TRACK_N;
+        if (_tr_n < TRACK_N) ++_tr_n;
+    }
+    void resetTrack() { _tr_i = 0; _tr_n = 0; }
+    CenterCal applyTrackedCenter(float max_ofs, float max_move) {
+        CenterCal r{};
+        r.st = CC_OK; r.n = _tr_n;
+        if (_tr_n < 10) { r.st = CC_NOSIG; return r; }
+        float mean[3];
+        for (int k = 0; k < 3; ++k) {
+            float lo = 1e9f, hi = -1e9f; double sum = 0.0;
+            for (int j = 0; j < _tr_n; ++j) {
+                const float v = _tr[k][j]; sum += v;
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            mean[k] = (float)(sum / _tr_n);
+            if (hi - lo > r.worst_move) r.worst_move = hi - lo;
+        }
+        r.roll = mean[0]; r.pitch = mean[1]; r.yaw = mean[2];
+        if (r.worst_move > max_move) { r.st = CC_MOVING; return r; }
+        if (fabsf(mean[0]) > max_ofs || fabsf(mean[1]) > max_ofs || fabsf(mean[2]) > max_ofs) {
+            r.st = CC_TOOFAR; return r;
+        }
+        _center[Ch::ROLL] = mean[0]; _center[Ch::PITCH] = mean[1]; _center[Ch::YAW] = mean[2];
         return r;
     }
 
