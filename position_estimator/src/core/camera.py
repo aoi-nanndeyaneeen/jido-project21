@@ -267,8 +267,11 @@ class CameraTracker:
             if wb and wb > 0:
                 self.cap.set(cv2.CAP_PROP_WB_TEMPERATURE, wb)
 
-            mode = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
-            ok = abs(mode - DSHOW_EXPOSURE_MANUAL) < 0.1
+            # ★ AUTO_EXPOSURE の読み戻しは OpenCV 5 + DSHOW だと設定に関係なく
+            #   -1 が返り、実際には固定できているのに毎回「失敗」と出ていた
+            #   (2026-09-15 Camera1 実測: -6 を設定すると 16fps -> 30fps に上がり
+            #   EXPOSURE も -6 で読み戻せる)。露出値そのものの読み戻しで判定する。
+            ok = abs(self.cap.get(cv2.CAP_PROP_EXPOSURE) - exposure) < 0.5
             if ok:
                 print(f"  [{self.label}] 露出を固定 (exposure={exposure:.1f}, wb={wb:.0f})")
             else:
