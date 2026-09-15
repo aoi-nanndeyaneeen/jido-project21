@@ -113,7 +113,19 @@ class WaypointMission:
     # 位置誤差 [m] -> 目標速度 [m/s] の比例ゲイン。
     #  ★ 小さく始めること。これは「機体のPID」ではなく「PCが出す目標速度」。
     #    0.5 なら 1m ずれで 0.5m/s を指令する。
-    KP_POS = 0.5
+    #  ★ 2026-09-15: 0.5 -> 0.3 + KD_VEL 0.4。中心保持試験 (20:30, 90秒) で
+    #    周期7秒・中心から平均0.30m/95%0.61m で揺れ続けた。指令→実速度の
+    #    遅れが1.4〜1.6秒あり、機体の速度PI (KP4/KI2) が同じ帯域で共振して
+    #    実速度が指令の約2倍に振れていた。PC位置ループ + 機体速度PI の
+    #    モデルで揺れ(0.12Hz)を再現し、そのうえで選んだ値:
+    #      1軸RMS 0.17m -> 0.09m、遅れが1.5倍になっても 0.73m -> 0.14m、
+    #      0.9m手前からの到達は 3.0秒/行き過ぎ0.46m -> 4.1秒/行き過ぎ無し。
+    KP_POS = 0.3
+    # カメラ実測速度 [m/s] -> 目標速度 [m/s] のブレーキ (減衰) ゲイン。
+    #  遅れの大きい位置ループに減衰を足す。0 で従来と同じ。
+    KD_VEL = 0.4
+    # カメラ速度の平滑化 (送信ごと 5Hz の差分に掛ける1次LPF係数)。
+    VEL_ALPHA = 0.5
     # 指令してよい最大速度 [m/s]。機体側 GUIDED_MAX_VEL でもクランプされる。
     MAX_VEL = 0.4
     # 目標速度がこれ未満なら 0 として送る (機体側は不感帯で位置ホールドへ落ちる)
@@ -186,6 +198,9 @@ class WaypointMission:
         self._t_send = 0.0
         self._t_pos_ok = 0.0
         self._returning = False     # 最後の WP を終えて home へ戻っている
+        # カメラ実測速度 (フィールド座標 m/s) と、その差分用の直前位置 (x, y, t)
+        self._vcam = None
+        self._prev_cam = None
         # 保持試験モード (MISSION_HOLD_AT_FIRST_WP) の出入り記録
         self._hold_inside = False
         self._t_hold_in = None
@@ -250,6 +265,8 @@ class WaypointMission:
         #   より安全 (中心なら三方の壁から距離が最大になる)。
         self._path = [(0.0, 0.0, self.TAKEOFF_ALT_M)] + self.waypoints
         self._returning = False
+        self._vcam = None
+        self._prev_cam = None
         self._hold_inside = False
         self._t_hold_in = None
         self._t_hold_first = None
@@ -379,6 +396,7 @@ class WaypointMission:
         if now - self._t_send < 1.0 / self.SEND_HZ:
             return
         self._t_send = now
+        self._update_camera_velocity(now, pos, pos_valid)
 
         flags = CF_ARMED_OK | CF_ALT_ABS
         if pos_valid:
@@ -535,6 +553,33 @@ class WaypointMission:
                       f"({wp[0]:+.2f}, {wp[1]:+.2f}, {wp[2]:.2f})")
         self._goto(Phase.CRUISE)
 
+    def _update_camera_velocity(self, now, pos, pos_valid):
+        """送信ごと (5Hz) のカメラ位置差分から、フィールド座標の速度を平滑化して持つ。"""
+        if not pos_valid or pos is None:
+            self._prev_cam = None
+            self._vcam = None
+            return
+        x, y = float(pos[0]), float(pos[1])
+        prev = self._prev_cam
+        self._prev_cam = (x, y, now)
+        if prev is None:
+            return
+        dt = now - prev[2]
+        if not (0.05 < dt < 0.6):
+            self._vcam = None
+            return
+        vx, vy = (x - prev[0]) / dt, (y - prev[1]) / dt
+        # 見失い明けの飛びや、1回だけゲートをすり抜けた誤検知は速度に入れない
+        if math.hypot(vx, vy) > 2.0:
+            self._vcam = None
+            return
+        if self._vcam is None:
+            self._vcam = (vx, vy)
+        else:
+            a = self.VEL_ALPHA
+            self._vcam = (self._vcam[0] + a * (vx - self._vcam[0]),
+                          self._vcam[1] + a * (vy - self._vcam[1]))
+
     def _note_hold(self, now, inside, dh):
         """保持試験モードで、到達半径の出入りと滞在時間をイベントに残す。"""
         if inside == self._hold_inside:
@@ -567,6 +612,11 @@ class WaypointMission:
 
         vx = self.KP_POS * fwd
         vy = self.KP_POS * right
+        if self._vcam is not None and self.KD_VEL > 0.0:
+            # 速度ベクトルも誤差と同じ回転で機体座標へ (body_frame_errors は回転そのもの)
+            v_fwd, v_right = body_frame_errors(self._vcam[0], self._vcam[1], yaw_rad)
+            vx -= self.KD_VEL * v_fwd
+            vy -= self.KD_VEL * v_right
 
         # ★ 速度クランプは「yaw_src==camera か」ではなく、機体自身の実測yaw
         #   (アーム基準の相対値) の大きさそのもので判断する。
@@ -636,6 +686,15 @@ class WaypointMission:
         diff_y = cam_y - drone_y
         diff_norm = math.hypot(diff_x, diff_y)
         self._diff = (diff_x, diff_y, diff_norm, drone_x, drone_y)
+
+        # ★ PC がカメラ位置で速度指令を出している間 (CRUISE) は送らない。
+        #   指令が不感帯を割ると機体はフロー位置保持へ落ち、そこへ 0.4m の
+        #   書き換えが入ると機体自身が偽のズレを埋めに動き、PC のループと
+        #   喧嘩する。中心保持試験 (20:30) ではフロー推定が 1.2〜1.6m 流れ、
+        #   保持中ずっと 0.4m ずつ書き換えていた。記録 (_diff) は続ける。
+        if self.phase is Phase.CRUISE:
+            self._corr_ref = None
+            return
 
         # ---- 持続性チェック --------------------------------------------
         if (self._corr_ref is None or
