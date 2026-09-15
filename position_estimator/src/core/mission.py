@@ -467,6 +467,12 @@ class WaypointMission:
                     self._say("機体が GUIDED に入りました -> 離陸")
                 self._t_fly = now        # 飛行時間はここから数える
                 self._goto(Phase.TAKEOFF)
+            elif self.link.flag("landed") and now - self._t_phase > 2.0:
+                # 前回の自動着陸の「出力停止」状態を機体が保持している
+                # (drone_s5 GP_LANDED はディスアームするまで解けない)。
+                self._say("機体が前回の着陸状態のままです。一度ディスアーム→"
+                          "再アームしてから [M] を押してください")
+                self._t_phase = now
             elif self.link.flag("armed") and now - self._t_phase > 15.0:
                 # ★ 未アームのうちは出さない。自動開始だと離陸まで数分
                 #   待つことがあり、その間ずっと鳴っていると本当の

@@ -409,7 +409,13 @@ constexpr float ANG_I_LIMIT = 30.0f;
 //       -1.00 - 1.38 = -2.38 -> -2.35
 //   次便で fh_leanp が ±0.5度 に入らなければ、同じ感度でもう1巡。
 constexpr float ROLL_TRIM_DEG  = +0.33f;
-constexpr float PITCH_TRIM_DEG = -2.35f;
+// ★ 2026-09-15(3) 23:00 の便 (GUIDED 中心保持 67秒): fh_leanp = +3.08 (std 0.63)
+//   でさらに悪化。-1.45→-1.00 で +0.75、-1.00→-2.35 で +0.78 と、トリムを
+//   どちらへ動かしても leanp が増えた = leanp はトリムでは決まっていない
+//   (同時に FLOW_VEL_SCALE も変えた便を感度に使ったのが誤り)。保持精度は
+//   X std 0.10 / Y std 0.14m で悪化していないので、3便で最も小さかった
+//   -1.45 に戻して打ち止め。leanp の残りは KI が抱えていて実害が無い。
+constexpr float PITCH_TRIM_DEG = -1.45f;
 
 } // namespace Gain
 
@@ -1449,7 +1455,11 @@ static S5::Mode selectMode() {
         //   ※ 地上で完全静止していても suspectDead() は立つ。その場合は
         //     MODE 表示が ALTHOLD になるので「フローが値を出していない」と
         //     すぐ分かる (この機体は今それに当たる)。
-        if (S5::USE_FLOW && g_flow_ok && !flow.suspectDead()) return S5::MODE_POSHOLD;
+        // ★ 2026-09-15: 地上 (離陸検知前) は静止していてフローの生カウントが
+        //   0 なのが正常。suspectDead() を空中でだけ効かせないと、地上からの
+        //   GUIDED 自動離陸が ALTHOLD 止まりで一度も始まらない (20:10 の便)。
+        if (S5::USE_FLOW && g_flow_ok && !(flow.suspectDead() && althold.airborne()))
+            return S5::MODE_POSHOLD;
         return S5::MODE_ALTHOLD;   // フロー未初期化 or 実行時に凍結
     }
     return S5::MODE_ANGLE;
@@ -1695,7 +1705,7 @@ static void updateGuided() {
     // ★ 2026-09-13: ch6 (旧 SW_AUTO) の物理スイッチが破損したため、
     //   GUIDED の入り口は SW_HOVER(ch8)=up の1本に統合した。
     if (sbus.Ch_state(Ch::SW_HOVER) != up) { guidedDisengage("SW_HOVER が下");    return; }
-    if (!S5::USE_FLOW || !g_flow_ok || flow.suspectDead())
+    if (!S5::USE_FLOW || !g_flow_ok || (flow.suspectDead() && althold.airborne()))
                                         { guidedDisengage("フローが死んでいる"); return; }
     if (!S5::USE_RANGE || !g_range_ok)  { guidedDisengage("測距が無い");           return; }
 
