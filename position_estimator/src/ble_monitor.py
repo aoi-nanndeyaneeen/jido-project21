@@ -44,7 +44,8 @@ ble_monitor.py  -  log_recorder (XIAO ESP32C3) 経由で、BLE だけで完結�
     i   デバイス確認 / I2C再走査 (機体は非アーム中のみ実行する)
     q   終了
 """
-
+#普通にlog取ってなくてもBLE経由で状態が見たい！！！
+#デバイスチェックはもっと正確に状態がわからないかな？
 import argparse
 import time
 from pathlib import Path
