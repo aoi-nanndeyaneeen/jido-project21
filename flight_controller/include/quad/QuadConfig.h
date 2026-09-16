@@ -936,7 +936,7 @@ constexpr float ALT_AIRBORNE_GROUND_MAX_M = 0.30f;
 // ============================================================
 //  § 9  地上局ガイド飛行 (GUIDED) — 自動離陸 / ウェイポイント / 自動着陸
 // ============================================================
-//  パケットの仕様と設計方針は include/S5Cmd.h の先頭コメントを読むこと。
+//  パケットの仕様と設計方針は protocol/S5Cmd.h の先頭コメントを読むこと。
 //  ここは「機体がどこまで地上局を信用するか」の数値だけ。
 //
 //  ★ 大原則: 地上局は setpoint (目標速度・目標高度) しか送れない。
@@ -947,7 +947,7 @@ constexpr float ALT_AIRBORNE_GROUND_MAX_M = 0.30f;
 // GUIDED を有効にするか。false なら従来 (POSHOLD まで) と完全に同じ動作。
 //  ★ true にしても、SW_AUTO を上げない限り何も変わらない。GUIDED へ入るには
 //    「SW_HOVER=up かつ SW_AUTO=up かつアーム済みかつ地上局から新鮮な指令」の
-//    全部が要る (drone_s5.cpp の updateGuided)。なので既定は true でよい。
+//    全部が要る (quad/Guided.h の Guided::update)。なので既定は true でよい。
 //  ★ ただし true にすると Serial3 の受信が S5C::Rx 側に切り替わる
 //    (旧 GroundData 経路は 32 バイト制限で元から機能していないので実害なし)。
 constexpr bool  GUIDED_ENABLE = true;
@@ -1000,7 +1000,7 @@ constexpr uint32_t GUIDED_LAND_TIMEOUT_MS = 20000;
 // ---- 自動水平旋回 (REQ_CIRCLE) ---------------------------------
 //  ★ ここだけは GUIDED と違い、開始した後は地上局からの新しいコマンドを
 //    待たずに機体単独 (ジャイロ+フロー) で1周分進み続ける
-//    (drone_s5.cpp の updateGuided() § GP_CIRCLE 参照)。そのぶん、
+//    (quad/Guided.h の GP_MANEUVER 参照)。そのぶん、
 //    ここで安全側にクランプしておく値が唯一の歯止めになる。
 //
 //  地上局が送れるヨーレートの上限 [deg/s]。半径は概算

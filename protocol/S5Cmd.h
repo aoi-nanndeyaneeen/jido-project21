@@ -1,11 +1,11 @@
 // ============================================================
 //  S5Cmd.h  -  地上局 -> 機体 の上りコマンド (IM920SL)
 // ============================================================
-//  ★ このファイルは flight_controller/ と ground_receiver/ の両方に
-//    同じ内容で置いてある。片方だけ編集すると構造体が食い違って
-//    チェックサムは通るのに値だけ壊れる。必ず両方そろえること。
-//      flight_controller/include/S5Cmd.h
-//      ground_receiver/include/S5Cmd.h
+//  ★ このファイルはリポジトリ直下の protocol/ にあり、flight_controller と
+//    ground_receiver の両方が platformio.ini の -I ../protocol で同じ実体を
+//    読む (以前は両プロジェクトに手コピーしていた)。Python 側の定数は
+//      python protocol/gen_py_protocol.py
+//    で position_estimator/src/core/s5_protocol.py に生成する。
 //
 // ------------------------------------------------------------
 //  【なぜ新しいパケットを作るのか】
@@ -37,7 +37,7 @@
 //  これが安全側に倒れる唯一の構造。
 //
 //  ★ 速度指令が「機体座標」なのは、機体が絶対方位を持たないから
-//    (6軸IMU。g_yaw_est はアーム時を 0 とした相対方位)。地上局は
+//    (6軸IMU。機体のヨー (HeadingHold) はアーム時を 0 とした相対方位)。地上局は
 //    カメラでヘディングを推定しているので (position_estimator の
 //    yaw_estimator)、地面座標 -> 機体座標の回転は地上局側でやる。
 //    ※ そのぶんヘディング推定を外すと指令の向きも外れる。ウェイポイント
@@ -47,7 +47,7 @@
 //    しない (機体座標のまま前進+回転を保ち続けるだけで、地面座標での
 //    円軌道は勝手にできる)。だからカメラのヘディング推定にもリンクの
 //    新鮮さにも依存せず、機体単独 (ジャイロ+オプティカルフロー) で完結
-//    させてよい。詳細は drone_s5.cpp の GP_CIRCLE 参照。
+//    させてよい。詳細は flight_controller/include/quad/Guided.h の GP_MANEUVER 参照。
 //
 // ------------------------------------------------------------
 //  【帯域】  ★ 2026-09-16 現在の割り当て
@@ -56,7 +56,7 @@
 //    下り (S5Telem) は 8Hz x 71文字 37ms = 30%。合計 53%。
 //
 //    レートを決めているのは 2 箇所だけ:
-//      上り … ground_receiver/src/tools/s5_log.cpp の CMD_MIN_GAP_MS
+//      上り … ground_receiver/src/main.cpp (GroundStation) の CMD_MIN_GAP_MS
 //      下り … flight_controller/src/drone_s5.cpp の TELEM_TX_HZ
 //    IM920 は半二重 (送信中は受信できない) なので、片方だけ上げると
 //    もう片方が落ちる。必ず 2 つセットで、合計 55% 程度を上限に見ること。
@@ -66,10 +66,11 @@
 //      5枠巡回の1枠しか無かったので実測 1.5Hz。PC が「自分の指令が効いた
 //      か」を見る枠がそこだったため、体感の遅れの主犯は上りではなく
 //      **下りの観測遅れ** だった。帯域を上りへ付け替え、枠割りも
-//      A,B,A,B,C,A,B,D に変えてある (drone_s5.cpp の tick())。
+//      A,B,A,B,C,A,B,D に変えてある (quad/S5Telemetry.h の tick())。
 // ============================================================
 #pragma once
 #include <Arduino.h>
+#include "Im920Frame.h"
 
 namespace S5C {
 
@@ -82,8 +83,8 @@ constexpr uint8_t VERSION = 9;  // laps (定型機動の周回数) added
 // 下りテレメトリ (S5T) の type と衝突しない値。'K' = command
 constexpr uint8_t MAGIC = 0x4B;
 
-constexpr size_t IM920SL_MAX_PAYLOAD = 32;
-constexpr size_t CHECKSUM_BYTES      = 4;
+constexpr size_t IM920SL_MAX_PAYLOAD = IM920::MAX_PAYLOAD;      // 32
+constexpr size_t CHECKSUM_BYTES      = IM920::CHECKSUM_BYTES;   // 4
 
 // ------------------------------------------------------------
 //  要求する飛行フェーズ
@@ -232,82 +233,19 @@ inline int16_t q16(float v, float scale) {
 }
 
 // チェックサム (S5Telem.h と同じ方式: 総和の2の補数)
-inline uint32_t checksum(const uint8_t* p, size_t n) {
-    uint32_t s = 0;
-    for (size_t i = 0; i < n; ++i) s += p[i];
-    return ~s + 1u;
-}
-
-// ============================================================
-//  Tx  -  地上局側の非ブロッキング送信
-// ============================================================
-//  S5T::Tx と同じ流儀。send() は組み立てるだけ、service() が
-//  availableForWrite() の空きぶんだけ進める。
-// ============================================================
-class Tx {
-public:
-    explicit Tx(HardwareSerial* ser) : _ser(ser) {}
-
-    bool send(const CmdFrame& pkt) {
-        if (busy()) { _dropped++; return false; }
-        const uint8_t* p  = (const uint8_t*)&pkt;
-        const uint32_t cs = checksum(p, sizeof(pkt));
-        const uint8_t* q  = (const uint8_t*)&cs;
-
-        char* w = _buf;
-        *w++ = 'T'; *w++ = 'X'; *w++ = 'D'; *w++ = 'A'; *w++ = ' ';
-        for (size_t i = 0; i < sizeof(pkt); ++i) w = hex2(w, p[i]);
-        for (size_t i = 0; i < sizeof(cs);  ++i) w = hex2(w, q[i]);
-        *w++ = '\r'; *w++ = '\n';
-
-        _len = (size_t)(w - _buf);
-        _pos = 0;
-        _sent++;
-        service();
-        return true;
-    }
-
-    void service() {
-        while (_pos < _len) {
-            const int room = _ser->availableForWrite();
-            if (room <= 0) return;
-            size_t n = _len - _pos;
-            if ((int)n > room) n = (size_t)room;
-            _ser->write((const uint8_t*)_buf + _pos, n);
-            _pos += n;
-        }
-    }
-
-    bool     busy()    const { return _pos < _len; }
-    uint32_t sent()    const { return _sent; }
-    uint32_t dropped() const { return _dropped; }
-
-private:
-    static char* hex2(char* w, uint8_t b) {
-        static const char H[] = "0123456789ABCDEF";
-        *w++ = H[b >> 4];
-        *w++ = H[b & 0x0F];
-        return w;
-    }
-    HardwareSerial* _ser;
-    char     _buf[64];         // "TXDA " + 36 + CRLF = 43
-    size_t   _len = 0, _pos = 0;
-    uint32_t _sent = 0, _dropped = 0;
-};
+// 行の組み立て / チェックサム / 送信は IM920 層 (Im920Frame.h) に一本化。
+using IM920::checksum;
+using Tx = IM920::Tx;       // 地上局側の非ブロッキング送信
 
 // ============================================================
 //  Rx  -  機体側の非ブロッキング受信
 // ============================================================
-//  ★ Telemetry.h の IM920SL_Generic::read() は String を使う。1000Hz の
-//    制御ループから String の連結・substring を呼ぶと、ヒープ断片化と
-//    数百us のジッタを持ち込む。ここは固定長の char バッファだけで組む。
+//  poll() を毎ループ (TELEM_RX_HZ) 呼ぶ。1 回の呼び出しで available() のぶんだけ
+//  進め、完全な行が出来たらデコードして last() を更新する。String は使わない
+//  (Im920Frame.h 冒頭)。
 //
-//  IM920 の受信行:  "<ノード>,<モジュールID>,<RSSI>:<データ16進>\r\n"
-//  poll() を毎ループ呼ぶ。1回の呼び出しで available() のぶんだけ進め、
-//  完全な行が出来たらデコードして last() を更新する。
-//
-//  ★ 同じ Serial ポートを Telemetry.h の受信と二重に読ませないこと。
-//    片方が先にバイトを抜くと、もう片方は永久に行を組み立てられない。
+//  ★ 同じ Serial ポートを他の受信処理と二重に読ませないこと。片方が先に
+//    バイトを抜くと、もう片方は永久に行を組み立てられない。
 // ============================================================
 class Rx {
 public:
@@ -317,14 +255,7 @@ public:
     bool poll() {
         bool got = false;
         while (_ser->available()) {
-            const char c = (char)_ser->read();
-            if (c == '\n') {
-                if (decodeLine()) got = true;
-                _n = 0;
-            } else if (c != '\r') {
-                if (_n < sizeof(_line) - 1) _line[_n++] = c;
-                else { _n = 0; _bad_len++; }   // 長すぎる = 化けている
-            }
+            if (_line.feed((char)_ser->read()) && decodeLine()) got = true;
         }
         return got;
     }
@@ -343,53 +274,23 @@ public:
 
     uint32_t nGood()   const { return _n_good;  }
     uint32_t nBadCs()  const { return _bad_cs;  }
-    uint32_t nBadLen() const { return _bad_len; }
+    uint32_t nBadLen() const { return _bad_len + _line.overflows(); }
     uint32_t nBadVer() const { return _bad_ver; }
     uint32_t nLost()   const { return _n_lost;  }
     int      rssi()    const { return _rssi;    }
 
 private:
-    static int hexVal(char c) {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        return -1;
-    }
-
     bool decodeLine() {
-        _line[_n] = '\0';
-        char* colon = strchr(_line, ':');
-        if (!colon) return false;        // "OK" / "NG" / 起動メッセージ
-
-        // ヘッダ3番目のフィールドが RSSI
-        {
-            *colon = '\0';
-            const char* c1 = strchr(_line, ',');
-            const char* c2 = c1 ? strchr(c1 + 1, ',') : nullptr;
-            if (c2) _rssi = (int)strtoul(c2 + 1, nullptr, 16);
-            *colon = ':';
+        uint8_t buf[sizeof(CmdFrame)];
+        const IM920::Decoded d = IM920::decodeLine(_line.line(), buf, sizeof(buf));
+        switch (d.st) {
+            case IM920::Decode::OK:       break;
+            case IM920::Decode::NOT_DATA: return false;        // "OK" / "NG" / 起動メッセージ
+            case IM920::Decode::BAD_CS:   _bad_cs++;  return false;
+            default:                      _bad_len++; return false;   // BAD_HEX / BAD_LEN
         }
-
-        // データ部を16進デコード (バイト間のカンマは読み飛ばす)
-        uint8_t buf[sizeof(CmdFrame) + CHECKSUM_BYTES];
-        size_t  n  = 0;
-        int     hi = -1;
-        for (const char* p = colon + 1; *p; ++p) {
-            if (*p == ',' || *p == ' ') continue;
-            const int v = hexVal(*p);
-            if (v < 0) return false;
-            if (hi < 0) { hi = v; continue; }
-            if (n >= sizeof(buf)) { _bad_len++; return false; }  // 想定より長い
-            buf[n++] = (uint8_t)((hi << 4) | v);
-            hi = -1;
-        }
-        if (hi >= 0 || n != sizeof(buf)) { _bad_len++; return false; }
-
-        uint32_t sum = 0;
-        for (size_t i = 0; i < sizeof(CmdFrame); ++i) sum += buf[i];
-        uint32_t cs = 0;
-        memcpy(&cs, buf + sizeof(CmdFrame), CHECKSUM_BYTES);
-        if ((uint32_t)(sum + cs) != 0u) { _bad_cs++; return false; }
+        if (d.n != sizeof(CmdFrame)) { _bad_len++; return false; }
+        _rssi = d.rssi;
 
         CmdFrame f;
         memcpy(&f, buf, sizeof(f));
@@ -408,8 +309,7 @@ private:
     }
 
     HardwareSerial* _ser;
-    char     _line[96];
-    size_t   _n = 0;
+    IM920::LineAssembler<96> _line;
     CmdFrame _last{};
     uint32_t _last_rx_ms = 0;
     uint32_t _n_good = 0, _bad_cs = 0, _bad_len = 0, _bad_ver = 0, _n_lost = 0;

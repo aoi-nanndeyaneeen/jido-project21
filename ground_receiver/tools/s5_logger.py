@@ -185,7 +185,7 @@ def main():
                         # 進捗だけ1行で上書き表示 (10Hz なので 1秒ごと)
                         fields = line.split(",")
                         # DATA,rx_ms,t_ms,seq,lost,rssi,frame,mode,... の並び
-                        # (s5_log.cpp の CSV_HEADER と対応。列を足したらここも直す)
+                        # (ground_receiver TelemetryStore.h の CSV_HEADER と対応。列を足したらここも直す)
                         try:
                             lost, rssi, mode = fields[4], fields[5], fields[7]
                             thr, h, tgt = fields[20], fields[25], fields[27]

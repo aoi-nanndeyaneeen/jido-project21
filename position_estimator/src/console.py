@@ -34,7 +34,7 @@ USB は 1 本しかないので **この 2 つは同時に使えない**。結�
   おけば機体は勝手に降りてくる。これが唯一の安全側の構造。
 
 ★ 緊急停止はプロポ。 SPACE の ABORT は「機体を即その場ホールドへ戻す」
-  であって、モーターを切るものではない (機体側 updateGuided() の
+  であって、モーターを切るものではない (機体側 quad/Guided.h の
   REQ_ABORT は HOLD と同じ扱い)。落とすなら THR_CUT / スティック介入。
 
 ★ 速度指令は機体座標。w = 機首方向へ前進であって、画面の上ではない。
@@ -60,7 +60,6 @@ USB は 1 本しかないので **この 2 つは同時に使えない**。結�
 """
 
 import argparse
-import os
 import sys
 import threading
 import time
@@ -74,6 +73,7 @@ from core.s5_link import (S5Link, REQ_ABORT, REQ_GUIDED, REQ_HOLD,
 from core.maneuver import Circle, FigureEight, ClimbTurn, ManeuverRunner
 from utils.config import GROUND_LINK_PORT, LOG_DIR, MISSION_TAKEOFF_ALT_M
 from utils.logger import CsvLogger
+from utils.screen import Screen
 
 # ---- 指令の刻み -----------------------------------------------------------
 # ★ 上限は機体側 Q::GUIDED_MAX_VEL (0.5 m/s) でも必ずクランプされる。
@@ -85,7 +85,7 @@ ALT_MAX_M = 2.00
 
 # 上りコマンドの送信レート [Hz]。
 #  ★ 2026-09-16: 5 -> 10。地上局 XIAO は「届いた順に、最短 125ms 間隔」で
-#    流すようになった (s5_log.cpp の CMD_MIN_GAP_MS)。速く送るほど、
+#    流すようになった (ground_receiver GroundConfig.h の CMD_MIN_GAP_MS)。速く送るほど、
 #    キーを押してから無線に出るまでの待ちが短くなる。無線の帯域を決めて
 #    いるのは地上局側だけなので、ここを上げても混まない。
 SEND_HZ = 10.0
@@ -114,57 +114,11 @@ CLIMB_TURN_ALT_M      = 2.2    # 上昇旋回の到達高度 [m] (ポール以�
 #    戻す (= その場ホールド)。動かし続けたければ押し続ける (連打する)。
 DEADMAN_S = 1.5
 
-# モード番号 -> 名前 (utils/logger.py の MODE_NAME と同じ対応)
-MODE_NAME = {0: "RATE", 1: "ANGLE", 2: "GUIDED", 3: "POSHOLD", 4: "ALTHOLD"}
+# モード番号 / 高度サブ状態 -> 名前。protocol/S5Telem.h から生成 (core/s5_protocol.py)。
+#  ★ 2026-09-16 までここに手書きされていた ALT_STATE_NAME は機体の実体
+#    (1=STANDBY 2=NO_HOVER_THR 3=NO_RANGE 4=HOLDING 5=RANGE_LOST) と食い違っていた。
+from core.s5_protocol import MODE_NAME, ALT_STATE_NAME   # noqa: E402
 
-# 機体の高度サブ状態 (S5Telem の AltState)
-ALT_STATE_NAME = {0: "OFF", 1: "HOLD", 2: "TAKEOFF", 3: "LAND", 4: "LANDED"}
-
-
-
-# ==========================================================================
-#  画面
-# ==========================================================================
-class Screen:
-    """毎回カーソルを左上へ戻して上書きする。行末は消してから書くので、
-    短い行になったときにゴミが残らない。
-
-    ★ --plain では ANSI を一切使わない。機体側 s5_log.cpp が
-      「PlatformIO のシリアルモニタでは ANSI が処理されず、画面が崩れた
-      のかキーが効いていないのか区別できなくなる」としてクリアを避けて
-      いるのと同じ理由で、逃げ道を用意しておく。
-    """
-
-    def __init__(self, plain=False):
-        self.plain = plain
-        if not plain and os.name == "nt":
-            self._enable_vt()
-
-    @staticmethod
-    def _enable_vt():
-        """Windows のコンソールで ANSI を有効にする (Win10 1511 以降)。"""
-        try:
-            import ctypes
-            k32 = ctypes.windll.kernel32
-            h = k32.GetStdHandle(-11)
-            mode = ctypes.c_uint32()
-            if k32.GetConsoleMode(h, ctypes.byref(mode)):
-                k32.SetConsoleMode(h, mode.value | 0x0004)
-        except Exception:
-            pass
-
-    def draw(self, lines):
-        out = ["\033[H"]
-        for line in lines:
-            out.append(line + "\033[K\n")
-        out.append("\033[J")
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
-
-    def clear(self):
-        if not self.plain:
-            sys.stdout.write("\033[2J\033[H")
-            sys.stdout.flush()
 
 
 # ==========================================================================
@@ -458,7 +412,7 @@ class KeyHandler:
             self.say("[Console] P/k/i はIM920では廃止しました。"
                      "ble_monitor.py を使ってください (BLE経由)")
         elif ch in ("S", "D", "Z", "C"):
-            # 地上局 XIAO のキーをそのまま転送する (s5_log.cpp の handleKey)
+            # 地上局 XIAO のキーをそのまま転送する (ground_receiver main.cpp の handleKey)
             fwd = {"S": "s", "D": "d", "Z": "z", "C": "1"}[ch]
             self.link.send_key(fwd)
             self.say(f"[Console] 地上局へ '{fwd}' を送りました")

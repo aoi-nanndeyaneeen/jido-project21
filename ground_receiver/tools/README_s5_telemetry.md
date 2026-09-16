@@ -6,7 +6,7 @@ IM920sL で 15Hz 落とし、地上局側で CSV にする。
 
 ```
 機体 (Teensy 4.0)                     地上局 (XIAO RP2040)            PC
-drone_s5.cpp                          tools/s5_log.cpp
+drone_s5.cpp                          src/main.cpp
   A: 高度+姿勢角 ┐                      受信・checksum検証   ──USB──> s5_logger.py
   B: 水平位置    │ 15Hz ──IM920sL──>    A/B/C を forward-fill        └> logs/s5_NNN_*.csv
   C: 姿勢ループ  │  (順番はモード依存)    CSV / 人間向け表示          └> analyze_poshold.py
@@ -78,7 +78,7 @@ pio device monitor -e xiao_s5_log
 | | ボード | ポート | ディレクトリ | env | ソース |
 |---|---|---|---|---|---|
 | 機体 | Teensy 4.0 | COM8 | `flight_controller` | `drone_s5` | `src/drone_s5.cpp` |
-| 地上局 | XIAO RP2040 | COM5 | `ground_receiver` | `xiao_s5_log` | `src/tools/s5_log.cpp` |
+| 地上局 | XIAO RP2040 | COM5 | `ground_receiver` | `xiao_s5_log` | `src/main.cpp` |
 
 `ground_receiver` の `default_envs` は `xiao_s5_log` にしてある（以前は
 `teensy40` = 旧 `main_pc.cpp` だった）。**VSCode のツールバーの Upload /
@@ -212,8 +212,7 @@ IM920sL の UART は 19200bps。TXDA は 1バイト = 16進2文字なので
 `S5Telem.h` は **機体側と地上局側の両方に同じ内容で置いてある**。
 
 ```
-flight_controller/include/S5Telem.h
-ground_receiver/include/S5Telem.h
+protocol/S5Telem.h   (機体・地上局で共有。2026-09-16 に一本化)
 ```
 
 片方だけ直すとチェックサムは通るのに値だけ壊れる。必ず両方そろえ、

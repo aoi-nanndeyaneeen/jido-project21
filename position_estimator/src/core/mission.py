@@ -10,10 +10,10 @@ core/mission.py
     yaw_estimator     ->  機首方位 psi [rad]
          |
          v
-    このファイル: 位置誤差 -> 「機体座標の目標速度」 [m/s]        ← 外側ループ (5Hz)
-         |  IM920 上り 5Hz
+    このファイル: 位置誤差 -> 「機体座標の目標速度」 [m/s]        ← 外側ループ (SEND_HZ=10Hz 上限)
+         |  USB -> 地上局 (蓋 125ms) -> IM920 上り 最大 8Hz
          v
-    機体 (drone_s5 / PosHold): 目標速度 -> 速度PID -> 目標リーン角  ← 内側ループ (100Hz)
+    機体 (drone_s5 / PosHold): 目標速度 -> 速度PID -> 目標リーン角  ← 内側ループ (25Hz, フロー窓)
     機体 (Mixer/姿勢PID):      目標リーン角 -> モーター            ← 最内 (1000Hz)
 
 ★ PC は速度までしか指令しない。姿勢は絶対に送らない。
@@ -54,6 +54,7 @@ PC が高度を刻んで送る方式だと、リンクが切れた瞬間に上�
 
 import math
 import time
+from dataclasses import dataclass
 from enum import Enum
 
 from utils.config import (MISSION_TAKEOFF_ALT_M, YAW_INITIAL_ALIGN_DEG,
@@ -68,7 +69,7 @@ from utils.config import (MISSION_TAKEOFF_ALT_M, YAW_INITIAL_ALIGN_DEG,
                           POS_CORR_TRACK_TOL_M, POS_CORR_CONFIRM_S)
 from core.maneuver import ManeuverRunner, from_config as maneuver_from_config
 from core.s5_link import (REQ_ABORT, REQ_GUIDED, REQ_HOLD, REQ_LAND,
-                          REQ_TAKEOFF, REQ_NAME,
+                          REQ_TAKEOFF, REQ_NAME, MODE_NAME,
                           CF_ARMED_OK, CF_POS_VALID, CF_YAW_VALID,
                           CF_ALT_ABS, CF_POS_CORR, CF_POS_SHIFT)
 
@@ -85,6 +86,19 @@ class Phase(Enum):
     ABORT     = "ABORT"      # 中断 (異常検知 / 手動)
 
 
+@dataclass
+class _Tick:
+    """update() の 1 回 (SEND_HZ に間引かれた回) の材料。_phase_* に渡す。"""
+    now: float
+    pos: object            # フィールド座標 [x, y, z] or None
+    pos_valid: bool
+    yaw_rad: object        # float or None
+    yaw_valid: bool
+    flags: int             # CF_* の論理和 (この回の送信に付ける)
+    st: dict               # link.state() のスナップショット
+    h_agl: float           # 機体の測距による対地高度 [m]
+
+
 def body_frame_errors(dx, dy, yaw_rad):
     """
     フィールド座標の誤差 (dx, dy) を機体座標の (前方, 右方) へ変換する。
@@ -92,8 +106,9 @@ def body_frame_errors(dx, dy, yaw_rad):
         n = (sin psi, cos psi)   機首方向 (psi=0 が +y = フィールド奥)
         r = (ny, -nx)            機体右方向
 
-    ★ core/autopilot.py と同じ定義。片方だけ直すと符号が食い違って
-      位置ループが正帰還になる (= 機体が飛んでいく)。
+    ★ ヨーの定義は core/yaw_estimator.py (yaw = atan2(nx, ny)) と同じ。
+      符号を間違えると位置ループが正帰還になる (= 機体が飛んでいく)。
+      (旧 used/autopilot.py にも同じ関数があったが、そちらは廃止済み)
     """
     nx, ny = math.sin(yaw_rad), math.cos(yaw_rad)
     rx, ry = ny, -nx
@@ -167,7 +182,7 @@ class WaypointMission:
     #  ★ 2026-09-16: 5 -> 10。以前は XIAO が 200ms の格子で再度間引いて
     #    いたので「5Hz より速く送っても無駄」だったが、地上局側を
     #    「届いた順に、最短 125ms 間隔で流す」に変えた
-    #    (s5_log.cpp の CMD_MIN_GAP_MS)。今は PC が速く送るほど、
+    #    (ground_receiver GroundConfig.h の CMD_MIN_GAP_MS)。今は PC が速く送るほど、
     #    地上局の蓋が開いた瞬間に渡せる指令が新しくなる。
     #    帯域の上限を決めるのは地上局側だけなので、ここを上げても
     #    無線が混むことはない (PC が送った行は最新1件だけが生き残る)。
@@ -503,143 +518,151 @@ class WaypointMission:
                         if pos is not None else None)
 
         # ---- 3) フェーズごとの指令 ------------------------------------
-        if self.phase is Phase.ARMING:
-            # 機体が GUIDED に入るまで HOLD を送り続ける。
-            #  入れない理由 (SW_AUTO が下 / フローが死んでいる / 未アーム) は
-            #  機体側のシリアル画面に出る。ここでは待つだけ。
-            self._send(REQ_HOLD, flags=flags, yaw_rad=yaw_rad)
-            if self.link.flag("guided"):
-                dev_yaw = st.get("yaw")
-                if self._yaw_src != "camera":
-                    # ★ リトライのたびに出す (プログラム起動中1回だけだと、
-                    #   2026-09-14 のように手動操作の合間に機首がズレていく
-                    #   のを見逃す)。機体自身の yaw (アーム基準の相対方位)
-                    #   も一緒に出す。ここが 0 から離れていたら、機首は
-                    #   もうフィールド奥を向いていない。
-                    dev_str = f"{dev_yaw:+.1f}deg" if dev_yaw is not None else "不明"
-                    self._say(f"機体が GUIDED に入りました -> 離陸 "
-                              f"(機首方位は{YAW_INITIAL_ALIGN_DEG:+.1f}deg決め打ち。"
-                              f"機体自身のyaw={dev_str}。0から離れていたら"
-                              f"機首はもうフィールド奥を向いていません)")
-                else:
-                    self._say("機体が GUIDED に入りました -> 離陸")
-                self._t_fly = now        # 飛行時間はここから数える
-                self._goto(Phase.TAKEOFF)
-            elif self.link.flag("landed") and now - self._t_phase > 2.0:
-                # 前回の自動着陸の「出力停止」状態を機体が保持している
-                # (drone_s5 GP_LANDED はディスアームするまで解けない)。
-                self._say("機体が前回の着陸状態のままです。SW_HOVER を一度下げて"
-                          "上げ直す (またはディスアーム→再アーム) と次の便に入れます")
-                self._t_phase = now
-            elif self.link.flag("armed") and now - self._t_phase > 15.0:
-                # ★ 未アームのうちは出さない。自動開始だと離陸まで数分
-                #   待つことがあり、その間ずっと鳴っていると本当の
-                #   メッセージが流れて見えなくなる。
-                self._say("アーム済みですが GUIDED に入りません。"
-                          "SW_HOVER が上か、フロー/測距が生きているか、"
-                          "スロットルが 15% 以上かを確認してください")
-                self._t_phase = now      # 15 秒ごとに出し直す
+        #  各フェーズは _phase_* メソッド 1 つ。この tick の材料は _Tick にまとめて渡す。
+        tick = _Tick(now=now, pos=pos, pos_valid=pos_valid, yaw_rad=yaw_rad,
+                     yaw_valid=yaw_valid, flags=flags, st=st, h_agl=h_agl)
+        self._PHASE_HANDLERS[self.phase](self, tick)
+
+    # ---------------------------------------------------------- フェーズ
+    def _phase_arming(self, t):
+        """機体が GUIDED に入るまで HOLD を送り続ける。入れない理由 (SW_HOVER が下 /
+        フローが死んでいる / 未アーム) は機体側のシリアル画面に出る。ここでは待つだけ。"""
+        now = t.now
+        self._send(REQ_HOLD, flags=t.flags, yaw_rad=t.yaw_rad)
+        if self.link.flag("guided"):
+            dev_yaw = t.st.get("yaw")
+            if self._yaw_src != "camera":
+                # ★ リトライのたびに出す (プログラム起動中1回だけだと、
+                #   2026-09-14 のように手動操作の合間に機首がズレていく
+                #   のを見逃す)。機体自身の yaw (アーム基準の相対方位)
+                #   も一緒に出す。ここが 0 から離れていたら、機首は
+                #   もうフィールド奥を向いていない。
+                dev_str = f"{dev_yaw:+.1f}deg" if dev_yaw is not None else "不明"
+                self._say(f"機体が GUIDED に入りました -> 離陸 "
+                          f"(機首方位は{YAW_INITIAL_ALIGN_DEG:+.1f}deg決め打ち。"
+                          f"機体自身のyaw={dev_str}。0から離れていたら"
+                          f"機首はもうフィールド奥を向いていません)")
+            else:
+                self._say("機体が GUIDED に入りました -> 離陸")
+            self._t_fly = now        # 飛行時間はここから数える
+            self._goto(Phase.TAKEOFF)
+        elif self.link.flag("landed") and now - self._t_phase > 2.0:
+            # 前回の自動着陸の「出力停止」状態を機体が保持している
+            # (機体側 GP_LANDED はディスアームするまで解けない)。
+            self._say("機体が前回の着陸状態のままです。SW_HOVER を一度下げて"
+                      "上げ直す (またはディスアーム→再アーム) と次の便に入れます")
+            self._t_phase = now
+        elif self.link.flag("armed") and now - self._t_phase > 15.0:
+            # ★ 未アームのうちは出さない。自動開始だと離陸まで数分
+            #   待つことがあり、その間ずっと鳴っていると本当の
+            #   メッセージが流れて見えなくなる。
+            self._say("アーム済みですが GUIDED に入りません。"
+                      "SW_HOVER が上か、フロー/測距が生きているか、"
+                      "スロットルが 15% 以上かを確認してください")
+            self._t_phase = now      # 15 秒ごとに出し直す
+
+    def _phase_takeoff(self, t):
+        self._send(REQ_TAKEOFF, alt_m=self.TAKEOFF_ALT_M, flags=t.flags, yaw_rad=t.yaw_rad)
+        if abs(t.h_agl - self.TAKEOFF_ALT_M) < self.TAKEOFF_TOL_M:
+            # 離陸地点を覚える (RTL の戻り先)。地上にいた位置を優先し、
+            # 見えていなければ今の位置で代用する。
+            home_note = ""
+            if self._home_fixed is None:
+                if self._ground_pos is not None:
+                    self.home = (self._ground_pos[0], self._ground_pos[1], self.TAKEOFF_ALT_M)
+                    home_note = "地上の位置"
+                elif t.pos is not None:
+                    self.home = (float(t.pos[0]), float(t.pos[1]), self.TAKEOFF_ALT_M)
+                    home_note = "地上で見えていなかったため今の位置"
+            if self.home is not None and home_note:
+                home_note = (f"  戻り先=({self.home[0]:+.2f}, {self.home[1]:+.2f}) "
+                             f"[{home_note}]")
+            self._say(f"離陸完了 (対地 {t.h_agl:.2f} m) -> WP0 へ{home_note}")
+            self._goto(Phase.CRUISE)
+        elif t.now - self._t_phase > self.TAKEOFF_TIMEOUT_S:
+            self.reason = "離陸がタイムアウト"
+            self._goto(Phase.LAND)
+            self._say(f"離陸が {self.TAKEOFF_TIMEOUT_S:.0f} 秒で完了しません "
+                      f"(対地 {t.h_agl:.2f} m) -> 着陸")
+
+    def _phase_maneuver(self, t):
+        """機体が自分で回っている。PC は開始要求 (バースト) のあと IDLE でリンクだけ生かす。
+        位置・ヨーの有無は問わない (機体は使わない)。
+        ★ HOLD/GUIDED を送ると機体側で機動が中断されるので送らないこと。"""
+        req, vx, yr, alt, laps = self._runner.request()
+        self._send(req, vx_mps=vx, yaw_rate_dps=yr, alt_m=alt, flags=t.flags,
+                   yaw_rad=t.yaw_rad, laps=laps)
+        st_m = self._runner.update(t.now)
+        if st_m == "done":
+            self._maneuver_done = True
+            self._say(f"{self.maneuver.name} 完了 ({self._runner.elapsed_s(t.now):.1f}s) "
+                      f"-> 離陸地点へ帰投")
+            self._runner = None
+            self._returning = True
+            self._goto(Phase.CRUISE)
+        elif st_m == "failed":
+            self.reason = f"機動 {self.maneuver.name} 失敗: {self._runner.reason}"
+            self._runner = None
+            self._goto(Phase.LAND)
+            self._say(f"異常検知 -> 自動着陸: {self.reason}")
+
+    def _phase_cruise_dwell(self, t):
+        target = self._target()
+        # ヘディングが分からないと「前」がどっちか分からない。
+        #  この状態で速度を出すと 90 度ずれた方向へ飛ぶので、必ず止める。
+        if not t.yaw_valid or t.yaw_rad is None or not t.pos_valid or t.pos is None:
+            self._send(REQ_HOLD, alt_m=target[2], flags=t.flags, yaw_rad=t.yaw_rad)
             return
 
-        if self.phase is Phase.TAKEOFF:
-            self._send(REQ_TAKEOFF, alt_m=self.TAKEOFF_ALT_M, flags=flags,
-                       yaw_rad=yaw_rad)
-            if abs(h_agl - self.TAKEOFF_ALT_M) < self.TAKEOFF_TOL_M:
-                # 離陸地点を覚える (RTL の戻り先)。地上にいた位置を優先し、
-                # 見えていなければ今の位置で代用する。
-                home_note = ""
-                if self._home_fixed is None:
-                    if self._ground_pos is not None:
-                        self.home = (self._ground_pos[0], self._ground_pos[1],
-                                     self.TAKEOFF_ALT_M)
-                        home_note = "地上の位置"
-                    elif pos is not None:
-                        self.home = (float(pos[0]), float(pos[1]), self.TAKEOFF_ALT_M)
-                        home_note = "地上で見えていなかったため今の位置"
-                if self.home is not None and home_note:
-                    home_note = (f"  戻り先=({self.home[0]:+.2f}, {self.home[1]:+.2f}) "
-                                 f"[{home_note}]")
-                self._say(f"離陸完了 (対地 {h_agl:.2f} m) -> WP0 へ{home_note}")
-                self._goto(Phase.CRUISE)
-            elif now - self._t_phase > self.TAKEOFF_TIMEOUT_S:
-                self.reason = "離陸がタイムアウト"
-                self._goto(Phase.LAND)
-                self._say(f"離陸が {self.TAKEOFF_TIMEOUT_S:.0f} 秒で完了しません "
-                          f"(対地 {h_agl:.2f} m) -> 着陸")
+        if self.phase is Phase.DWELL:
+            self._send(REQ_HOLD, alt_m=target[2], flags=t.flags, yaw_rad=t.yaw_rad)
+            if t.now - self._t_phase >= self.DWELL_S:
+                self._advance()
             return
 
-        if self.phase is Phase.MANEUVER:
-            # 機体が自分で回っている。PC は開始要求 (バースト) のあと IDLE で
-            # リンクだけ生かす。位置・ヨーの有無は問わない (機体は使わない)。
-            #  ★ HOLD/GUIDED を送ると機体側で機動が中断されるので送らないこと。
-            req, vx, yr, alt, laps = self._runner.request()
-            self._send(req, vx_mps=vx, yaw_rate_dps=yr, alt_m=alt, flags=flags,
-                       yaw_rad=yaw_rad, laps=laps)
-            st_m = self._runner.update(now)
-            if st_m == "done":
-                self._maneuver_done = True
-                self._say(f"{self.maneuver.name} 完了 ({self._runner.elapsed_s(now):.1f}s) "
-                          f"-> 離陸地点へ帰投")
-                self._runner = None
-                self._returning = True
-                self._goto(Phase.CRUISE)
-            elif st_m == "failed":
-                self.reason = f"機動 {self.maneuver.name} 失敗: {self._runner.reason}"
-                self._runner = None
-                self._goto(Phase.LAND)
-                self._say(f"異常検知 -> 自動着陸: {self.reason}")
+        vx, vy = self._velocity_command(t.pos, target, t.yaw_rad)
+        self._send(REQ_GUIDED, vx_mps=vx, vy_mps=vy,
+                   alt_m=target[2], flags=t.flags, yaw_rad=t.yaw_rad)
+
+        dh = self._dist_h
+        dz = abs(target[2] - t.h_agl)
+        inside = dh < self.ARRIVE_R_M and dz < self.ARRIVE_Z_M
+        # 保持試験モード: 1点目 (CENTER) に着いても DWELL へ進まず、
+        #  カメラ位置で速度指令を出し続けてその場に留まる。DWELL は指令を
+        #  止めて機体のフロー保持に任せるので、留まれる能力の測定にならない。
+        #  抜けるのは ミッションタイムアウト / 異常検知 / [X] / スイッチ操作。
+        if MISSION_HOLD_AT_FIRST_WP and self.wp_idx == 0 and not self._returning:
+            self._note_hold(t.now, inside, dh)
             return
+        if inside:
+            self._say(f"{self._label()} 到達 (残り {dh:.2f} m) -> "
+                      f"{self.DWELL_S:.0f} 秒保持")
+            self._goto(Phase.DWELL)
 
-        if self.phase in (Phase.CRUISE, Phase.DWELL):
-            target = self._target()
-            # ヘディングが分からないと「前」がどっちか分からない。
-            #  この状態で速度を出すと 90 度ずれた方向へ飛ぶので、必ず止める。
-            if not yaw_valid or yaw_rad is None or not pos_valid or pos is None:
-                self._send(REQ_HOLD, alt_m=target[2], flags=flags, yaw_rad=yaw_rad)
-                return
-
-            if self.phase is Phase.DWELL:
-                self._send(REQ_HOLD, alt_m=target[2], flags=flags, yaw_rad=yaw_rad)
-                if now - self._t_phase >= self.DWELL_S:
-                    self._advance()
-                return
-
-            vx, vy = self._velocity_command(pos, target, yaw_rad)
-            self._send(REQ_GUIDED, vx_mps=vx, vy_mps=vy,
-                       alt_m=target[2], flags=flags, yaw_rad=yaw_rad)
-
-            dh = self._dist_h
-            dz = abs(target[2] - h_agl)
-            inside = dh < self.ARRIVE_R_M and dz < self.ARRIVE_Z_M
-            # 保持試験モード: 1点目 (CENTER) に着いても DWELL へ進まず、
-            #  カメラ位置で速度指令を出し続けてその場に留まる。DWELL は指令を
-            #  止めて機体のフロー保持に任せるので、留まれる能力の測定にならない。
-            #  抜けるのは ミッションタイムアウト / 異常検知 / [X] / スイッチ操作。
-            if MISSION_HOLD_AT_FIRST_WP and self.wp_idx == 0 and not self._returning:
-                self._note_hold(now, inside, dh)
-                return
-            if inside:
-                self._say(f"{self._label()} 到達 (残り {dh:.2f} m) -> "
-                          f"{self.DWELL_S:.0f} 秒保持")
-                self._goto(Phase.DWELL)
+    def _phase_land(self, t):
+        self._send(REQ_LAND, flags=t.flags, yaw_rad=t.yaw_rad)
+        if self.link.n_data() > 0 and not self.link.flag("armed"):
+            # 既にディスアーム済み (地上) なら降ろすものが無い。
+            self._goto(Phase.DONE)
+            self._say("機体はディスアーム済みです -> 終了")
             return
+        if self.link.flag("landed"):
+            self._goto(Phase.DONE)
+            self._say("着陸完了。THR_CUT でディスアームしてください"
+                      + (f"  (理由: {self.reason})" if self.reason else ""))
+        elif t.now - self._t_phase > 40.0:
+            self._goto(Phase.DONE)
+            self._say("着陸完了の通知が来ませんでした。"
+                      "機体の状態を目視で確認し、手動で回収してください")
 
-        if self.phase is Phase.LAND:
-            self._send(REQ_LAND, flags=flags, yaw_rad=yaw_rad)
-            if self.link.n_data() > 0 and not self.link.flag("armed"):
-                # 既にディスアーム済み (地上) なら降ろすものが無い。
-                self._goto(Phase.DONE)
-                self._say("機体はディスアーム済みです -> 終了")
-                return
-            if self.link.flag("landed"):
-                self._goto(Phase.DONE)
-                self._say("着陸完了。THR_CUT でディスアームしてください"
-                          + (f"  (理由: {self.reason})" if self.reason else ""))
-            elif now - self._t_phase > 40.0:
-                self._goto(Phase.DONE)
-                self._say("着陸完了の通知が来ませんでした。"
-                          "機体の状態を目視で確認し、手動で回収してください")
-            return
+    _PHASE_HANDLERS = {
+        Phase.ARMING:   _phase_arming,
+        Phase.TAKEOFF:  _phase_takeoff,
+        Phase.MANEUVER: _phase_maneuver,
+        Phase.CRUISE:   _phase_cruise_dwell,
+        Phase.DWELL:    _phase_cruise_dwell,
+        Phase.LAND:     _phase_land,
+    }
 
     # ------------------------------------------------------------ 内部
     def _label(self):
@@ -933,7 +956,7 @@ class WaypointMission:
         return None
 
     # ------------------------------------------------------------ 表示
-    MODE_NAME = {0: "RATE", 1: "ANGLE", 2: "GUIDED", 3: "POSHOLD", 4: "ALTHOLD"}
+    MODE_NAME = MODE_NAME   # protocol/S5Telem.h から生成 (core/s5_link 経由)
 
     def status_line(self):
         """

@@ -32,7 +32,7 @@ BLE ログ (機体 125Hz) と PC 側のログ (テレメトリ / カメラ / 指
 2. テレメトリの t_ms は 655.36 秒で一周している
    下りパケットの時刻は 10ms 単位の uint16 (S5Telem)。地上局が展開して
    いるが、起点は「最初に受けたパケット」なので、真の millis() とは
-   k * 655360 ms だけずれている (ground_receiver/src/tools/s5_log.cpp
+   k * 655360 ms だけずれている (ground_receiver/include/TelemetryStore.h
    の unwrapTime)。→ BIN と重なるように k を選ぶ。
 
 3. カメラの Time は「撮影時刻」ではない

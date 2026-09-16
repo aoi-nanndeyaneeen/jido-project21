@@ -58,13 +58,14 @@ BIN2CSV_PY = REPO_ROOT / "flight_controller" / "scripts" / "bin2csv.py"
 DECODE_HZ = 10.0
 
 
-_MODE_NAME = {0: "IDLE", 1: "HOLD", 2: "TAKEOFF", 3: "GUIDED", 4: "LAND"}
-
-# S5Cmd.h / S5Telem.h と一致させること (BLE 側は Action の値をそのまま運ぶだけ)
-ACT_NONE, ACT_PID_RESET, ACT_IMU_CAL, ACT_SELFTEST = 0, 1, 2, 3
-ACT_NAME = {ACT_NONE: "-", ACT_PID_RESET: "PID_RESET",
-           ACT_IMU_CAL: "IMU_CAL", ACT_SELFTEST: "SELFTEST"}
-ACK_OK, ACK_REFUSED_ARMED, ACK_CAL_REJECTED = 0, 1, 2
+# ★ 値は protocol/S5Cmd.h / S5Telem.h が唯一の定義 (core/s5_protocol.py は生成物)。
+#   BLE 側は Action の値をそのまま運ぶだけ。
+#   2026-09-16 まではここに手書きの _MODE_NAME があり、機体の mode (0=RATE 1=ANGLE
+#   2=GUIDED 3=POSHOLD 4=ALTHOLD) を REQ 名 (IDLE/HOLD/TAKEOFF/...) で表示していた。
+from core.s5_protocol import (MODE_NAME as _MODE_NAME,
+                              ACT_NONE, ACT_PID_RESET, ACT_IMU_CAL, ACT_SELFTEST,
+                              ACTION_NAME as ACT_NAME,
+                              ACK_OK, ACK_REFUSED_ARMED, ACK_CAL_REJECTED)
 ACK_RESULT_NAME = {ACK_OK: "OK", ACK_REFUSED_ARMED: "拒否(アーム中)",
                    ACK_CAL_REJECTED: "却下(妥当性チェック)"}
 

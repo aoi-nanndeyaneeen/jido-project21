@@ -46,7 +46,7 @@ IM920sL は半二重 19200bps、実効 15Hz、往復の遅れは 100〜200ms。
         v  position_estimator/src/core/mission.py   外側ループ 10Hz
    「機体座標の目標速度 [m/s]」 + 「目標対地高度 [m]」
         |
-        v  USB -> 地上局 (s5_log.cpp)。届いた順に無線へ。最短 125ms 間隔
+        v  USB -> 地上局 (ground_receiver src/main.cpp)。届いた順に無線へ。最短 125ms 間隔
         v  IM920 上り 最大 8Hz  (S5Cmd.h / 20+4=24 バイト)
         |
   機体 PosHold  : 目標速度 -> 速度PID -> 目標リーン角     内側 100Hz
@@ -306,6 +306,12 @@ MISSION_WAYPOINTS = [(0.3, 0.0, 0.50)]     # 右へ 0.3m だけ
 ---
 
 ## 3. 追加・変更したもの
+
+> ★ 2026-09-16 のリファクタリングで置き場所が変わった (下表は 09-11 時点の記録):
+> `S5Cmd.h` / `S5Telem.h` → リポジトリ直下 `protocol/` に 1 つだけ (両プロジェクトが `-I` で参照)。
+> `ground_receiver/src/tools/s5_log.cpp` → `ground_receiver/src/main.cpp` (+ `include/*.h`)。
+> `drone_s5.cpp` の GUIDED 状態機械 → `include/quad/Guided.h`。全体は [SYSTEM_FLOW.md](SYSTEM_FLOW.md)。
+
 
 | ファイル | 内容 |
 |---|---|

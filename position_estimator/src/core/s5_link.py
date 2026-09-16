@@ -16,7 +16,7 @@ XIAO の USB シリアルは 1 本しかない。従来は
     → s5_logger.py は **同時に起動しないこと**。このクラスが CSV も書く。
 
 --------------------------------------------------------------------------
-プロトコル (ground_receiver/src/tools/s5_log.cpp と対)
+プロトコル (ground_receiver/src/main.cpp と対)
 --------------------------------------------------------------------------
 受信 (XIAO -> PC):
     "HEADER,<列名...>"   CSV の列定義。これを見て列を動的に覚える
@@ -30,7 +30,7 @@ XIAO の USB シリアルは 1 本しかない。従来は
     "1" / "0"            CSV 出力の ON / OFF
     "CMD,<req>,<vx_mmps>,<vy_mmps>,<alt_cm>,<yaw_rate_cdps>,<flags>"
                          上りコマンド。XIAO は届いた順に無線へ流す
-                         (最短 125ms 間隔 = 8Hz。s5_log.cpp の
+                         (最短 125ms 間隔 = 8Hz。ground_receiver GroundConfig.h の
                           CMD_MIN_GAP_MS が無線帯域の唯一の蓋)。
                          速く送るほど、蓋が開いた瞬間に渡る指令が新しくなる。
 
@@ -53,40 +53,22 @@ from pathlib import Path
 import serial
 import serial.tools.list_ports
 
-# ground_receiver/src/tools/s5_log.cpp / include/S5Cmd.h の Req と同じ値
-REQ_IDLE    = 0
-REQ_HOLD    = 1
-REQ_TAKEOFF = 2
-REQ_GUIDED  = 3
-REQ_LAND    = 4
-REQ_ABORT   = 5
-# ★ 2026-09-16: 自動水平旋回。GUIDED と違い、機体に1回届けば地上局からの
-#   継続送信なしで機体単独 (ジャイロ+オプティカルフロー) で1周を完結する
-#   (S5Cmd.h / drone_s5.cpp の GP_CIRCLE 参照)。
-REQ_CIRCLE  = 6
-REQ_FIGURE8 = 7        # 8の字 (CIRCLE 2周、2周目は逆回り)
-REQ_CLIMB_TURN = 8     # 上昇旋回 (1周の間に alt_m まで上昇)
-#   送り方は core/maneuver.py の ManeuverRunner を使うこと (バースト → IDLE)。
-
-REQ_NAME = {REQ_IDLE: "IDLE", REQ_HOLD: "HOLD", REQ_TAKEOFF: "TAKEOFF",
-            REQ_GUIDED: "GUIDED", REQ_LAND: "LAND", REQ_ABORT: "ABORT",
-            REQ_CIRCLE: "CIRCLE", REQ_FIGURE8: "FIGURE8", REQ_CLIMB_TURN: "CLIMB"}
-
-# S5Cmd.h の CmdFlag
-CF_ARMED_OK  = 1 << 0
-CF_POS_VALID = 1 << 1
-CF_YAW_VALID = 1 << 2
-CF_ALT_ABS   = 1 << 3
-CF_POS_CORR  = 1 << 4   # corr_n_m/corr_e_m を機体の pos_n/pos_e へ適用する
-# CF_POS_CORR と一緒に立てると「原点合わせ」(hold も一緒に動くので機体は
-# 動かない)。以降、機体の pos_n/pos_e はこちらの座標系になり、機体側
-# フェンス (QuadConfig FENCE_*) が効き始める。テレメトリ frame_ok=1 で確認。
-CF_POS_SHIFT = 1 << 5
-
-# ★ 2026-09-14: PID reset / IMU校正 / デバイス確認の単発指令 (Action) は
-#   IM920 から削除した (IM920は操縦専用に戻し、これらはBLE経由に一本化。
-#   core/ble_tap.py 参照)。この CmdFrame (IM920) には二度と action/
-#   action_seq を足さないこと。
+# ---- プロトコル定数 ----------------------------------------------------------
+#  ★ 値は protocol/S5Cmd.h / S5Telem.h が唯一の定義。core/s5_protocol.py は
+#    そこから `python protocol/gen_py_protocol.py` で生成したもの。ここでは
+#    従来どおり `from core.s5_link import REQ_*` で使えるように再公開するだけ。
+#  REQ_CIRCLE / FIGURE8 / CLIMB_TURN (定型機動) は GUIDED と違い、機体に 1 回届けば
+#  地上局からの継続送信なしで機体単独で完結する (flight_controller quad/Guided.h)。
+#  送り方は core/maneuver.py の ManeuverRunner (バースト → IDLE)。
+#  ★ PID reset / IMU校正 / デバイス確認の単発指令 (Action) は IM920 から削除済み
+#    (BLE 経由に一本化。core/ble_tap.py)。この CmdFrame には二度と足さないこと。
+from core.s5_protocol import (                                   # noqa: F401 (再公開)
+    S5C_VERSION, S5T_VERSION,
+    REQ_IDLE, REQ_HOLD, REQ_TAKEOFF, REQ_GUIDED, REQ_LAND, REQ_ABORT,
+    REQ_CIRCLE, REQ_FIGURE8, REQ_CLIMB_TURN, REQ_NAME,
+    CF_ARMED_OK, CF_POS_VALID, CF_YAW_VALID, CF_ALT_ABS, CF_POS_CORR, CF_POS_SHIFT,
+    MODE_NAME, ALT_STATE_NAME,
+)
 
 # XIAO の USB CDC。Windows では description で判別できないので VID:PID。
 # ★ 地上局を RP2040 -> ESP32C3 に移行済み。ESP32C3 はチップ内蔵のネイティブ
@@ -116,8 +98,8 @@ class S5Link:
             st = link.state()            # 最新テレメトリ (dict)
         link.close()
 
-    state() が返す dict の中身は機体の CSV 列そのまま (s5_log.cpp の
-    CSV_HEADER)。よく使うのは:
+    state() が返す dict の中身は機体の CSV 列そのまま (ground_receiver
+    TelemetryStore.h の CSV_HEADER)。よく使うのは:
         mode      0=RATE 1=ANGLE 2=GUIDED 3=POSHOLD 4=ALTHOLD
         armed     0/1
         guided    0/1   GUIDED に入っているか
@@ -262,7 +244,7 @@ class S5Link:
         vals = line[len("DATA,"):].split(",")
         if len(vals) != len(self._cols):
             # 列数が合わない = 受信機のファーム更新後に HEADER を取り損ねた。
-            # 次の HEADER を待つ (s5_log.cpp は '1' を受けるたびに出し直す)。
+            # 次の HEADER を待つ (地上局は '1' を受けるたびに出し直す)。
             return
         d = {}
         for k, v in zip(self._cols, vals):
@@ -367,14 +349,14 @@ class S5Link:
                 parts.append("0")
             parts.append(str(int(round(yaw_abs_deg * 100.0))))
         if laps:
-            # laps は 10 項目め。手前を 0 で埋める (s5_log.cpp handleCmdLine の並び)。
+            # laps は 10 項目め。手前を 0 で埋める (ground_receiver Uplink.h の並び)。
             while len(parts) < 10:
                 parts.append("0")
             parts.append(str(int(laps)))
         self._write_raw(",".join(parts) + "\n")
 
     def send_key(self, ch):
-        """地上局 XIAO のキー入力をそのまま送る (s5_log.cpp の handleKey)。
+        """地上局 XIAO のキー入力をそのまま送る (ground_receiver main.cpp の handleKey)。
 
         's' 状態表示 / 'd' 生データ / 'z' 統計クリア / '1','0' CSV 出力。
         返事は '#' 行で返ってくるので on_message から拾える。

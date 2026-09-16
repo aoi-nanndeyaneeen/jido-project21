@@ -5,6 +5,12 @@
 
 ## 🌟 システム全体構成 (System Architecture)
 
+> **処理の流れと周期 (何がどこで何 Hz で回っているか) は [SYSTEM_FLOW.md](SYSTEM_FLOW.md) を参照。**
+> 機体と地上局が共有する無線パケット定義は `protocol/` (S5Cmd.h / S5Telem.h / Im920Frame.h) に
+> 1 箇所だけあり、Python 側の定数は `python protocol/gen_py_protocol.py` で生成する。
+> 使わなくなったコードは各サブシステムの `used/` に置いてある (削除はしていない)。
+
+
 本プロジェクトは大きく分けて3つのサブシステムから構成されています。
 
 ### 1. 🛩️ Flight Controller (機体側制御システム)
@@ -15,15 +21,15 @@
   - 機体の姿勢（Roll, Pitch, Yaw）と加速度、高度の取得
   - テレメトリデータ（センサ値）の地上への送信
   - 地上からのRCコマンドを受信し、自律飛行やオートジャイロ機能などの実行。各種機体（ドローン、双発機、トレーナー、デルタ翼）用のファームウェア環境を切り替え可能。
-  - 現在のメイン開発ターゲットは `src/drone.cpp` (自律飛行対応版)
+  - 現在のメイン開発ターゲットは `src/drone_s5.cpp` (+ `include/quad/*.h`)。`drone.cpp` は旧版
 
 ### 2. 📡 Ground Receiver (地上局通信レシーバー)
 * **ディレクトリ**: `ground_receiver/`
-* **概要**: 機体とPC間の通信を中継するレシーバー。
-* **主要ハードウェア**: RP2040 (Raspberry Pi Pico等), IM920SL
+* **概要**: 機体とPC間の通信を中継するレシーバー (`src/main.cpp`)。
+* **主要ハードウェア**: Seeed XIAO RP2040, IM920SL
 * **機能**:
-  - 機体から送られてくるIM920無線パケットを受信。
-  - 受信データをPC（Python）が読み取りやすいCSV形式等にパースし、USBシリアル通信でPosition Estimatorへと渡す。
+  - 機体から送られてくるIM920無線パケットを受信し、CSV (`DATA,...`) として USB へ (`include/TelemetryStore.h`)。
+  - PC からの `CMD,...` 行を最短 125ms 間隔 (8Hz) で無線へ中継 (`include/Uplink.h`)。PC が黙れば送信を止め、機体をフェイルセーフへ落とす。
 
 ### 3. 💻 Position Estimator (PC側システム・オートパイロット)
 * **ディレクトリ**: `position_estimator/`

@@ -17,6 +17,7 @@ import csv
 import datetime
 import time
 from pathlib import Path
+from core.s5_protocol import MODE_NAME
 
 
 class CsvLogger:
@@ -147,7 +148,7 @@ class MissionLogger(CsvLogger):
     ]
 
     # 機体モード番号 -> 名前 (s5_link.py の docstring と同じ対応)
-    MODE_NAME = {0: "RATE", 1: "ANGLE", 2: "GUIDED", 3: "POSHOLD", 4: "ALTHOLD"}
+    MODE_NAME = MODE_NAME   # protocol/S5Telem.h から生成 (core/s5_protocol.py)
 
     def __init__(self, log_path: Path):
         super().__init__(log_path, self.HEADER, mode="w")

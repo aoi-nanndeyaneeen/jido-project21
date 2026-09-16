@@ -8,11 +8,12 @@
 //    姿勢(数十Hz)の解析はできないが、高度・位置ホールドのループは
 //    1〜2Hz の現象なので、これで足りる。
 //
-//  ★ このファイルは flight_controller/ と ground_receiver/ の両方に
-//    同じ内容で置いてある。片方だけ編集すると構造体が食い違って
-//    チェックサムは通るのに値だけ壊れる。必ず両方そろえること。
-//      flight_controller/include/S5Telem.h
-//      ground_receiver/include/S5Telem.h
+//  ★ このファイルはリポジトリ直下の protocol/ にあり、flight_controller と
+//    ground_receiver の両方が platformio.ini の -I ../protocol で同じ実体を
+//    読む (以前は両プロジェクトに手コピーしていた)。Python 側の定数は
+//      python protocol/gen_py_protocol.py
+//    で position_estimator/src/core/s5_protocol.py に生成する。
+//    構造体を変えたら VERSION を上げ、生成スクリプトを再実行すること。
 //    ずれの検出用に VERSION と static_assert(sizeof) を入れてある。
 //
 // ------------------------------------------------------------
@@ -41,12 +42,13 @@
 //    D = ヨー推定用の機体Δv (地上局ガイド飛行のヨー保持に使う)
 //    P = ゲイン一覧 (数秒に1回、枠を1つ borrow する)
 //
-//  ★ 送る順番はモードで変える (drone_s5.cpp の S5Tel::tick):
+//  ★ 送る順番はモードで変える (quad/S5Telemetry.h の TelemetryTx::tick):
 //      ANGLE / RATE  … A,C の交互          (各 7.5Hz)
 //        B(水平位置)/D(Δv) は POSHOLD 以外では意味が薄いので送らない。
 //        代わりに C を厚くして、離陸時の転倒やモーター飽和を追えるようにする。
-//      POSHOLD/AUTO  … A,B,D,A,C の5枠巡回  (A 6Hz / B,D,C 各3Hz)
-//        位置ループは 0.3〜1Hz、ヨー推定も1Hz未満の窓なので 3Hz で足りる。
+//      POSHOLD/GUIDED … A,B,A,B,C,A,B,D の8枠巡回 (8Hz で A 3Hz / B 3Hz / C 1Hz / D 1Hz)
+//        B は「PC が自分の指令の効きを見る唯一の枠」なので C/D より厚くしてある
+//        (2026-09-16。旧: A,B,D,A,C の5枠)。
 //
 //  ★ 送信は必ず非同期 (S5T::Tx::service)。HardwareSerial::print を直接
 //    呼ぶと TXバッファ(40B)が溢れた時点でブロックし、1000Hz の制御
@@ -58,6 +60,7 @@
 // ============================================================
 #pragma once
 #include <Arduino.h>
+#include "Im920Frame.h"
 
 namespace S5T {
 
@@ -76,8 +79,8 @@ namespace S5T {
 constexpr uint8_t VERSION = 9;
 
 // IM920sL の実効ペイロード上限 [byte]。これを超えると黙って切られる。
-constexpr size_t IM920SL_MAX_PAYLOAD = 32;
-constexpr size_t CHECKSUM_BYTES      = 4;
+constexpr size_t IM920SL_MAX_PAYLOAD = IM920::MAX_PAYLOAD;      // 32
+constexpr size_t CHECKSUM_BYTES      = IM920::CHECKSUM_BYTES;   // 4
 constexpr size_t PACKET_BYTES        = IM920SL_MAX_PAYLOAD - CHECKSUM_BYTES;  // 28
 
 constexpr uint8_t TYPE_ALT   = 0x41;  // 'A'  高度ループ + 姿勢
@@ -109,7 +112,7 @@ enum Flag : uint16_t {
     F_SAT         = 1u << 9,   // ミキサーがどこかで飽和した
     F_TX_DROP     = 1u << 10,  // 送信バッファが空かず直前に1回捨てた
     // ★ VERSION 5 で追加 (地上局ガイド飛行 / S5Cmd.h)
-    F_GUIDED      = 1u << 11,  // 地上局コマンドで飛んでいる (MODE_AUTO)
+    F_GUIDED      = 1u << 11,  // 地上局コマンドで飛んでいる (MODE_GUIDED)
     F_CMD_FRESH   = 1u << 12,  // 上りコマンドが規定時間内に届いている
     F_LANDED      = 1u << 13,  // 自動着陸が完了して出力を切った
     // ★ VERSION 6 で追加 (S5Cmd.h の REQ_CIRCLE)
@@ -117,6 +120,54 @@ enum Flag : uint16_t {
     F_FRAME_OK    = 1u << 15,  // CF_POS_SHIFT で原点合わせ済み = 機体側フェンスが有効
                                //   (離陸前・モード切替で落ちる。地上局は落ちたら送り直す)
 };
+
+// ------------------------------------------------------------
+//  飛行モード / 高度ホールド状態  (packModes で 1 バイトに載る値)
+// ------------------------------------------------------------
+//  ★ 値は無線に乗るので、機体側 (drone_s5.cpp selectMode / AltHold.h) も
+//    地上側 (ground_receiver / console.py / mission.py) もここだけを見る。
+//    以前は各所に手書きの対応表があり、console.py の alt_state 名が
+//    機体の実体 (Standby/NoHoverThr/…) とずれたまま表示されていた。
+enum Mode : uint8_t {
+    MODE_RATE    = 0,   // 封印 (アクロ)。selectMode は返さない
+    MODE_ANGLE   = 1,   // 完全手動 (自己水平のみ)。SW_HOVER=down。bail-out
+    MODE_GUIDED  = 2,   // 地上局ガイド飛行 (旧名 MODE_AUTO)
+    MODE_POSHOLD = 3,   // フロー水平ホールド + 高度ホールド。SW_HOVER=cen/up
+    MODE_ALTHOLD = 4,   // 高度ホールドのみ (フロー喪失時のフォールバック)
+};
+
+inline const char* modeName(uint8_t m) {
+    switch (m) {
+        case MODE_RATE:    return "RATE";
+        case MODE_ANGLE:   return "ANGLE";
+        case MODE_GUIDED:  return "GUIDED";
+        case MODE_POSHOLD: return "POSHOLD";
+        case MODE_ALTHOLD: return "ALTHOLD";
+    }
+    return "?";
+}
+
+//  高度ホールドの状態 (quad/AltHold.h の実体。表示 / ログ / PosHold のゲート)
+enum class AltState : uint8_t {
+    Off        = 0,  // シリアルのトグルで無効にされている
+    Standby    = 1,  // 未アーム / POSHOLD でない / スロットルを絞っている
+    NoHoverThr = 2,  // ALT_HOVER_THR が未設定 (0) なので engage しない
+    NoRange    = 3,  // 測距が無い / まだ一度も掴めていない
+    Holding    = 4,  // 通常動作。スロットルを握っている
+    RangeLost  = 5,  // engage 後に測距「だけ」を失い、base で保持している
+};
+
+inline const char* altStateName(uint8_t s) {
+    switch ((AltState)s) {
+        case AltState::Off:        return "OFF";
+        case AltState::Standby:    return "STANDBY";
+        case AltState::NoHoverThr: return "NO_HOVER_THR";
+        case AltState::NoRange:    return "NO_RANGE";
+        case AltState::Holding:    return "HOLDING";
+        case AltState::RangeLost:  return "RANGE_LOST";
+    }
+    return "?";
+}
 
 // mode と alt_state を 1 バイトに詰める (上位=alt_state 下位=mode)
 inline uint8_t packModes(uint8_t mode, uint8_t alt_state) {
@@ -128,7 +179,7 @@ inline uint8_t unpackAltState(uint8_t m) { return (uint8_t)((m >> 4) & 0x0F); }
 // ------------------------------------------------------------
 //  共通ヘッダ (6 byte)
 //    t_cs は millis()/10 [10ms単位]。655.35 秒で一周するので、地上側で
-//    自前の受信時刻を使って巻き戻しを展開する (s5_log.cpp の unwrap)。
+//    自前の受信時刻を使って巻き戻しを展開する (ground_receiver TelemetryStore の unwrapTime)。
 //    uint32 の生 millis を載せる余裕は 28 バイトには無い。
 // ------------------------------------------------------------
 struct __attribute__((__packed__)) Header {
@@ -222,11 +273,11 @@ static_assert(sizeof(AttFrame) == PACKET_BYTES, "AttFrame が 28 byte ではあ�
 //  直前にこのフレームを送ってからの経過時間ぶん積分した値 = 速度変化。
 //
 //  ★ 積分窓は固定 200ms ではなく可変長 (前回の D 送信から今回まで)。
-//    送信頻度はモードで変わる (S5Tel::tick) ため、固定長にすると実際の
+//    送信頻度はモードで変わる (TelemetryTx::tick) ため、固定長にすると実際の
 //    積分区間とズレる。地上側は h.t_cs (このフレームの送信時刻 = 窓の
 //    終端) をそのまま使えばよい (窓の開始は特に要らない。PC側
 //    yaw_estimator は複数フレームを跨いで合成する)。
-//  ★ yaw_dd は AltFrame と同じ量 (g_yaw_est) だが、Δv とちょうど同じ
+//  ★ yaw_dd は AltFrame と同じ量 (機体のヨー推定 HeadingHold::est) だが、Δv とちょうど同じ
 //    瞬間の値をペアで送る (旋回ゲート判定の精度のため。AltFrame は
 //    別の巡回スロットで届くので厳密に同時刻にならない)。
 //  ★ A/B/C と違って 28 byte ちょうどにしていない (中身が少ないので
@@ -242,7 +293,7 @@ struct __attribute__((__packed__)) DvFrame {
     Header   h;                //  6
     int16_t  dvx_mmps;         //  8  重力除去後のΔv 前+ [mm/s]
     int16_t  dvy_mmps;         // 10  同 右+ [mm/s]
-    int16_t  yaw_dd;           // 12  この瞬間の g_yaw_est [0.1 deg]
+    int16_t  yaw_dd;           // 12  この瞬間の機体ヨー推定 [0.1 deg]
     // ---- 上りリンク (S5C::Rx) の統計。すべて「機体が実際に見た値」 ----
     uint16_t cmd_age_cs;       // 14  最後に受けた上りコマンドからの経過 [10ms]
                                //     0xFFFF = 一度も受けていない / 655秒以上
@@ -343,83 +394,11 @@ inline uint8_t qu8(float v, float scale) {
 }
 
 // ------------------------------------------------------------
-//  チェックサム (既存 Telemetry.h と同じ方式)
-//    全バイトの総和の2の補数を little-endian 4バイトで後ろに付ける。
-//    受信側は「データ部の総和 + チェックサム値 == 0」で検証する。
 // ------------------------------------------------------------
-inline uint32_t checksum(const uint8_t* p, size_t n) {
-    uint32_t s = 0;
-    for (size_t i = 0; i < n; ++i) s += p[i];
-    return ~s + 1u;
-}
-
-// ============================================================
-//  Tx  -  機体側の非ブロッキング送信
-// ============================================================
-//  send() は文字列を内部バッファに組み立てるだけ。実際の UART 書き込みは
-//  service() が availableForWrite() の空きぶんだけ進める。毎ループ
-//  (1000Hz) 呼ぶこと。前のパケットを送り切る前に send() が来たら、その
-//  パケットは捨てて dropped() を増やす (制御ループを止めるより良い)。
-// ============================================================
-class Tx {
-public:
-    explicit Tx(HardwareSerial* ser) : _ser(ser) {}
-
-    // ★ Serial3 を FlightTelemetry::begin() が既に開いているなら呼ばなくてよい。
-    void begin(unsigned long baud = 19200) { _ser->begin(baud); }
-
-    template <typename T>
-    bool send(const T& pkt) {
-        static_assert(sizeof(T) + CHECKSUM_BYTES <= IM920SL_MAX_PAYLOAD,
-                      "IM920sL の 32 バイト制限を超えています "
-                      "(超えた分は黙って切り捨てられ、値が壊れます)");
-        if (busy()) { _dropped++; return false; }
-        const uint8_t* p  = (const uint8_t*)&pkt;
-        const uint32_t cs = checksum(p, sizeof(T));
-        const uint8_t* q  = (const uint8_t*)&cs;
-
-        char* w = _buf;
-        *w++ = 'T'; *w++ = 'X'; *w++ = 'D'; *w++ = 'A'; *w++ = ' ';
-        for (size_t i = 0; i < sizeof(T);  ++i) w = hex2(w, p[i]);
-        for (size_t i = 0; i < sizeof(cs); ++i) w = hex2(w, q[i]);
-        *w++ = '\r'; *w++ = '\n';
-
-        _len = (size_t)(w - _buf);
-        _pos = 0;
-        _sent++;
-        service();          // 空いていればこの場で書けるだけ書く
-        return true;
-    }
-
-    // 送りかけのバイトを可能なぶんだけ吐き出す。ブロックしない。
-    void service() {
-        while (_pos < _len) {
-            const int room = _ser->availableForWrite();
-            if (room <= 0) return;
-            size_t n = _len - _pos;
-            if ((int)n > room) n = (size_t)room;
-            _ser->write((const uint8_t*)_buf + _pos, n);
-            _pos += n;
-        }
-    }
-
-    bool     busy()    const { return _pos < _len; }
-    uint32_t sent()    const { return _sent; }
-    uint32_t dropped() const { return _dropped; }
-
-private:
-    static char* hex2(char* w, uint8_t b) {
-        static const char H[] = "0123456789ABCDEF";
-        *w++ = H[b >> 4];
-        *w++ = H[b & 0x0F];
-        return w;
-    }
-
-    HardwareSerial* _ser;
-    // "TXDA " + 32*2 + CRLF = 71。余裕を見て 96。
-    char     _buf[96];
-    size_t   _len = 0, _pos = 0;
-    uint32_t _sent = 0, _dropped = 0;
-};
+//  行の組み立て / チェックサム / 送信は IM920 層 (Im920Frame.h) に一本化
+// ------------------------------------------------------------
+//  以前はここと S5Cmd.h に同じ checksum() と Tx クラスが 2 つずつあった。
+using IM920::checksum;
+using Tx = IM920::Tx;
 
 } // namespace S5T

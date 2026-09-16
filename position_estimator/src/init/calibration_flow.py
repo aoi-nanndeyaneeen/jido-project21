@@ -459,7 +459,7 @@ def run_calibration_phase(cam1, cam1_ok: bool, cam2_ok: bool, cam2_stub):
     Camera1・Camera2両方のキャリブレーションを実施し、
     (calib1, calib2, cam2) を返す。calib は CameraCalib。
     """
-    print("\n[INIT 4/4]  フィールドキャリブレーション")
+    print("\n[INIT 3/3]  フィールドキャリブレーション")
     print(f"  使用プリセット: {CALIB_PRESET}")
     print(f"  基準点の3D座標:\n{FIELD_POINTS}")
 

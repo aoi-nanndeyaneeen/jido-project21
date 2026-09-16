@@ -28,18 +28,13 @@
 #include <math.h>
 #include "quad/QuadConfig.h"
 #include "quad/QuadPID.h"
+#include "S5Telem.h"     // AltState (値は無線に乗るので protocol/ が唯一の定義)
 
 namespace Quad {
 
 //  高度ホールドの状態。表示 / ログ / PosHold のゲートに使う。
-enum class AltState : uint8_t {
-    Off        = 0,  // シリアルのトグルで無効にされている
-    Standby    = 1,  // 未アーム / POSHOLD でない / スロットルを絞っている
-    NoHoverThr = 2,  // ALT_HOVER_THR が未設定 (0) なので engage しない
-    NoRange    = 3,  // 測距が無い / まだ一度も掴めていない
-    Holding    = 4,  // 通常動作。スロットルを握っている
-    RangeLost  = 5,  // engage 後に測距「だけ」を失い、base で保持している
-};
+//  ★ 定義は protocol/S5Telem.h の S5T::AltState (地上局・PC と共有)。
+using AltState = S5T::AltState;
 
 class AltitudeHold {
 public:

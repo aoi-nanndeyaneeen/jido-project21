@@ -1,0 +1,207 @@
+// ============================================================
+//  S5Status.h  -  USB シリアルのデバッグ画面 (DEBUG_HZ = 10Hz)
+// ============================================================
+//  drone_s5.cpp § 9 printStatus() をそのまま移したもの。読むだけで
+//  状態は変えない。FlightLog::Usb が動いている間は呼ばれない
+//  (同じ USB を奪い合うとログが落ちる)。
+// ============================================================
+#pragma once
+#include <Arduino.h>
+#include "quad/S5Vehicle.h"
+#include "quad/SelfTest.h"
+#include "quad/SdLog.h"
+#include "quad/LogLink.h"
+
+namespace S5 {
+
+inline void printStatus(Vehicle& v, uint32_t dt_us) {
+    Serial.print("\033[2J\033[H");
+    Serial.println("=== Stage 5d : 1スイッチ完全自動ホバリング ===");
+    if (v.dry_run)
+        Serial.println(">>> DRY-RUN: ESCへは0のみ (モーターは回らない)  ['m']で解除 <<<");
+    Serial.printf("loop dt = %6lu us (%6.1f Hz)   %s   link=%s\n",
+                  (unsigned long)dt_us, 1000000.0f / (float)dt_us,
+                  isArmed(v) ? "ARMED" : "DISARMED",
+                  v.sbus.isSafe() ? "OK" : "LOST");
+    Serial.printf("MODE = %s   (SW_HOVER: down=ANGLE / cen=POSHOLD / up=GUIDED%s)\n",
+                  modeLabel(v.mode),
+                  Quad::GUIDED_ENABLE ? " (資格切れ中はPOSHOLD)" : "");
+    SelfTest::printCompact(Serial);   // 起動時に何がつながっていたか (画面に残す)
+
+    if (USE_IM920) {
+        // 下りテレメトリの送信状況。drop が増え続けるなら TELEM_TX_HZ が速すぎる。
+        Serial.printf("TELEM tx=%lu drop=%lu %s\n",
+                      (unsigned long)v.s5tx.sent(), (unsigned long)v.s5tx.dropped(),
+                      v.s5tx.busy() ? "(sending)" : "");
+
+        // ---- 上りコマンド (GUIDED) --------------------------------
+        //  ★ ベンチで「地上局のコマンドが届いているか」を確認する唯一の場所。
+        //    good が増えないなら無線かパケット定義。badver なら S5Cmd.h が
+        //    機体側と地上側でずれている。badcs が増えるなら電波が弱い。
+        if (Quad::GUIDED_ENABLE) {
+            const S5C::Rx& rx = v.s5rx;
+            Serial.printf("CMD   rx: good=%lu lost=%lu badcs=%lu badlen=%lu badver=%lu  "
+                          "RSSI=%d %s\n",
+                          (unsigned long)rx.nGood(),  (unsigned long)rx.nLost(),
+                          (unsigned long)rx.nBadCs(), (unsigned long)rx.nBadLen(),
+                          (unsigned long)rx.nBadVer(), rx.rssi(),
+                          rx.everReceived() ? "" : "(まだ1つも受信していません)");
+            if (rx.everReceived()) {
+                const S5C::CmdFrame& c = rx.last();
+                Serial.printf("         %lu ms前  req=%-7s vx=%+.3f vy=%+.3f alt=%.2f m "
+                              "flags=0x%04X\n",
+                              (unsigned long)rx.ageMs(), S5C::reqName(c.req),
+                              (float)c.vx_mmps / S5C::SC_MMPS,
+                              (float)c.vy_mmps / S5C::SC_MMPS,
+                              (float)c.alt_cm  / S5C::SC_CM,
+                              (unsigned)c.flags);
+            }
+            const Quad::Guided& g = v.guided;
+            Serial.printf("GUIDED %s  phase=%-7s  目標 vx=%+.3f vy=%+.3f alt=%.2f m "
+                          "(slew %.2f m/s)%s%s\n",
+                          g.engaged() ? "ENGAGED" : "----   ",
+                          Quad::guidedPhaseName(g.phase()), g.vx(), g.vy(), g.altM(), g.slew(),
+                          (!g.engaged() && g.why()[0]) ? "  直前の解除理由: " : "",
+                          (!g.engaged() && g.why()[0]) ? g.why() : "");
+            if (g.inManeuver()) {
+                const Quad::Maneuver& m = g.maneuver();
+                Serial.printf("  機動 %s  進行 %5.1f / %.0f deg (脚 %d/%d)  ヨーレート %+.1f deg/s  "
+                              "高度目標 %.2f m\n",
+                              m.name(), m.doneDeg(), m.totalDeg(),
+                              m.leg() + 1, m.legs(), m.yawRate(), m.altTarget());
+            }
+            Serial.printf("FENCE  %s  (N±%.1f E±%.1f m)%s\n",
+                          v.poshold.fenceOn() ? "有効"
+                              : (Quad::FENCE_ENABLE ? "待機 (原点未設定: CF_POS_SHIFT 待ち)" : "無効"),
+                          Quad::FENCE_N_LIM, Quad::FENCE_E_LIM,
+                          v.poshold.fencePush() ? "  ★境界で押し返し中" : "");
+        }
+    }
+
+    if (v.sd_ok)   SdLog::brief(Serial);
+    if (v.link_ok) LogLink::brief(Serial);
+
+    if (v.mode != MODE_RATE) {
+        Serial.println("\n[角度ループ]  目標[deg]  実測[deg]  → 角速度目標[deg/s]");
+        Serial.printf("  roll  %10.1f %10.1f %18.1f\n",
+                      v.roll_axis.ang_tar, v.roll_axis.ang_meas, v.roll_axis.rate_tar);
+        Serial.printf("  pitch %10.1f %10.1f %18.1f\n",
+                      v.pitch_axis.ang_tar, v.pitch_axis.ang_meas, v.pitch_axis.rate_tar);
+    }
+
+    if (v.mode == MODE_POSHOLD) {
+        const Quad::PositionHold& ph = v.poshold;
+        Serial.printf("\n[フロー位置ホールド] %s  vel P=%.2f I=%.2f  pos P=%.2f  失探=%d\n",
+                      ph.holding() ? "HOLD " : "STICK",
+                      v.flow_vel_kp, v.flow_vel_ki, v.flow_pos_kp, ph.badCount());
+        Serial.printf("  速度[m/s]  実測(前,右)=%+6.2f %+6.2f   目標(前,右)=%+6.2f %+6.2f\n",
+                      ph.vxCtl(), ph.vyCtl(), ph.vxTar(), ph.vyTar());
+        Serial.printf("  位置[m]    現在(N,E)=%+6.2f %+6.2f   保持(N,E)=%+6.2f %+6.2f"
+                      "   (地面固定, ψ=%+.1fdeg)\n",
+                      ph.posN(), ph.posE(), ph.holdN(), ph.holdE(), v.heading.est());
+        Serial.printf("  → 目標リーン角[deg]  roll=%+5.1f  pitch=%+5.1f\n",
+                      ph.leanRoll(), ph.leanPitch());
+    }
+
+    // --- フローセンサの生死 (常時表示) ---
+    //  以前は POSHOLD のときしか出ず、「フローが死んでいるので POSHOLD に入れない」
+    //  状態だと画面のどこにも出なかった。常に出す。
+    if (USE_FLOW) {
+        Serial.printf("\n[フロー] %s  窓カウント(%.0f,%.0f)  SQUAL=%u(床%u)  "
+                      "0連続=%.1fs 低品質=%.1fs  h=%.2fm  (読%dHz/制御%dHz)\n",
+                      !v.flowobs.ok         ? "FAIL(起動時に応答なし)"
+                    : v.flow.suspectDead()  ? "凍結? (SQUAL床下 or 窓カウント0が継続)"
+                                            : "OK  ",
+                      v.flowobs.raw_x, v.flowobs.raw_y, v.flow.squal(), (unsigned)Quad::FLOW_SQUAL_MIN,
+                      v.flow.zeroRunS(), v.flow.lowQualS(), v.flow.height(),
+                      Quad::FLOW_LOOP_HZ, Quad::FLOW_CTRL_HZ);
+    }
+
+    // --- 距離センサ + 高度ホールド ---
+    if (USE_RANGE) {
+        const Quad::AltitudeHold& ah = v.althold;
+        Serial.printf("\n[距離:%s] %s  斜め=%.2fm  → 鉛直h=%.2fm  上昇=%+.2fm/s\n",
+                      (Quad::RANGE_BACKEND == Quad::RangeBackend::Sonar_EZ) ? "SONAR" : "ToF",
+                      !v.range.ok ? "FAIL " : (v.range.valid ? "OK   " : "失探 "),
+                      v.range.raw_m, v.range.h_m, v.range.climb_mps);
+        Serial.printf("[高度ホールド] %s  %s  hold=%.2fm  vz_tar=%+.2fm/s  "
+                      "base=%.2f corr=%+.3f → thr=%.2f\n",
+                      v.alt_hold_enable ? "ENABLED" : "OFF(手動)",
+                      ah.stateName(), ah.holdM(), ah.vzTar(),
+                      ah.thrBase(), ah.thrCorr(), ah.thrOut());
+        Serial.printf("  base=ALT_HOVER_THR(%.2f)固定  スティックvz=%s  "
+                      "離陸=%s (engage時h=%.2fm)  → スロットルは高度のみで決まる\n",
+                      Quad::ALT_HOVER_THR,
+                      Quad::ALT_STICK_VZ_ENABLE ? "有効" : "無効",
+                      ah.airborne() ? "検知済" : "未検知(水平ホールド待機)",
+                      ah.engageH());
+        Serial.printf("  gains: pos P=%.2f  rate P=%.2f I=%.2f D=%.3f   ['g']切替  ['p']-[s..v]調整\n",
+                      ah.posKp(), ah.ratePid().kp(), ah.ratePid().ki(), ah.ratePid().kd());
+    }
+
+    Serial.println("\n[レートループ] 目標[deg/s] 実測[deg/s]      cmd      I項");
+    Serial.printf("  roll  %11.1f %11.1f %9.4f %8.4f\n",
+                  v.roll_axis.rate_tar, v.roll_axis.rate_meas,
+                  v.roll_axis.cmd, v.roll_axis.rate.i_term());
+    Serial.printf("  pitch %11.1f %11.1f %9.4f %8.4f\n",
+                  v.pitch_axis.rate_tar, v.pitch_axis.rate_meas,
+                  v.pitch_axis.cmd, v.pitch_axis.rate.i_term());
+    Serial.printf("  yaw   %11.1f %11.1f %9.4f %8.4f\n",
+                  v.yaw_axis.rate_tar, v.yaw_axis.rate_meas,
+                  v.yaw_axis.cmd, v.yaw_axis.rate.i_term());
+
+    // --- ヘディングホールド ---
+    //  err がじわじわ片側に増え続けるなら、機体が回っているのではなく
+    //  ジャイロZのバイアスが残っている (= [k] で再キャリブレーションが必要)。
+    Serial.printf("\n[ヨー保持] %s  kp=%.2f  目標%+8.2f  推定%+8.2f  誤差%+7.2f [deg]\n",
+                  v.heading.holding() ? "HOLD  " : "STICK ",
+                  v.heading.kp(), v.heading.hold(), v.heading.est(), v.heading.error());
+
+    Serial.printf("\n  attitude roll=%+7.2f pitch=%+7.2f [deg]  thr=%.2f\n",
+                  v.att.roll, v.att.pitch, v.sbus.des[Ch::THR]);
+
+    Serial.println("\n[モーター]  M1=左前 M2=右前 M3=右後 M4=左後");
+    for (int i = 0; i < Quad::MOTOR_COUNT; ++i) {
+        Serial.printf("  M%d %5.3f  ", i + 1, v.out[i]);
+        const int bar = (int)(v.out[i] * 40.0f);
+        for (int j = 0; j < bar; ++j) Serial.print('#');
+        Serial.println();
+    }
+
+    Serial.printf("\n[ミキサー] span_limit=%.3f  scale=%.3f  sat=0b%c%c%c%c (M4..M1)\n",
+                  v.mix.span_limit, v.mix.scale,
+                  (v.mix.sat & 8) ? '1' : '0', (v.mix.sat & 4) ? '1' : '0',
+                  (v.mix.sat & 2) ? '1' : '0', (v.mix.sat & 1) ? '1' : '0');
+
+    // --- オプティカルフロー (観測値とキャリブ積算) ---
+    //  ① 符号/軸: 機体を「ゆっくり大きく」平行移動させて acc_px を見る
+    //     ・前へ動かす → x が一方向に伸びる (逆なら FLOW_SIGN_X=-1)
+    //     ・右へ動かす → y                  (逆なら FLOW_SIGN_Y=-1)
+    //     ・前後で y / 左右で x が伸びる     → FLOW_SWAP_XY=true
+    //  ③ スケール ([z]でゼロ → 高さ h で距離 D をスライド → acc_px を読む):
+    //        FLOW_PX_PER_RAD = (acc_px ÷ D) × h     ← QuadConfig.h へ
+    //  ② de-rotation: 位置固定で向きだけ傾ける。derot が ~0 なら OK。
+    //     raw と逆向きに振れる → FLOW_DEROT_SIGN_* を反転。
+    if (USE_FLOW) {
+        const FlowObs& fo = v.flowobs;
+        Serial.printf("\n[フロー] %s  h=%.2fm  窓raw(x,y)=%+6.1f %+6.1f  "
+                      "derot(x,y)=%+6.1f %+6.1f  SQUAL=%u\n",
+                      fo.ok ? "OK  " : "FAIL", v.flow.height(),
+                      fo.raw_x, fo.raw_y, fo.dx, fo.dy, v.flow.squal());
+        Serial.printf("         v=%+6.2f %+6.2f m/s (LPF %+6.2f %+6.2f)   [z]ゼロ\n",
+                      fo.vx, fo.vy, fo.vx_f, fo.vy_f);
+        Serial.printf("         積算 raw=(%+9.0f,%+9.0f)  derot=(%+9.0f,%+9.0f)  "
+                      "m=(%+7.3f,%+7.3f)\n",
+                      fo.acc_raw_x, fo.acc_raw_y, fo.acc_px_x, fo.acc_px_y,
+                      fo.acc_m_x, fo.acc_m_y);
+    }
+
+    Serial.println("\n[p]ゲイン [k]IMUキャリブ(EEPROM保存) [x]キャリブ消去 [r]PIDリセット "
+                   "[l]ログ(USB直結時) [n]RAMログ手動トリガ [v]RAMログdump [y]RAMログ状態 "
+                   "[w]停止調査ログdump "
+                   "[z]フロー積算ゼロ "
+                   "[h]フロー高度(手動) [g]高度ホールド切替 [i]I2Cスキャン [m]ドライラン切替 "
+                   "[s]SD状態/単体テスト [d]起動時デバイスチェック再表示");
+}
+
+} // namespace S5

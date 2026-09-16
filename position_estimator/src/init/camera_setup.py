@@ -47,7 +47,7 @@ def init_cameras():
         cam2_ok_rpi : bool - RPiに疎通できたか
         cam2        : _DummyCam2 スタブ（本接続はキャリブ後に差し替え）
     """
-    print("\n[INIT 1/4]  カメラ起動中...")
+    print("\n[INIT 1/3]  カメラ起動中...")
     cam1 = CameraTracker(CAMERA_1_URL, width=CAMERA_W, height=CAMERA_H, label="Camera1")
 
     ret, test_frame = cam1.cap.read()
