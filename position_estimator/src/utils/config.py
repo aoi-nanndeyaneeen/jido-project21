@@ -23,7 +23,7 @@ PROJECT_DIR = SRC_DIR.parent.parent
 # ローカルのUSBカメラIDを直接指定することも可能です（例: 0, 1）。
 CAMERA_1_URL = 1                    # ラップトップUSBカメラ
 # Camera2の接続先。通常はRPI、LaptopへUSB直結する一時運用ではUSBにする。
-CAMERA2_SOURCE = "USB"             # "USB" または "RPI"
+CAMERA2_SOURCE = "RPI"             # "USB" または "RPI"
 CAMERA_2_URL = 2                    # USB時のCamera2デバイス番号
 RPI_HOST     = "192.168.11.13"      # ラズパイIP
 RPI_PORT     = 5555  # カメラ2 (ラズパイ接続)
@@ -91,11 +91,11 @@ SERIAL_BAUD    = 115200
 #   y = 奥行方向 (-FIELD_D/2 〜 +FIELD_D/2)
 #   z = 高さ（上が正）
 # カメラ2台は手前側 (y = -FIELD_D/2 の辺) の2隅に設置する。
-FIELD_PROFILE = "middle"           # "small" / "middle" / "large"
+FIELD_PROFILE = "large"            # "small" / "middle" / "large"
 FIELD_PROFILES = {
     "small":  (1.4, 1.4),           # 一時運用: 1.4m x 1.4m
     "middle": (1.8, 2.6),           # 横1.8m x 奥行2.6m
-    "large":  (26.0, 42.0),         # 通常運用: 26m x 42m
+    "large":  (6.0, 9.0),           # 通常運用: 横6m x 縦9m (2026-09-16 実測フィールドに変更)
 }
 FIELD_W, FIELD_D = FIELD_PROFILES[FIELD_PROFILE]
 
@@ -109,7 +109,10 @@ _HD = FIELD_D / 2.0   # 21.0
 #    CALIB_PRESET を書き換えるだけでよい。
 #
 # クリック順序は全プリセット共通:
-#     1) 手前左  2) 手前右  3) 奥右  4) 奥左  5) 4番の点の真上（高さ CALIB_POLE_H）
+#     1) 手前左  2) 手前右  3) 奥右  4) 奥左  5) 4番(奥左)の点の真上（高さ CALIB_POLE_H）
+#   ★ 2026-09-16: 一時的に「手前右→手前左」始まりにしていたが、元の
+#     「手前左→手前右」始まりに戻した。順序を変えたら FIELD_POINT_COORDS /
+#     CALIB_POINT_LABELS / _make_preset / calibration_flow.py の案内文を全部そろえること。
 #
 # 【5点目について】
 #   4点が床の同一平面上にあるため、カメラの姿勢とスケールを決めているのは
@@ -126,10 +129,10 @@ CALIB_POLE_AT_NEAR = False   # True: 手前左(1番)の真上 / False: 奥左(4�
 
 def _make_preset(half_w: float, half_d: float, pole_h: float, pole_near: bool):
     """4隅 + 高さ点 の5点を生成する。"""
-    p1 = [-half_w, -half_d, 0.0]   # 手前左
-    p2 = [ half_w, -half_d, 0.0]   # 手前右
-    p3 = [ half_w,  half_d, 0.0]   # 奥右
-    p4 = [-half_w,  half_d, 0.0]   # 奥左
+    p1 = [-half_w, -half_d, 0.0]   # 1: 手前左
+    p2 = [ half_w, -half_d, 0.0]   # 2: 手前右
+    p3 = [ half_w,  half_d, 0.0]   # 3: 奥右
+    p4 = [-half_w,  half_d, 0.0]   # 4: 奥左
     base = p1 if pole_near else p4
     p5 = [base[0], base[1], pole_h]
     return np.array([p1, p2, p3, p4, p5], dtype=np.float32)
@@ -151,6 +154,7 @@ CALIB_PRESETS = {
     "volleyball": _make_preset( 9.0 / 2, 18.0 / 2, CALIB_POLE_H, CALIB_POLE_AT_NEAR),
 
     # --- 当日その場で実測した任意の5点を直接書く場合はここを編集 ---
+    # 順序: 手前左, 手前右, 奥右, 奥左, 高さ点
     "custom": np.array([
         [-13.0, -21.0, 0.0],
         [ 13.0, -21.0, 0.0],
@@ -161,7 +165,10 @@ CALIB_PRESETS = {
 }
 
 # ★ 5点の座標は、使用するプロファイルのリストを直接編集する。
-#    順序: 手前左, 手前右, 奥右, 奥左, 高さ点
+#    順序: 手前左, 手前右, 奥右, 奥左, 高さ点 (奥左の真上)
+#    ★ 4隅の x/y は FIELD_PROFILES の寸法と一致していないと起動時に止まる
+#      (下のチェック)。寸法を変えたらここも直す。5点目の z は当日立てる
+#      棒の実測高さ。
 FIELD_POINT_COORDS = {
     "small": [
         [-0.7, -0.7, 0.0],
@@ -177,12 +184,13 @@ FIELD_POINT_COORDS = {
         [-0.9,  1.3, 0.0],
         [-0.9,  1.3, 0.82],
     ],
+    # 2026-09-16: 6m x 9m。高さ点は奥左の 2.0m 上。
     "large": [
-        [-13.0, -21.0, 0.0],
-        [ 13.0, -21.0, 0.0],
-        [ 13.0,  21.0, 0.0],
-        [-13.0,  21.0, 0.0],
-        [-13.0,  21.0, 2.0],
+        [-3.0, -4.5, 0.0],
+        [ 3.0, -4.5, 0.0],
+        [ 3.0,  4.5, 0.0],
+        [-3.0,  4.5, 0.0],
+        [-3.0,  4.5, 2.0],
     ],
 }
 
@@ -190,13 +198,23 @@ CALIB_PRESET = f"{FIELD_PROFILE}_coordinates"
 
 FIELD_POINTS = np.array(FIELD_POINT_COORDS[FIELD_PROFILE], dtype=np.float32)
 
+# 4隅の座標が FIELD_PROFILES の寸法と食い違っていたら起動時に止める。
+# (寸法だけ直して基準点を直し忘れる事故の再発防止。上の 2026-09-16 参照)
+for _i, (_px, _py) in enumerate(((-_HW, -_HD), (_HW, -_HD), (_HW, _HD), (-_HW, _HD))):
+    if abs(FIELD_POINTS[_i][0] - _px) > 1e-3 or abs(FIELD_POINTS[_i][1] - _py) > 1e-3:
+        raise ValueError(
+            f"[config] FIELD_POINT_COORDS['{FIELD_PROFILE}'] の {_i + 1} 点目 "
+            f"({FIELD_POINTS[_i][0]:+.2f}, {FIELD_POINTS[_i][1]:+.2f}) が "
+            f"FIELD_PROFILES の寸法 ({_px:+.2f}, {_py:+.2f}) と一致しません。"
+            "フィールド寸法を変えたら基準5点も直してください。")
+
 # クリック時に画面へ表示するラベル（順序ミスを防ぐ）
 CALIB_POINT_LABELS = [
     "1: 手前左 (near-left)",
     "2: 手前右 (near-right)",
     "3: 奥右   (far-right)",
     "4: 奥左   (far-left)",
-    f"5: {'1番' if CALIB_POLE_AT_NEAR else '4番'}の真上 {CALIB_POLE_H:.1f}m",
+    f"5: 4番(奥左)の真上 {float(FIELD_POINTS[4][2]):.1f}m",
 ]
 
 # ==========================================
@@ -283,7 +301,10 @@ GATE_Y = (-_HD - GATE_MARGIN_M, _HD + GATE_MARGIN_M)
 #   (高さ数cm) が「フィールド外」で必ず棄却され、位置が一切出ない
 #   (2026-09-15、両カメラで点滅確認済みなのに 3263 フレーム全棄却)。
 #   床面の鏡像反射は z≈-高度 に三角測量されるので、-0.10m でも浮上後は落ちる。
-GATE_Z = (-0.10, 10.0) if FIELD_PROFILE != "large" else (0.5, 10.0)
+# ★ 2026-09-16: この修正は long/large 判定を "!= large" に限定していたため、
+#   FIELD_PROFILE="large" (このプロファイルを6m×9mの実測フィールドに転用)
+#   では旧 0.5m 下限のままで再発した。プロファイルに関係なく同じ下限にする。
+GATE_Z = (-0.10, 10.0)
 
 # ==========================================
 # ジオフェンス (ミッションが「逸脱した」と判断する境界)
@@ -544,6 +565,28 @@ MISSION_WAYPOINTS = MISSION_SQUARE_CORNERS * MISSION_LAPS + [MISSION_SQUARE_CORN
 # MISSION_WAYPOINTS = [(0.0, 1.0, MISSION_TAKEOFF_ALT_M)]
 # Phase 4 (WP なし。離陸 -> 中心 -> 帰投 -> 着陸だけ。2026-09-15 に成功率確認済み):
 # MISSION_WAYPOINTS = []
+
+# ---- ウェイポイント消化後の定型機動 (2026-09-16) --------------------------
+#  最後の WP に到達したら、その場で機体単独の定型機動を1回やってから
+#  離陸地点へ帰投 (RTL) → 自動着陸する。None なら今までどおり機動なし。
+#    "circle"  : 水平旋回 1周
+#    "figure8" : 8の字 (1周 + 逆回り1周)
+#    "climb"   : 上昇旋回 (1周の間に MISSION_MANEUVER_ALT_M まで上昇)
+#  実装: core/maneuver.py (Maneuver / ManeuverRunner) と core/mission.py の
+#  Phase.MANEUVER。機動中は PC は REQ_IDLE でリンクだけ生かし、機体の
+#  maneuver フラグが落ちたら (完了) ウェイポイント飛行に戻って home へ帰る。
+#  ★ 半径 r = 速度 / ω。ルールブックは「概ね 1.5m 以上」。0.4m/s・15deg/s で
+#    r≈1.53m (実測は 2〜3割大きめに出る)。円の中心は開始地点から旋回方向へ
+#    r 横なので、最後の WP からフィールド境界まで 2r + 0.5m の余裕を確認すること。
+#    6m x 9m なら中心 (0,0) から右回りで直径 3m が収まる。
+#  ★ "climb" は低高度で laps 周 → 回りながら上昇 (1周) → 高高度で laps 周
+#    (ルール: 3m以下で2周 → ポール以上へ → ポール以上で2周)。到達高度は
+#    MISSION_FENCE_Z (2.5m) 未満にすること (超えるとジオフェンスで着陸する)。
+MISSION_MANEUVER          = "circle"  # None / "circle" / "figure8" / "climb"
+MISSION_MANEUVER_SPEED    = 0.4       # [m/s]
+MISSION_MANEUVER_YAW_RATE = 15.0      # [deg/s] 符号 = 最初の旋回方向 (右 +)
+MISSION_MANEUVER_LAPS     = 2         # circle: 周回数 (連続2周=1000点) / climb: 低・高それぞれ
+MISSION_MANEUVER_ALT_M    = 2.2       # "climb" の到達高度 [m]。他は WP の高度を保持
 
 # 保持試験モード (一時的)。True だと 1点目 (CENTER) に到達したら帰投・着陸せず、
 # カメラ位置で速度指令を出し続けてその場に留まる。到達半径 (mission.py

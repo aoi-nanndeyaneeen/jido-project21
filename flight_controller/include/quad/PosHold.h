@@ -91,6 +91,27 @@ public:
         _pos_e = e_m;
     }
 
+    // ------------------------------------------------------------
+    //  フレームの原点合わせ (地上局から1回。フェンスの基準)
+    // ------------------------------------------------------------
+    //  correctPosition() と違い _hold_n/_hold_e も同じ量だけ動かす。
+    //  「今いる場所の座標名を付け替える」だけで、hold-pos の誤差は
+    //  変わらないので機体は動かない。これ以降 _pos_n/_pos_e は地上局が
+    //  決めた座標系 (mission.py ならフィールド座標) になり、FENCE_* の
+    //  矩形がその座標系で効き始める。
+    //  ★ reset()/reset_outputs() で無効に戻る (離陸前・モード切替)。
+    //    地上局は telemetry の F_FRAME_OK を見て、落ちていたら送り直す。
+    void shiftFrame(float n_m, float e_m) {
+        const float dn = n_m - _pos_n;
+        const float de = e_m - _pos_e;
+        _pos_n = n_m;       _pos_e = e_m;
+        _hold_n += dn;      _hold_e += de;
+        _frame_ok = true;
+    }
+    bool frameOk()   const { return _frame_ok; }
+    bool fenceOn()   const { return FENCE_ENABLE && _frame_ok; }
+    bool fencePush() const { return _fence_push; }   // いま境界で押し返している
+
     // アーム/モード切替でクリアする (drone_s5 の resetControllers から)
     void reset() {
         _vx_ctl = _vy_ctl = 0.0f;
@@ -100,6 +121,8 @@ public:
         _lean_roll = _lean_pitch = 0.0f;
         _holding   = false;
         _bad_count = 0;
+        _frame_ok  = false;
+        _fence_push = false;
         _vx_pid.reset();
         _vy_pid.reset();
         clearVelCommand();
@@ -165,11 +188,28 @@ public:
             tar_x = FLOW_STICK_SIGN_X * sx * FLOW_STICK_VEL;
             tar_y = FLOW_STICK_SIGN_Y * sy * FLOW_STICK_VEL;
         }
+        // --- フェンス (地面固定フレームの矩形。shiftFrame() 後だけ有効) ---
+        //   境界の外へ向かう速度成分を 0 にし、はみ出た量に比例して内側へ
+        //   押し戻す。スティック / 地上局指令 / 位置ループのどれが出した
+        //   目標速度でも同じ場所で必ず通るので、手動・GUIDED・自動旋回の
+        //   区別なく効く。リンクが切れていても機体単独で効く。
+        const bool fence = fenceOn();
+        _fence_push = false;
+
         if (stick_active) {
+            if (fence) {
+                float vn =  tar_x * c - tar_y * s;
+                float ve =  tar_x * s + tar_y * c;
+                vn = fenceAxis(vn, _pos_n, FENCE_N_LIM);
+                ve = fenceAxis(ve, _pos_e, FENCE_E_LIM);
+                tar_x =  vn * c + ve * s;
+                tar_y = -vn * s + ve * c;
+            }
             _vx_tar = tar_x;
             _vy_tar = tar_y;
             _hold_n = _pos_n;          // 保持基準を今の地面位置へ張り付け
             _hold_e = _pos_e;
+            if (fence) clampHoldToFence();
             _holding = false;
         } else {
             // 保持基準を「今の推定位置」へゆっくり緩和する (リーク)。
@@ -180,11 +220,18 @@ public:
                 _hold_n += (_pos_n - _hold_n) * k;
                 _hold_e += (_pos_e - _hold_e) * k;
             }
+            // 保持基準そのものは常にフェンスの内側に置く (外で止まったまま
+            // リークで基準が外へ寄っていくのを防ぐ)。
+            if (fence) clampHoldToFence();
             // 位置ループは地面固定フレームで解き、出力を機体座標へ戻す
-            const float vn_tar = constrain(_pos_kp * (_hold_n - _pos_n),
-                                           -FLOW_POS_VEL_LIM, FLOW_POS_VEL_LIM);
-            const float ve_tar = constrain(_pos_kp * (_hold_e - _pos_e),
-                                           -FLOW_POS_VEL_LIM, FLOW_POS_VEL_LIM);
+            float vn_tar = constrain(_pos_kp * (_hold_n - _pos_n),
+                                     -FLOW_POS_VEL_LIM, FLOW_POS_VEL_LIM);
+            float ve_tar = constrain(_pos_kp * (_hold_e - _pos_e),
+                                     -FLOW_POS_VEL_LIM, FLOW_POS_VEL_LIM);
+            if (fence) {
+                vn_tar = fenceAxis(vn_tar, _pos_n, FENCE_N_LIM);
+                ve_tar = fenceAxis(ve_tar, _pos_e, FENCE_E_LIM);
+            }
             _vx_tar =  vn_tar * c + ve_tar * s;
             _vy_tar = -vn_tar * s + ve_tar * c;
             _holding = true;
@@ -237,6 +284,28 @@ private:
         _vx_pid.reset();
         _vy_pid.reset();
         _bad_count = 0;
+        _frame_ok = false;     // 原点が消えたのでフェンスも無効 (地上局が送り直す)
+        _fence_push = false;
+    }
+
+    // 1軸ぶんのフェンス。p が ±lim の外なら外向き成分を殺し、はみ出し量に
+    // 比例した内向き速度 (FENCE_VEL_MAX でクランプ) を最低限確保する。
+    float fenceAxis(float v, float p, float lim) {
+        if (p > lim) {
+            const float back = -fminf(FENCE_KP * (p - lim), FENCE_VEL_MAX);
+            _fence_push = true;
+            return fminf(v, back);
+        }
+        if (p < -lim) {
+            const float back = fminf(FENCE_KP * (-lim - p), FENCE_VEL_MAX);
+            _fence_push = true;
+            return fmaxf(v, back);
+        }
+        return v;
+    }
+    void clampHoldToFence() {
+        _hold_n = constrain(_hold_n, -FENCE_N_LIM, FENCE_N_LIM);
+        _hold_e = constrain(_hold_e, -FENCE_E_LIM, FENCE_E_LIM);
     }
 
     // 地上局からの目標速度指令 (setVelCommand)。_ext_on=false なら従来動作。
@@ -253,6 +322,8 @@ private:
     float _lean_roll = 0.0f, _lean_pitch = 0.0f;   // 目標リーン角 [deg]
     bool  _holding   = false;
     int   _bad_count = 0;
+    bool  _frame_ok   = false;   // shiftFrame() 済み (座標系が地上局のもの)
+    bool  _fence_push = false;   // 直近の update() で境界に当たった
 };
 
 } // namespace Quad

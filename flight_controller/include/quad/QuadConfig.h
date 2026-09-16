@@ -997,4 +997,38 @@ constexpr float GUIDED_LAND_FLOOR_M  = 0.05f;
 //  それ以上ぶら下げずに出力を切る (引っかかり / 測距の化け対策)。
 constexpr uint32_t GUIDED_LAND_TIMEOUT_MS = 20000;
 
+// ---- 自動水平旋回 (REQ_CIRCLE) ---------------------------------
+//  ★ ここだけは GUIDED と違い、開始した後は地上局からの新しいコマンドを
+//    待たずに機体単独 (ジャイロ+フロー) で1周分進み続ける
+//    (drone_s5.cpp の updateGuided() § GP_CIRCLE 参照)。そのぶん、
+//    ここで安全側にクランプしておく値が唯一の歯止めになる。
+//
+//  地上局が送れるヨーレートの上限 [deg/s]。半径は概算
+//    r[m] = v[m/s] / (rate[deg/s] * pi/180)
+//  例: v=0.3m/s, rate=30deg/s なら r≈0.57m, 1周≈12秒。
+//  ★ 小さく始めること。速すぎるレートは1周検出前に大きくフラつく。
+constexpr float MANEUVER_MAX_YAW_RATE_DPS = 60.0f;
+
+// ---- 機体側フェンス (PosHold.h) ----------------------------------
+//  ★ 2026-09-16: console.py の手動速度指令でフィールド (1.8m x 2.6m) の外へ
+//    出た (フロー積分で E=+2.9m)。地上局に頼らず機体だけで止める矩形。
+//
+//  座標系は PosHold の地面固定フレーム (N=アーム時の機首方向, E=右)。
+//  原点は地上局が CF_POS_SHIFT で1回教える (mission.py ならカメラの
+//  フィールド座標 → 原点=フィールド中心 / console.py なら 'o' キー =
+//  「今いる場所を中心」)。教えてもらうまでフェンスは効かない
+//  (離陸点基準では端で離陸したときに意味が無いため)。
+//
+//  ★ フロー積分は数十秒で 0.3〜0.6m 流れる (2026-09-16 周回試験の
+//    Diff_Norm 平均0.37/最大0.64m)。境界は実寸より内側に取ること。
+//    2026-09-16: フィールド 6m x 9m (position_estimator config "large")。
+//    半幅 3.0/4.5 に対して余裕 0.3m で 2.7/4.2。半径1.5mの旋回 (直径3m+流れ)
+//    が中心から収まる。1.8m x 2.6m の部屋に戻すなら 0.6/1.0。
+constexpr bool  FENCE_ENABLE  = true;
+constexpr float FENCE_N_LIM   = 4.2f;   // 前後 (フィールド奥行方向) ±[m]
+constexpr float FENCE_E_LIM   = 2.7f;   // 左右 (フィールド幅方向)   ±[m]
+//  はみ出し量 [m] → 押し戻し速度 [m/s] の比例ゲインと、その上限。
+constexpr float FENCE_KP      = 1.0f;
+constexpr float FENCE_VEL_MAX = 0.4f;
+
 } // namespace Quad

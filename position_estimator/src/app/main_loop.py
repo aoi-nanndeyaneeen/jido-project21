@@ -68,6 +68,8 @@ def run_main_loop(cam1, cam2,
     print("  [M]     ミッション待機の開始/やり直し "
           "(自動開始が有効なら押す必要はありません)")
     print("  [X]     ミッション中断 (その場から自動着陸)")
+    print("  [C]/[8]/[U]  巡航中の今の場所から 水平旋回 / 8の字 / 上昇旋回 "
+          "(終了後は離陸地点へ帰投。半径・周回数は config MISSION_MANEUVER_*)")
     print("  [B]     背景リセット (両カメラ)")
     print("  [Q]     終了")
     print()
@@ -108,6 +110,10 @@ def run_main_loop(cam1, cam2,
                 elif key == b'x':
                     print("[KEY] X → ミッション中断要求")
                     shared["mission_request"] = "abort"
+                elif key in (b'c', b'8', b'u'):
+                    kind = {b'c': "circle", b'8': "figure8", b'u': "climb"}[key]
+                    print(f"[KEY] {key.decode().upper()} → 定型機動 {kind} 要求")
+                    shared["mission_request"] = "maneuver:" + kind
             time.sleep(0.05)
 
     threading.Thread(target=keyboard_thread, daemon=True).start()
@@ -293,6 +299,8 @@ def run_main_loop(cam1, cam2,
                         mission.start()
                     elif req == "abort":
                         mission.abort("キー操作")
+                    elif req.startswith("maneuver:"):
+                        mission.request_maneuver(req.split(":", 1)[1])
 
                 #  カメラが機体を捉えているか。
                 #  ★ in_dummy (仮想円軌道へのフォールバック中) は「捉えていない」。

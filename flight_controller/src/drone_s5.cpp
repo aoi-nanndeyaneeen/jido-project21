@@ -36,6 +36,11 @@
 //      飛ばさず直前のホバースロットルを保持する (落下防止)。
 //    ・調整は QuadConfig.h § 7-2 / § 7-4 と シリアル 'p' メニュー
 //      ([i][j][o] = フロー水平, [s][t][u][v] = 高度)。
+//    ★ 2026-09-16: GUIDED に定型機動 REQ_CIRCLE / REQ_FIGURE8 / REQ_CLIMB_TURN
+//      を追加。地上局は「ウェイポイントまで飛ばして、その場で開始させる」だけの
+//      1発トリガーで、以降はリンクの新鮮さに関係なく機体単独 (ジャイロ+
+//      オプティカルフロー) で完結する (GuidedPhase::GP_MANEUVER、中身は
+//      quad/Maneuver.h、S5Cmd.h 冒頭の設計注記も参照)。
 //    ★ 初回は広い床で、指をモードスイッチに。符号ミス = 即壁/天井行き。
 //    ★ 地上確認は 'm' のドライラン (ESCへ0のみ / g_out は計算・表示) を使う。
 //      フロー制御は「アーム && POSHOLD && スロットル > FLOW_ENABLE_THR」でしか
@@ -107,6 +112,7 @@
 #include "quad/SdLog.h"          // 飛行まるごとSDへストリーミング (HW-125, CS=9)
 #include "quad/LogLink.h"        // 同じログを UART で RP2040 ロガーへ (SPI0 を空ける)
 #include "quad/StatusLed.h"      // モード表示用 RGB LED (pin 5/6/7)
+#include "quad/Maneuver.h"       // 定型機動 (水平旋回 / 8の字 / 上昇旋回) の進行管理
 #include "quad/FlightLog.h"      // ログ1行の定義/整形 + USBストリーム + RAMリング
 
 namespace Q = Quad;
@@ -691,6 +697,11 @@ enum GuidedPhase : uint8_t {
     GP_CRUISE,      // 地上局の速度指令に従って移動中
     GP_LAND,        // 自動着陸中。水平 0
     GP_LANDED,      // 接地を検知して出力を切った (ディスアームするまで保持)
+    // ★ 2026-09-16: 定型機動 (REQ_CIRCLE / FIGURE8 / CLIMB_TURN)。GP_CRUISE と
+    //   違い、開始した瞬間の目標(前進速度・ヨーレート・高度)を持ったまま、
+    //   以降は地上局からの新しいコマンドを待たずに機体単独で進む。
+    //   中身 (何周・どちら回り・高度の動かし方) は quad/Maneuver.h。
+    GP_MANEUVER,
 };
 GuidedPhase g_gp = GP_OFF;
 
@@ -707,6 +718,12 @@ float g_guided_vx      = 0.0f;   // 機体座標の目標速度 前+ [m/s]
 float g_guided_vy      = 0.0f;   // 同 右+ [m/s]
 float g_guided_alt_m   = 0.0f;   // 目標対地高度 [m] (0 = 指令なし)
 float g_guided_slew    = 0.0f;   // 目標高度を動かしてよい速さ [m/s]
+
+// GP_MANEUVER の中身。詳細は quad/Maneuver.h と updateGuided() 内のコメント。
+Q::Maneuver maneuver;
+// 直前に完了/中断した機動の REQ。地上局が同じ REQ を送り続けていても
+// 再開しないためのラッチ (別の REQ が届いたら解ける)。0xFF = なし。
+uint8_t g_maneuver_done_req = 0xFF;
 
 // 着陸の判定用
 uint32_t g_land_start_ms = 0;    // 降下を始めた時刻 (タイムアウト用)
@@ -1145,6 +1162,8 @@ inline void fillHeader(S5T::Header& h, uint8_t type) {
     if (Q::GUIDED_ENABLE && s5rx.fresh(Q::GUIDED_STALE_HOLD_MS))
                               f |= S5T::F_CMD_FRESH;
     if (g_gp == GP_LANDED)    f |= S5T::F_LANDED;
+    if (g_gp == GP_MANEUVER)  f |= S5T::F_MANEUVER;
+    if (poshold.frameOk())    f |= S5T::F_FRAME_OK;
     h.flags = f;
 
     // 28バイトに uint32 の millis は載らないので 10ms 単位。
@@ -1695,13 +1714,24 @@ static void guidedDisengage(const char* why) {
     g_guided_vy     = 0.0f;
     g_guided_alt_m  = 0.0f;
     g_guided_slew   = 0.0f;
+    maneuver.abort();
+    g_maneuver_done_req = 0xFF;
     g_touch_since_ms = 0;
 }
 
 static void applyGuidedCommand(const S5C::CmdFrame& c, uint32_t now) {
     if (c.flags & S5C::CF_POS_CORR) {
-        poshold.correctPosition((float)c.corr_n_mm / S5C::SC_MM,
-                                (float)c.corr_e_mm / S5C::SC_MM);
+        const float n = (float)c.corr_n_mm / S5C::SC_MM;
+        const float e = (float)c.corr_e_mm / S5C::SC_MM;
+        if (c.flags & S5C::CF_POS_SHIFT) {
+            // 原点合わせ (hold も一緒に動くので機体は動かない)。以降フェンス有効。
+            if (!poshold.frameOk())
+                Serial.printf("\n>>> フレーム原点合わせ: pos=(%.2f, %.2f) -> フェンス有効 "
+                              "(N±%.1f E±%.1f)\n", n, e, Q::FENCE_N_LIM, Q::FENCE_E_LIM);
+            poshold.shiftFrame(n, e);
+        } else {
+            poshold.correctPosition(n, e);
+        }
     }
 
     // ---- ヨー補正: カメラが実測した絶対ヨーで g_yaw_est を再基準する ----
@@ -1754,11 +1784,53 @@ static void applyGuidedCommand(const S5C::CmdFrame& c, uint32_t now) {
             }
             break;
 
+        // ★ 定型機動 (水平旋回 / 8の字 / 上昇旋回)。開始は1回だけ:
+        //   ・すでに実行中なら進行はリセットしない (無線の再送に耐える)
+        //   ・直前に完了/中断したのと同じ REQ が来続けていても再開しない
+        //     (g_maneuver_done_req)。別の REQ が1回届けば解除。
+        case S5C::REQ_CIRCLE:
+        case S5C::REQ_FIGURE8:
+        case S5C::REQ_CLIMB_TURN: {
+            if (c.req == g_maneuver_done_req) break;
+            if (g_gp != GP_MANEUVER) {
+                const Q::Maneuver::Kind kind =
+                      (c.req == S5C::REQ_CIRCLE)  ? Q::Maneuver::CIRCLE
+                    : (c.req == S5C::REQ_FIGURE8) ? Q::Maneuver::FIGURE8
+                                                  : Q::Maneuver::CLIMB_TURN;
+                const float fwd  = constrain((float)c.vx_mmps / S5C::SC_MMPS,
+                                             -Q::GUIDED_MAX_VEL, Q::GUIDED_MAX_VEL);
+                const float rate = constrain((float)c.yaw_rate_cdps / S5C::SC_CDPS,
+                                             -Q::MANEUVER_MAX_YAW_RATE_DPS,
+                                             +Q::MANEUVER_MAX_YAW_RATE_DPS);
+                const float alt_now = (g_range_valid && g_range_h_m > 0.05f)
+                                    ? g_range_h_m : g_guided_alt_m;
+                maneuver.begin(kind, fwd, rate, alt_now, cmd_alt, (int)c.laps, now);
+                g_gp = GP_MANEUVER;
+                Serial.printf("\n>>> 機動開始 %s: 前進 %.2f m/s, ヨーレート %+.1f deg/s "
+                              "(半径 %.2f m), %d 脚 (%.0f deg), 高度 %.2f -> %.2f m "
+                              "(機体センサのみで完結)\n",
+                              maneuver.name(), fwd, rate,
+                              (fabsf(rate) > 0.1f) ? fwd / (fabsf(rate) * DEG_TO_RAD) : 0.0f,
+                              maneuver.legs(), maneuver.totalDeg(), alt_now, cmd_alt);
+            }
+            g_guided_vx = maneuver.fwd();
+            g_guided_vy = 0.0f;   // 機動中は前進のみ。横方向は使わない
+            g_guided_alt_m = maneuver.altTarget();
+            g_guided_slew  = Q::GUIDED_CRUISE_SLEW_MPS;
+            break;
+        }
+
         case S5C::REQ_HOLD:
         case S5C::REQ_ABORT:
         case S5C::REQ_IDLE:
         default:
-            if (g_gp == GP_CRUISE || g_gp == GP_TAKEOFF) g_gp = GP_HOLD;
+            if (g_gp == GP_MANEUVER) {
+                Serial.printf("\n>>> 機動中断 (%s) by %s\n", maneuver.name(), S5C::reqName(c.req));
+            }
+            if (g_gp == GP_CRUISE || g_gp == GP_TAKEOFF || g_gp == GP_MANEUVER)
+                g_gp = GP_HOLD;
+            maneuver.abort();
+            g_maneuver_done_req = 0xFF;   // 別の REQ が来た = 次の機動を受け付けてよい
             g_guided_vx = g_guided_vy = 0.0f;
             g_guided_slew = Q::GUIDED_CRUISE_SLEW_MPS;
             break;
@@ -1800,6 +1872,14 @@ static void updateGuided() {
         guidedDisengage("スティック操作を検出");
         return;
     }
+    // ★ 通常の GUIDED はヨースティックを生かしたまま (機首だけ手動で振れる)。
+    //   だが自動水平旋回中はそのヨー経路をこちらが握っているので、パイロットが
+    //   ヨースティックに触れたら「回しすぎ・変な方向」への意思表示とみなして
+    //   即座に降りる。ロール/ピッチと同じ「スイッチを探さずに戻せる」安全網。
+    if (g_gp == GP_MANEUVER && fabsf(sbus.des[Ch::YAW]) > Gain::YAW_STICK_DEAD) {
+        guidedDisengage("機動中にヨースティック操作を検出");
+        return;
+    }
 
     // 着陸完了は、ディスアームするまで保持する (上の !isArmed で解ける)
     if (g_gp == GP_LANDED) { g_guided_vx = g_guided_vy = 0.0f; return; }
@@ -1827,8 +1907,33 @@ static void updateGuided() {
         Serial.printf("\n>>> GUIDED 開始 (目標高度 %.2f m から保持)\n", g_guided_alt_m);
     }
 
-    // --- 2) リンク断のフェイルセーフ (要求より先に見る) ---------------
-    if (!fresh_land) {
+    if (g_gp == GP_MANEUVER) {
+        // --- 2') 定型機動中はリンクの新鮮さでフォールバックしない ---
+        //   ★ ここが「ウェイポイントまでは地上局、そこから先は機体単独」の要。
+        //     開始した瞬間の目標を Maneuver が持ったまま、新しいコマンドを
+        //     待たずに進み続ける。地上局が明示的に HOLD/ABORT/LAND を送って
+        //     くれば、新鮮な間だけそれを即座に反映する (明示指令は常に効く)。
+        //     進行は Maneuver が「指令ヨーレート × 経過時間」で機体の時計だけで
+        //     数える (無線が完全に止まっても進み続けられる)。
+        maneuver.update(now);
+        g_guided_vx    = maneuver.fwd();
+        g_guided_vy    = 0.0f;
+        g_guided_alt_m = maneuver.altTarget();   // CLIMB_TURN は進行に合わせて動く
+
+        if (maneuver.done()) {
+            // ★ 完了。同じ REQ が来続けても再開しないようラッチしてから HOLD へ。
+            g_maneuver_done_req = c.req;
+            Serial.printf("\n>>> 機動完了 %s (%.0f deg) -> ホールドへ復帰 (高度 %.2f m)\n",
+                          maneuver.name(), maneuver.totalDeg(), g_guided_alt_m);
+            maneuver.abort();
+            g_gp = GP_HOLD;
+            g_guided_vx = g_guided_vy = 0.0f;
+        } else if (fresh_hold && (c.req == S5C::REQ_HOLD || c.req == S5C::REQ_ABORT
+                                  || c.req == S5C::REQ_LAND)) {
+            applyGuidedCommand(c, now);
+        }
+    } else if (!fresh_land) {
+        // --- 2) リンク断のフェイルセーフ (要求より先に見る) ---------------
         if (g_gp != GP_LAND) {
             Serial.printf("\n!! 地上局リンク断 %lu ms -> 自動着陸\n", (unsigned long)age);
             g_gp            = GP_LAND;
@@ -2090,7 +2195,15 @@ static void updateControl(float dt_s) {
 
     const bool yaw_stick_active = (fabsf(yaw_axis.stick) > Gain::YAW_STICK_DEAD);
 
-    if (yaw_stick_active || !integrate) {
+    if (g_gp == GP_MANEUVER) {
+        // 定型機動中: ヘディングホールドではなく一定レート指令 (8の字は
+        // Maneuver が2周目で符号を反転する)。中断判定は updateGuided() 側。
+        // g_yaw_hold は今の向きに追従させておく (終わった瞬間、そのままの
+        // 機首でホールドへ引き継げるように)。
+        yaw_axis.rate_tar = maneuver.yawRate();
+        g_yaw_hold        = g_yaw_est;
+        g_yaw_holding     = false;
+    } else if (yaw_stick_active || !integrate) {
         // 操作中、または低スロットル(地上)。
         // 目標方位を現在値に追従させておくことで、スティックを離した
         // 瞬間から「今の向き」の保持が始まる。
@@ -2549,7 +2662,7 @@ static void printStatus(uint32_t dt_us) {
                               (float)c.alt_cm  / S5C::SC_CM,
                               (unsigned)c.flags);
             }
-            static const char* PH[] = { "OFF", "HOLD", "TAKEOFF", "CRUISE", "LAND", "LANDED" };
+            static const char* PH[] = { "OFF", "HOLD", "TAKEOFF", "CRUISE", "LAND", "LANDED", "MANEUV" };
             Serial.printf("GUIDED %s  phase=%-7s  目標 vx=%+.3f vy=%+.3f alt=%.2f m "
                           "(slew %.2f m/s)%s%s\n",
                           g_guided_engaged ? "ENGAGED" : "----   ",
@@ -2557,6 +2670,17 @@ static void printStatus(uint32_t dt_us) {
                           g_guided_alt_m, g_guided_slew,
                           (!g_guided_engaged && g_guided_why[0]) ? "  直前の解除理由: " : "",
                           (!g_guided_engaged && g_guided_why[0]) ? g_guided_why : "");
+            if (g_gp == GP_MANEUVER) {
+                Serial.printf("  機動 %s  進行 %5.1f / %.0f deg (脚 %d/%d)  ヨーレート %+.1f deg/s  "
+                              "高度目標 %.2f m\n",
+                              maneuver.name(), maneuver.doneDeg(), maneuver.totalDeg(),
+                              maneuver.leg() + 1, maneuver.legs(), maneuver.yawRate(),
+                              maneuver.altTarget());
+            }
+            Serial.printf("FENCE  %s  (N±%.1f E±%.1f m)%s\n",
+                          poshold.fenceOn() ? "有効" : (Q::FENCE_ENABLE ? "待機 (原点未設定: CF_POS_SHIFT 待ち)" : "無効"),
+                          Q::FENCE_N_LIM, Q::FENCE_E_LIM,
+                          poshold.fencePush() ? "  ★境界で押し返し中" : "");
         }
     }
 

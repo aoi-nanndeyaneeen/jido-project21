@@ -261,7 +261,9 @@ def camera_thread_func(cam1, cam2,
                 current_z = float(P_vec[2]) if P_vec is not None else 0.0
                 log.write(P_real, res_real,
                           len(cands1), len(cands2), uv1, uv2,
-                          pair_rejected, in_dummy_mode)
+                          pair_rejected, in_dummy_mode,
+                          reject=selector.last_reject if pair_rejected else None,
+                          blink1=blink1.best(), blink2=blink2.best())
 
                 frame_count += 1
                 if frame_count % 300 == 0:

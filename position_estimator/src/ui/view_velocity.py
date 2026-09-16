@@ -87,7 +87,10 @@ class ViewVelocity:
 
         field = np.array([self._top_point(point[0], point[1])
                           for point in self.field_points], dtype=np.int32)
-        cv2.polylines(image, [field], True, (120, 120, 120), 1, cv2.LINE_AA)
+        # ★ field_points の並び順（クリック順）はそのまま四角形の外周順とは
+        #   限らない。凸包で外周順に並べ替えてから描画する。
+        hull = cv2.convexHull(field)
+        cv2.polylines(image, [hull], True, (120, 120, 120), 1, cv2.LINE_AA)
         origin = self._top_point(0.0, 0.0)
         cv2.line(image, (origin[0], top), (origin[0], bottom), (205, 205, 205), 1)
         cv2.line(image, (left, origin[1]), (right, origin[1]), (205, 205, 205), 1)

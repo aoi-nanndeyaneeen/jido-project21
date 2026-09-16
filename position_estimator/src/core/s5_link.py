@@ -60,9 +60,17 @@ REQ_TAKEOFF = 2
 REQ_GUIDED  = 3
 REQ_LAND    = 4
 REQ_ABORT   = 5
+# ★ 2026-09-16: 自動水平旋回。GUIDED と違い、機体に1回届けば地上局からの
+#   継続送信なしで機体単独 (ジャイロ+オプティカルフロー) で1周を完結する
+#   (S5Cmd.h / drone_s5.cpp の GP_CIRCLE 参照)。
+REQ_CIRCLE  = 6
+REQ_FIGURE8 = 7        # 8の字 (CIRCLE 2周、2周目は逆回り)
+REQ_CLIMB_TURN = 8     # 上昇旋回 (1周の間に alt_m まで上昇)
+#   送り方は core/maneuver.py の ManeuverRunner を使うこと (バースト → IDLE)。
 
 REQ_NAME = {REQ_IDLE: "IDLE", REQ_HOLD: "HOLD", REQ_TAKEOFF: "TAKEOFF",
-            REQ_GUIDED: "GUIDED", REQ_LAND: "LAND", REQ_ABORT: "ABORT"}
+            REQ_GUIDED: "GUIDED", REQ_LAND: "LAND", REQ_ABORT: "ABORT",
+            REQ_CIRCLE: "CIRCLE", REQ_FIGURE8: "FIGURE8", REQ_CLIMB_TURN: "CLIMB"}
 
 # S5Cmd.h の CmdFlag
 CF_ARMED_OK  = 1 << 0
@@ -70,6 +78,10 @@ CF_POS_VALID = 1 << 1
 CF_YAW_VALID = 1 << 2
 CF_ALT_ABS   = 1 << 3
 CF_POS_CORR  = 1 << 4   # corr_n_m/corr_e_m を機体の pos_n/pos_e へ適用する
+# CF_POS_CORR と一緒に立てると「原点合わせ」(hold も一緒に動くので機体は
+# 動かない)。以降、機体の pos_n/pos_e はこちらの座標系になり、機体側
+# フェンス (QuadConfig FENCE_*) が効き始める。テレメトリ frame_ok=1 で確認。
+CF_POS_SHIFT = 1 << 5
 
 # ★ 2026-09-14: PID reset / IMU校正 / デバイス確認の単発指令 (Action) は
 #   IM920 から削除した (IM920は操縦専用に戻し、これらはBLE経由に一本化。
@@ -303,7 +315,7 @@ class S5Link:
 
     def send_command(self, req, vx_mps=0.0, vy_mps=0.0, alt_m=0.0,
                      yaw_rate_dps=0.0, flags=0, corr_n_m=None, corr_e_m=None,
-                     yaw_abs_deg=None):
+                     yaw_abs_deg=None, laps=0):
         """
         上りコマンドを 1 行送る。
 
@@ -312,7 +324,10 @@ class S5Link:
             vx_mps     : 機体座標の目標速度 前+ [m/s]
             vy_mps     : 機体座標の目標速度 右+ [m/s]
             alt_m      : 目標対地高度 [m]。0 以下 = 「現状維持」
-            yaw_rate_dps: 目標ヨーレート [deg/s]。現状 機体側は未使用
+            yaw_rate_dps: 目標ヨーレート [deg/s]。REQ_GUIDED では機体側は
+                        未使用。REQ_CIRCLE 等では旋回レート (符号=方向) として使う
+            laps       : 定型機動の周回数 (CIRCLE: その回数, CLIMB: 低/高それぞれ)。
+                        0 = 機体側の既定。他の REQ では無視
             flags      : CF_* の論理和
             corr_n_m/corr_e_m: 地面固定フレームの絶対位置補正 [m]。
                 None なら送らない (行を短く保つ)。値を渡すときは
@@ -347,10 +362,15 @@ class S5Link:
             parts.append(str(int(round(corr_n_m * 1000.0))))
             parts.append(str(int(round(corr_e_m * 1000.0))))
         if yaw_abs_deg is not None:
-            # yaw は末尾。位置補正を使わない回も、途中の2項を0で埋める。
+            # yaw は 9 項目め。位置補正を使わない回も、途中の2項を0で埋める。
             while len(parts) < 9:
                 parts.append("0")
             parts.append(str(int(round(yaw_abs_deg * 100.0))))
+        if laps:
+            # laps は 10 項目め。手前を 0 で埋める (s5_log.cpp handleCmdLine の並び)。
+            while len(parts) < 10:
+                parts.append("0")
+            parts.append(str(int(laps)))
         self._write_raw(",".join(parts) + "\n")
 
     def send_key(self, ch):

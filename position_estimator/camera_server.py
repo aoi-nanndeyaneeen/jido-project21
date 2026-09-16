@@ -34,6 +34,26 @@ LOCK_EXPOSURE_ON_STREAM = True
 
 DSHOW_EXPOSURE_MANUAL = 0.25
 
+# ★ 2026-09-16: PC側 (src/utils/config.py) の TRACKING_EXPOSURE に相当する
+#   値がこちらには無かった。lock_exposure() は「今の自動露出の結果」を
+#   そのまま固定するだけなので、Camera2 (このRPi) は会場の明るさに合わせた
+#   普通の (=比較的明るい/長い) 露出のまま bright 検知していたことになる。
+#
+#   10m超で Camera1 (PC直結、TRACKING_EXPOSURE=-6 で暗く固定) だけが検知を
+#   落とし、Camera2 (このRPi) は検知できた件の原因はここ:
+#     ・Camera1: 露出を絞って「LEDだけ白飛び」にしてある → LED自体の
+#       実光量が距離の2乗で落ちる遠方では bright_threshold(230) を割る
+#     ・Camera2: 自動露出のまま (明るい) → 遠方のLEDでも他の明点と一緒に
+#       ある程度持ち上がって閾値を超えやすい (静的輝点マスクで背景の
+#       明点は引かれる)
+#   つまり Camera2 が遠方で拾えていたのは「暗くし損ねていた」副作用の
+#   可能性が高い。近距離での白飛び過多 (窓・反射) が今後出るなら、
+#   ここを負値 (V4L2 は 1=manual 3=auto が一般的。実際の露出時間の単位・
+#   範囲は `v4l2-ctl -d /dev/video0 --list-ctrls` で確認すること。
+#   DSHOW と違い 2のべき乗ではない) にして Camera1 と同じ考え方で
+#   絞れるようにしておく。None のままなら今までどおり (自動→そのまま固定)。
+TRACKING_EXPOSURE = None
+
 # ── 検知パラメータ（PC側と共有）────────────────────────────────
 _DEFAULT_PARAMS = {
     "detect_mode": "motion",
@@ -246,12 +266,20 @@ def lock_exposure(cap):
     try:
         exposure = cap.get(cv2.CAP_PROP_EXPOSURE)
         wb = cap.get(cv2.CAP_PROP_WB_TEMPERATURE)
+        if TRACKING_EXPOSURE is not None:
+            exposure = float(TRACKING_EXPOSURE)
+            print(f"[RPi] 追跡用に露出を {exposure:.1f} へ落とします (TRACKING_EXPOSURE)")
         cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, DSHOW_EXPOSURE_MANUAL)
         cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
         cap.set(cv2.CAP_PROP_AUTO_WB, 0)
         if wb and wb > 0:
             cap.set(cv2.CAP_PROP_WB_TEMPERATURE, wb)
-        print(f"[RPi] 露出を固定 (exposure={exposure:.1f}, wb={wb:.0f})")
+        readback = cap.get(cv2.CAP_PROP_EXPOSURE)
+        ok = abs(readback - exposure) < 0.5
+        if TRACKING_EXPOSURE is not None and not ok:
+            print(f"[RPi] [WARN] 露出の固定に失敗しました (要求{exposure:.1f} / 実測{readback:.1f})。"
+                  "自動のまま続行します。")
+        print(f"[RPi] 露出を固定 (exposure={readback:.1f}, wb={wb:.0f})")
     except Exception as e:
         print(f"[RPi] [WARN] 露出固定に失敗（自動のまま続行）: {e}")
 

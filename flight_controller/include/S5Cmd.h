@@ -43,10 +43,16 @@
 //    ※ そのぶんヘディング推定を外すと指令の向きも外れる。ウェイポイント
 //      飛行中は機首を回さない (ヨー指令 0) 運用にすること。
 //
+//  ★ REQ_CIRCLE / REQ_FIGURE8 / REQ_CLIMB_TURN (定型機動) はこの前提の例外。地面座標へは一切変換
+//    しない (機体座標のまま前進+回転を保ち続けるだけで、地面座標での
+//    円軌道は勝手にできる)。だからカメラのヘディング推定にもリンクの
+//    新鮮さにも依存せず、機体単独 (ジャイロ+オプティカルフロー) で完結
+//    させてよい。詳細は drone_s5.cpp の GP_CIRCLE 参照。
+//
 // ------------------------------------------------------------
 //  【帯域】  ★ 2026-09-16 現在の割り当て
-//    1 パケット 20+4 = 24 バイト = "TXDA " + 48桁 + CRLF = 55 文字 =
-//    19200bps で 28.6ms。上り 8Hz で UART 占有率 23%。
+//    1 パケット 22+4 = 26 バイト = "TXDA " + 52桁 + CRLF = 59 文字 =
+//    19200bps で 30.7ms。上り 8Hz で UART 占有率 25%。
 //    下り (S5Telem) は 8Hz x 71文字 37ms = 30%。合計 53%。
 //
 //    レートを決めているのは 2 箇所だけ:
@@ -71,7 +77,7 @@ namespace S5C {
 // VERSION 4 (2026-09-14): action/action_seq を削除 (IM920は操縦専用に戻し、
 //   単発メンテナンス指令はBLE経由に限定したため。下の Action 列挙子の
 //   コメント参照)。
-constexpr uint8_t VERSION = 5;  // camera absolute-yaw field added
+constexpr uint8_t VERSION = 9;  // laps (定型機動の周回数) added
 
 // 下りテレメトリ (S5T) の type と衝突しない値。'K' = command
 constexpr uint8_t MAGIC = 0x4B;
@@ -91,6 +97,20 @@ enum Req : uint8_t {
     REQ_GUIDED  = 3,  // 巡航: vx/vy と alt_cm に従う
     REQ_LAND    = 4,  // 自動着陸。水平は 0 固定
     REQ_ABORT   = 5,  // 中断: 即 HOLD して地上局の指令を捨てる
+    // ★ 2026-09-16: 自動水平旋回。GUIDED と違い「一度届けば機体単独で
+    //   完結する」設計 (下の注記参照)。REQ_FIGURE8 / REQ_CLIMB_TURN も
+    //   同じ形 (vx_mmps=巡航速度, yaw_rate_cdps=旋回レート, alt_cm=高度)
+    //   で足す予定なので、値を詰めて並べてある。
+    REQ_CIRCLE  = 6,  // 水平旋回1周: vx_mmps で前進しつつ yaw_rate_cdps で
+                      // 回り続け、機体が自分で360°を数えて自動的に HOLD へ戻る。
+                      // alt_cm は保持する高度。
+    REQ_FIGURE8 = 7,  // 8の字: 1周 + 逆回りで1周 (半径は同じ)。
+    REQ_CLIMB_TURN = 8, // 上昇旋回: 開始高度で laps 周 → 回りながら alt_cm へ上昇
+                      // (1周分) → alt_cm で laps 周。(quad/Maneuver.h)
+    // ★ 機体は同じ REQ_* が連続して届いても1回しか始めない (完了後に同じ
+    //   要求が来続けても再開しない)。次を始めるには別の REQ (IDLE/HOLD 等)
+    //   を1回挟むこと。2026-09-16 の初飛行で、console が 10Hz で REQ_CIRCLE
+    //   を送り続けたため完了→即再開を繰り返し 2.4 周回った。
 };
 
 inline const char* reqName(uint8_t r) {
@@ -101,6 +121,9 @@ inline const char* reqName(uint8_t r) {
         case REQ_GUIDED:  return "GUIDED";
         case REQ_LAND:    return "LAND";
         case REQ_ABORT:   return "ABORT";
+        case REQ_CIRCLE:  return "CIRCLE";
+        case REQ_FIGURE8: return "FIGURE8";
+        case REQ_CLIMB_TURN: return "CLIMB";
     }
     return "?";
 }
@@ -170,8 +193,14 @@ struct __attribute__((__packed__)) CmdFrame {
     int16_t  corr_n_mm;     // 16  位置補正の絶対目標 pos_n [mm]。CF_POS_CORR 時のみ有効
     int16_t  corr_e_mm;     // 18  同 pos_e [mm]
     int16_t  yaw_abs_cdeg;  // 20  カメラ絶対ヨー [0.01 deg]。CF_YAW_VALID 時のみ
+    // ★ 2026-09-16: 定型機動の周回数。REQ_CIRCLE = この回数だけ同じ向きに回る
+    //   (ルールブック: 連続2周で1000点)。REQ_CLIMB_TURN = 低高度で laps 周 →
+    //   上昇しながら1周 → 高高度で laps 周。REQ_FIGURE8 では無視 (常に1+1)。
+    //   0 は既定 (CIRCLE=1, CLIMB=2)。他の REQ では無視。
+    uint8_t  laps;          // 21
+    uint8_t  rsv;           // 22  予約 (0)
 };
-static_assert(sizeof(CmdFrame) == 20, "CmdFrame は 20 byte");
+static_assert(sizeof(CmdFrame) == 22, "CmdFrame は 22 byte");
 static_assert(sizeof(CmdFrame) + CHECKSUM_BYTES <= IM920SL_MAX_PAYLOAD,
               "IM920sL の 32 バイト制限を超えています");
 
@@ -181,6 +210,11 @@ enum CmdFlag : uint16_t {
     CF_YAW_VALID = 1u << 2,  // ヘディング推定が収束している
     CF_ALT_ABS   = 1u << 3,  // alt_cm を絶対目標として扱う (落ちていれば現状維持)
     CF_POS_CORR  = 1u << 4,  // corr_n_mm/corr_e_mm を pos_n/pos_e へ適用する
+    // ★ 2026-09-16: CF_POS_CORR と一緒に立てると「補正」ではなく「原点合わせ」。
+    //   pos だけでなく hold も同じ量だけ動かすので機体は動かず、以降の
+    //   pos_n/pos_e が地上局の座標系 (フィールド座標) になる。機体側フェンス
+    //   (QuadConfig FENCE_*) はこれを受けてから効き始める。PosHold::shiftFrame()。
+    CF_POS_SHIFT = 1u << 5,
 };
 
 // スケール

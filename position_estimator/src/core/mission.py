@@ -60,13 +60,17 @@ from utils.config import (MISSION_TAKEOFF_ALT_M, YAW_INITIAL_ALIGN_DEG,
                           MISSION_FENCE_X, MISSION_FENCE_Y, MISSION_FENCE_Z,
                           MISSION_FENCE_GRACE_S, MISSION_YAW_PROBE_VEL,
                           MISSION_HOLD_AT_FIRST_WP,
+                          MISSION_MANEUVER, MISSION_MANEUVER_SPEED,
+                          MISSION_MANEUVER_YAW_RATE, MISSION_MANEUVER_ALT_M,
+                          MISSION_MANEUVER_LAPS,
                           POS_CORR_ENABLED, POS_CORR_PERIOD_S,
                           POS_CORR_MAX_STEP_M,
                           POS_CORR_TRACK_TOL_M, POS_CORR_CONFIRM_S)
+from core.maneuver import ManeuverRunner, from_config as maneuver_from_config
 from core.s5_link import (REQ_ABORT, REQ_GUIDED, REQ_HOLD, REQ_LAND,
                           REQ_TAKEOFF, REQ_NAME,
                           CF_ARMED_OK, CF_POS_VALID, CF_YAW_VALID,
-                          CF_ALT_ABS, CF_POS_CORR)
+                          CF_ALT_ABS, CF_POS_CORR, CF_POS_SHIFT)
 
 
 class Phase(Enum):
@@ -75,6 +79,7 @@ class Phase(Enum):
     TAKEOFF   = "TAKEOFF"    # 離陸高度まで上昇中
     CRUISE    = "CRUISE"     # ウェイポイントへ移動中
     DWELL     = "DWELL"      # ウェイポイント上で静止保持中
+    MANEUVER  = "MANEUVER"   # 機体単独の定型機動 (旋回/8の字/上昇旋回) を実行中
     LAND      = "LAND"       # 自動着陸中
     DONE      = "DONE"       # 着陸完了
     ABORT     = "ABORT"      # 中断 (異常検知 / 手動)
@@ -202,9 +207,18 @@ class WaypointMission:
     FENCE_Z = MISSION_FENCE_Z
     FENCE_GRACE_S = MISSION_FENCE_GRACE_S
 
-    def __init__(self, link, waypoints, home=None, verbose=True):
+    def __init__(self, link, waypoints, home=None, verbose=True, maneuver="default"):
         self.link = link
         self.waypoints = [tuple(float(v) for v in wp) for wp in waypoints]
+        # 最後の WP でやる定型機動 (core/maneuver.Maneuver) か None。
+        # "default" なら config (MISSION_MANEUVER*) から作る。
+        if maneuver == "default":
+            maneuver = maneuver_from_config(MISSION_MANEUVER, MISSION_MANEUVER_SPEED,
+                                            MISSION_MANEUVER_YAW_RATE, MISSION_MANEUVER_ALT_M,
+                                            MISSION_MANEUVER_LAPS)
+        self.maneuver = maneuver
+        self._runner = None          # 実行中の ManeuverRunner
+        self._maneuver_done = False  # この便で機動を済ませたか (1便に1回)
         self.home = tuple(home) if home is not None else None
         # 呼び出し側が戻り先を固定したか。None なら毎フライト離陸地点から決め直す。
         self._home_fixed = self.home
@@ -300,6 +314,8 @@ class WaypointMission:
         self._hold_inside = False
         self._t_hold_in = None
         self._t_hold_first = None
+        self._runner = None
+        self._maneuver_done = False
         self._t_phase = now
         self._t_start = now
         self._t_pos_ok = now
@@ -314,8 +330,25 @@ class WaypointMission:
         self._diff = None
         self._corr_ref = None
         self._t_corr_start = 0.0
+        mtxt = f" -> {self.maneuver.name}" if self.maneuver is not None else ""
         self._say(f"待機開始: 機体が GUIDED に入ったら自動で離陸します "
-                  f"(WP {len(self.waypoints)} 点 -> 離陸地点へ戻って自動着陸)")
+                  f"(WP {len(self.waypoints)} 点{mtxt} -> 離陸地点へ戻って自動着陸)")
+        return True
+
+    def request_maneuver(self, kind):
+        """巡航中の今の場所から定型機動を始める (main.py の c/8/u キー)。
+        終わったら通常どおり離陸地点へ帰投→着陸する。
+        kind: "circle" / "figure8" / "climb"。速度・レート・高度・周回数は config。"""
+        if self.phase not in (Phase.CRUISE, Phase.DWELL):
+            self._say(f"機動は巡航中 (CRUISE/DWELL) にだけ開始できます (今は {self.phase.value})")
+            return False
+        m = maneuver_from_config(kind, MISSION_MANEUVER_SPEED, MISSION_MANEUVER_YAW_RATE,
+                                 MISSION_MANEUVER_ALT_M, MISSION_MANEUVER_LAPS)
+        self.maneuver = m
+        self._runner = ManeuverRunner(m, self.link)
+        self._runner.start()
+        self._say(f"キー操作 -> {m.describe()} を開始 (終了後は離陸地点へ帰投)")
+        self._goto(Phase.MANEUVER)
         return True
 
     def abort(self, reason="手動中断"):
@@ -339,7 +372,7 @@ class WaypointMission:
             print(f"[Mission] {msg}")
 
     def _send(self, req, vx_mps=0.0, vy_mps=0.0, alt_m=0.0, flags=0,
-              yaw_rad=None):
+              yaw_rad=None, yaw_rate_dps=0.0, laps=0):
         """送信と記録を必ずセットで行う。link.send_command() を直接呼ばないこと。"""
         # 保留中の位置補正があれば、この送信1回にだけ乗せて消費する。
         # どのフェーズの _send() 呼び出しに乗るかは問わない
@@ -349,7 +382,9 @@ class WaypointMission:
         corr_n = corr_e = None
         if corr is not None:
             flags |= CF_POS_CORR
-            corr_n, corr_e = corr
+            corr_n, corr_e = corr[0], corr[1]
+            if len(corr) > 2 and corr[2]:
+                flags |= CF_POS_SHIFT      # 原点合わせ (機体は動かない)
 
         # ★ phase は「送った時点」のものを控える。update() は送信後に
         #   フェーズを進めることがあるので、あとから self.phase を読むと
@@ -359,7 +394,7 @@ class WaypointMission:
                     "phase": self.phase.value, "corr": corr}
         self._n_tx += 1
         self.link.send_command(req, vx_mps=vx_mps, vy_mps=vy_mps,
-                               alt_m=alt_m, flags=flags,
+                               alt_m=alt_m, yaw_rate_dps=yaw_rate_dps, laps=laps, flags=flags,
                                corr_n_m=corr_n, corr_e_m=corr_e,
                                yaw_abs_deg=(math.degrees(yaw_rad)
                                             if yaw_rad is not None and (flags & CF_YAW_VALID)
@@ -533,6 +568,28 @@ class WaypointMission:
                           f"(対地 {h_agl:.2f} m) -> 着陸")
             return
 
+        if self.phase is Phase.MANEUVER:
+            # 機体が自分で回っている。PC は開始要求 (バースト) のあと IDLE で
+            # リンクだけ生かす。位置・ヨーの有無は問わない (機体は使わない)。
+            #  ★ HOLD/GUIDED を送ると機体側で機動が中断されるので送らないこと。
+            req, vx, yr, alt, laps = self._runner.request()
+            self._send(req, vx_mps=vx, yaw_rate_dps=yr, alt_m=alt, flags=flags,
+                       yaw_rad=yaw_rad, laps=laps)
+            st_m = self._runner.update(now)
+            if st_m == "done":
+                self._maneuver_done = True
+                self._say(f"{self.maneuver.name} 完了 ({self._runner.elapsed_s(now):.1f}s) "
+                          f"-> 離陸地点へ帰投")
+                self._runner = None
+                self._returning = True
+                self._goto(Phase.CRUISE)
+            elif st_m == "failed":
+                self.reason = f"機動 {self.maneuver.name} 失敗: {self._runner.reason}"
+                self._runner = None
+                self._goto(Phase.LAND)
+                self._say(f"異常検知 -> 自動着陸: {self.reason}")
+            return
+
         if self.phase in (Phase.CRUISE, Phase.DWELL):
             target = self._target()
             # ヘディングが分からないと「前」がどっちか分からない。
@@ -609,6 +666,13 @@ class WaypointMission:
             return
         self.wp_idx += 1
         if self.wp_idx >= len(self._path):
+            if self.maneuver is not None and not self._maneuver_done:
+                # 最後の WP の上で、その場から定型機動。終わったら帰投。
+                self._runner = ManeuverRunner(self.maneuver, self.link)
+                self._runner.start()
+                self._say(f"全ウェイポイント消化 -> {self.maneuver.describe()} を開始")
+                self._goto(Phase.MANEUVER)
+                return
             self._returning = True
             self._say("全ウェイポイント消化 -> 離陸地点へ帰投")
         else:
@@ -736,7 +800,7 @@ class WaypointMission:
           そこから取り直し、同じ値が POS_CORR_CONFIRM_S 秒続いて初めて
           信用する。誤検知1フレームでは持続時間が足りず弾かれる。
         """
-        if not POS_CORR_ENABLED or self.phase is Phase.LAND:
+        if not POS_CORR_ENABLED or self.phase in (Phase.LAND, Phase.MANEUVER):
             return
         if not pos_valid or pos is None:
             return
@@ -746,12 +810,25 @@ class WaypointMission:
 
         cam_x, cam_y = float(pos[0]), float(pos[1])
 
+        # ★ 2026-09-16: 原点合わせは「機体の座標系をフィールド座標に付け替える」
+        #   (CF_POS_SHIFT)。以前は PC 側だけが _align を覚えていたが、それだと
+        #   機体は自分がフィールドのどこにいるか知らず、機体側フェンスが
+        #   効かせられない。shift 後は fh_posn/fh_pose がそのままフィールド
+        #   座標 (n=y, e=x) なので _align は (0,0) になる。
+        #   ★ 離陸前 (PosHold が active でない間) は機体側が pos を毎ループ 0 に
+        #     戻すので、shift は airborne になってから送る。モード切替でも
+        #     消える (frame_ok が落ちる) ので、そのときは取り直す。
+        if self._align is not None and not st.get("frame_ok"):
+            self._align = None
         if self._align is None:
-            # 両方が同時に信用できる最初の瞬間。定義よりズレは0なので
-            # 送る意味がない。原点だけ覚えて次回以降に備える。
-            self._align = (cam_x - fh_e, cam_y - fh_n)
+            if not st.get("airborne"):
+                return
+            self._pending_corr = (cam_y, cam_x, True)
+            self._align = (0.0, 0.0)
             self._diff = (0.0, 0.0, 0.0, cam_x, cam_y)
             self._corr_ref = None
+            self._say(f"機体の座標系をフィールド座標へ合わせました "
+                      f"({cam_x:+.2f}, {cam_y:+.2f}) -> 機体側フェンス有効")
             return
 
         drone_x = fh_e + self._align[0]
@@ -845,7 +922,7 @@ class WaypointMission:
         # 機体が自分で GUIDED を降りた (パイロットがスイッチを戻した等)。
         #  この場合 機体は POSHOLD でその場に留まっているので、こちらも
         #  指令をやめて手動へ譲る。着陸させない (パイロットが操縦中かもしれない)。
-        if self.phase in (Phase.CRUISE, Phase.DWELL, Phase.TAKEOFF):
+        if self.phase in (Phase.CRUISE, Phase.DWELL, Phase.TAKEOFF, Phase.MANEUVER):
             if self.link.n_data() > 0 and not self.link.flag("guided"):
                 self.reason = "機体が GUIDED を抜けた (手動介入)"
                 self._goto(Phase.ABORT)
@@ -876,6 +953,8 @@ class WaypointMission:
         s = f"{self.phase.value}"
         if self.phase in (Phase.CRUISE, Phase.DWELL):
             s += f" -> {self._label()}"
+        elif self.phase is Phase.MANEUVER and self._runner is not None:
+            s += f" {self.maneuver.name} {self._runner.state} {self._runner.elapsed_s():.0f}s"
         if tgt is not None:
             s += f" ({tgt[0]:+.2f}, {tgt[1]:+.2f}, {tgt[2]:.2f})"
         if self._dist_h is not None:

@@ -112,6 +112,10 @@ enum Flag : uint16_t {
     F_GUIDED      = 1u << 11,  // 地上局コマンドで飛んでいる (MODE_AUTO)
     F_CMD_FRESH   = 1u << 12,  // 上りコマンドが規定時間内に届いている
     F_LANDED      = 1u << 13,  // 自動着陸が完了して出力を切った
+    // ★ VERSION 6 で追加 (S5Cmd.h の REQ_CIRCLE)
+    F_MANEUVER    = 1u << 14,  // 自動水平旋回(等)を実行中。完了すると自然に落ちる
+    F_FRAME_OK    = 1u << 15,  // CF_POS_SHIFT で原点合わせ済み = 機体側フェンスが有効
+                               //   (離陸前・モード切替で落ちる。地上局は落ちたら送り直す)
 };
 
 // mode と alt_state を 1 バイトに詰める (上位=alt_state 下位=mode)

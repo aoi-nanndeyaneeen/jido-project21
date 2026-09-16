@@ -68,9 +68,10 @@ from datetime import datetime
 from pathlib import Path
 
 from core.keyreader import KeyReader
-from core.s5_link import (S5Link, REQ_ABORT, REQ_GUIDED, REQ_HOLD, REQ_IDLE,
-                          REQ_LAND, REQ_TAKEOFF, REQ_NAME,
-                          CF_ARMED_OK, CF_ALT_ABS)
+from core.s5_link import (S5Link, REQ_ABORT, REQ_GUIDED, REQ_HOLD,
+                          REQ_IDLE, REQ_LAND, REQ_TAKEOFF, REQ_NAME,
+                          CF_ARMED_OK, CF_ALT_ABS, CF_POS_CORR, CF_POS_SHIFT)
+from core.maneuver import Circle, FigureEight, ClimbTurn, ManeuverRunner
 from utils.config import GROUND_LINK_PORT, LOG_DIR, MISSION_TAKEOFF_ALT_M
 from utils.logger import CsvLogger
 
@@ -92,6 +93,26 @@ SEND_HZ = 10.0
 # 機体側のフェイルセーフ (QuadConfig.h)。画面の注意書きに使う。
 STALE_HOLD_S = 1.0
 STALE_LAND_S = 4.0
+
+# ---- 定型機動 (c 水平旋回 / 8 8の字 / u 上昇旋回) のベンチテスト値 --------
+#  半径 r[m] = 速度 / (ヨーレート * pi/180)。ルールブックは「概ね 1.5m 以上」。
+#    0.4 m/s, 15 deg/s → r≈1.53m、1周≈24秒。実測は指令より 2〜3割大きく出る
+#    (2026-09-16: 0.3/30 → 指令 0.57m、フィット 0.7〜0.78m)。
+#  ★ 押した時点で機体が GUIDED に入って静止ホバリング中であること。
+#    円の中心は「開始地点から旋回方向へ r 横」。右回り(+)なら左寄りで
+#    始めること。6m 幅なら中心から始めて直径 3m + 流れ 0.5m で収まる。
+#    送り方は core/maneuver.py の ManeuverRunner (1秒バースト → IDLE)。
+MANEUVER_SPEED_MPS    = 0.4
+MANEUVER_YAW_RATE_DPS = 15.0
+MANEUVER_LAPS         = 2      # c: 連続2周 (1000点)。u: 低高度2周 + 高高度2周 (ルール)
+CLIMB_TURN_ALT_M      = 2.2    # 上昇旋回の到達高度 [m] (ポール以上。MISSION_FENCE_Z=2.5 未満に)
+
+# ---- デッドマン --------------------------------------------------------
+#  ★ 2026-09-16: w/a/s/d で入れた速度指令は「次に押すまで残り続ける」ので、
+#    手を離しても機体は同じ速度で進み続け、フィールド外 (フロー積分で
+#    E=+2.9m) まで出た。GUIDED 中にこの秒数キー操作が無ければ速度を 0 に
+#    戻す (= その場ホールド)。動かし続けたければ押し続ける (連打する)。
+DEADMAN_S = 1.5
 
 # モード番号 -> 名前 (utils/logger.py の MODE_NAME と同じ対応)
 MODE_NAME = {0: "RATE", 1: "ANGLE", 2: "GUIDED", 3: "POSHOLD", 4: "ALTHOLD"}
@@ -207,7 +228,11 @@ class Commander:
         self._req = REQ_HOLD
         self._vx = 0.0
         self._vy = 0.0
+        self._yaw_rate = 0.0
         self._alt = alt_m
+        self._runner = None           # 実行中の定型機動 (core.maneuver.ManeuverRunner)
+        self._t_key = 0.0             # 最後に速度を触った時刻 (デッドマン用)
+        self._origin_pending = False  # 次の1回だけ CF_POS_SHIFT(0,0) を乗せる
         self._tx = False              # ★ 起動時は必ず送信 OFF
         self._event = ""
         self._n_tx = 0
@@ -218,24 +243,50 @@ class Commander:
     # ---- 状態 ----------------------------------------------------------
     def snapshot(self):
         with self._lock:
-            return {"req": self._req, "vx": self._vx, "vy": self._vy,
-                    "alt": self._alt, "tx_on": self._tx,
+            req, vx, vy, yr, alt = self._req, self._vx, self._vy, self._yaw_rate, self._alt
+            mst = None
+            r = self._runner
+            if r is not None and r.active():
+                req, vx, yr, alt_m, laps = r.request()
+                vy = 0.0
+                if alt_m > 0.0:
+                    alt = alt_m
+                mst = (r.m.name, r.state, r.elapsed_s())
+            else:
+                laps = 0
+            return {"req": req, "vx": vx, "vy": vy, "yaw_rate": yr, "laps": laps,
+                    "alt": alt, "tx_on": self._tx, "maneuver": mst,
                     "flags": CF_ARMED_OK | CF_ALT_ABS, "n_tx": self._n_tx}
 
     # ---- 操作 ----------------------------------------------------------
     def set_req(self, req, event=""):
         with self._lock:
+            if self._runner is not None and self._runner.active():
+                self._event = f"機動 {self._runner.m.name} を中断 -> {REQ_NAME.get(req, req)}"
+            self._runner = None       # 手動操作は機動より優先 (HOLD/ABORT は機体側でも割り込む)
             self._req = req
             if req in (REQ_HOLD, REQ_TAKEOFF, REQ_LAND, REQ_ABORT):
                 self._vx = self._vy = 0.0   # 水平は機体側でも 0 にされる
+            self._yaw_rate = 0.0
             self._tx = True
             self._event = event or f"REQ={REQ_NAME.get(req, req)}"
+
+    def set_maneuver(self, maneuver):
+        """定型機動を1回だけ実行する。送り方 (バースト→IDLE) と完了判定は ManeuverRunner。"""
+        with self._lock:
+            self._runner = ManeuverRunner(maneuver, self.link)
+            self._runner.start()
+            self._vx = self._vy = 0.0
+            self._yaw_rate = 0.0
+            self._tx = True
+            self._event = f"MANEUVER {maneuver.describe()}"
 
     def nudge(self, dvx=0.0, dvy=0.0, dalt=0.0):
         with self._lock:
             self._vx = max(-VEL_MAX_MPS, min(VEL_MAX_MPS, self._vx + dvx))
             self._vy = max(-VEL_MAX_MPS, min(VEL_MAX_MPS, self._vy + dvy))
             self._alt = max(0.0, min(ALT_MAX_M, self._alt + dalt))
+            self._t_key = time.time()
             self._event = (f"SET vx={self._vx:+.2f} vy={self._vy:+.2f} "
                            f"alt={self._alt:.2f}")
 
@@ -243,6 +294,12 @@ class Commander:
         with self._lock:
             self._vx = self._vy = 0.0
             self._event = "SET vx=0 vy=0"
+
+    def set_origin(self):
+        """今いる場所を機体側フェンスの中心 (0,0) にする。機体は動かない。"""
+        with self._lock:
+            self._origin_pending = True
+            self._event = "ORIGIN (CF_POS_SHIFT 0,0) -> 機体側フェンス有効"
 
     def stop_tx(self):
         with self._lock:
@@ -265,15 +322,46 @@ class Commander:
         period = 1.0 / SEND_HZ
         while self._running:
             t0 = time.time()
+            # 定型機動の進行 (完了/失敗したら IDLE に落として HOLD に任せる)
+            with self._lock:
+                r = self._runner
+                if r is not None and r.active():
+                    st = r.update(t0)
+                    if st == "done":
+                        self._event = f"MANEUVER {r.m.name} 完了 ({r.elapsed_s(t0):.1f}s) -> HOLD"
+                        self._req = REQ_IDLE
+                        self._runner = None
+                    elif st == "failed":
+                        self._event = f"MANEUVER {r.m.name} 失敗: {r.reason} -> HOLD"
+                        self._req = REQ_HOLD
+                        self._runner = None
+            # デッドマン: GUIDED で速度が入ったまま DEADMAN_S 触られていなければ 0 へ
+            with self._lock:
+                if (self._tx and self._req == REQ_GUIDED
+                        and (self._vx != 0.0 or self._vy != 0.0)
+                        and t0 - self._t_key > DEADMAN_S):
+                    self._vx = self._vy = 0.0
+                    self._event = f"DEADMAN {DEADMAN_S:.1f}s 操作なし -> vx=0 vy=0 (ホールド)"
+                origin = self._origin_pending
+                self._origin_pending = False
             snap = self.snapshot()
             event = self.take_event()
             send_now = snap["tx_on"]
             if send_now:
+                flags = snap["flags"]
+                corr_n = corr_e = None
+                if origin:
+                    flags |= CF_POS_CORR | CF_POS_SHIFT
+                    corr_n = corr_e = 0.0
                 self.link.send_command(snap["req"], vx_mps=snap["vx"],
                                        vy_mps=snap["vy"], alt_m=snap["alt"],
-                                       flags=snap["flags"])
+                                       yaw_rate_dps=snap["yaw_rate"], laps=snap["laps"],
+                                       flags=flags, corr_n_m=corr_n, corr_e_m=corr_e)
                 with self._lock:
                     self._n_tx += 1
+            elif origin:
+                with self._lock:
+                    self._event = "ORIGIN は送信中 (h/g など) にしか送れません"
             if self.logger is not None and (send_now or event):
                 self.logger.write(snap, self.link.state(), self.link.age(), event)
             time.sleep(max(0.0, period - (time.time() - t0)))
@@ -322,9 +410,21 @@ class KeyHandler:
         elif ch == "l":
             cmdr.set_req(REQ_LAND, "KEY l -> LAND")
             self.say("[Console] LAND (自動着陸)")
-        elif ch == " ":
-            cmdr.set_req(REQ_ABORT, "KEY SPACE -> ABORT")
-            self.say("[Console] ABORT = 機体は即その場ホールド。落とすならプロポ")
+        elif ch in ("c", "8", "u"):
+            if not self.link.flag("guided"):
+                self.say("[Console] 機動は機体が GUIDED に入ってから (h で HOLD を送って静止させてから)")
+            else:
+                alt_now = float(self.link.state().get("range_h", 0.0) or 0.0)
+                hold_alt = cmdr.snapshot()["alt"]
+                if ch == "c":
+                    m = Circle(MANEUVER_SPEED_MPS, MANEUVER_YAW_RATE_DPS, hold_alt, MANEUVER_LAPS)
+                elif ch == "8":
+                    m = FigureEight(MANEUVER_SPEED_MPS, MANEUVER_YAW_RATE_DPS, hold_alt)
+                else:
+                    m = ClimbTurn(MANEUVER_SPEED_MPS, MANEUVER_YAW_RATE_DPS, CLIMB_TURN_ALT_M, MANEUVER_LAPS)
+                cmdr.set_maneuver(m)
+                self.say(f"[Console] {m.describe()} を開始 (今の高度 {alt_now:.2f}m)。"
+                         "機体センサのみで完結し、終わると自動でホールド")
         elif ch == "x":
             cmdr.stop_tx()
             self.say(f"[Console] 送信停止。機体は {STALE_HOLD_S:.0f}s でホールド "
@@ -339,6 +439,14 @@ class KeyHandler:
             cmdr.nudge(dvy=+VEL_STEP_MPS)
         elif ch == "0":
             cmdr.zero_vel()
+        elif ch == "o":
+            if self.link.flag("airborne"):
+                cmdr.set_origin()
+                self.say("[Console] ここをフェンス中心 (0,0) にしました。"
+                         "画面の FRAME が点いたら機体側フェンス有効")
+            else:
+                self.say("[Console] o は離陸後 (airborne) にだけ効きます "
+                         "(地上では機体が位置を毎ループ 0 に戻すため)")
         elif ch == "r":
             cmdr.nudge(dalt=+ALT_STEP_M)
         elif ch == "f":
@@ -417,7 +525,8 @@ def build_lines(link, cmd, tap, messages, rate_hz, help_on):
     flags = "  ".join(x for x in [
         _onoff(tel, "armed", "ARMED"), _onoff(tel, "guided", "GUIDED"),
         _onoff(tel, "airborne", "AIRBORNE"), _onoff(tel, "cmd_fresh", "CMD_FRESH"),
-        _onoff(tel, "landed", "LANDED"), _onoff(tel, "flow_ok", "FLOW"),
+        _onoff(tel, "landed", "LANDED"), _onoff(tel, "maneuver", "CIRCLE中"),
+        _onoff(tel, "frame_ok", "FRAME"), _onoff(tel, "flow_ok", "FLOW"),
         _onoff(tel, "range_valid", "RANGE"), _onoff(tel, "pos_hold", "HOLD"),
     ] if x.strip())
     lines.append(f" MODE   {mode_s:<8} alt:{alt_s:<8} {flags}")
@@ -458,9 +567,14 @@ def build_lines(link, cmd, tap, messages, rate_hz, help_on):
     # ---- 送信状態 -----------------------------------------------------
     tx_mark = ">>> 送信中 <<<" if cmd["tx_on"] else "--- 送信停止 ---"
     alt_txt = "現状維持" if cmd["alt"] <= 0.0 else f"{cmd['alt']:.2f} m"
+    yaw_txt = (f"  yaw_rate {cmd['yaw_rate']:+.1f}deg/s"
+              if cmd.get("yaw_rate", 0.0) != 0.0 else "")
+    mst = cmd.get("maneuver")
+    if mst:
+        yaw_txt += f"  [{mst[0]} {mst[1]} {mst[2]:.1f}s]"
     lines.append(f" TX     {tx_mark}  REQ={REQ_NAME.get(cmd['req'], cmd['req']):<8}"
                  f" vx {cmd['vx']:+.2f}  vy {cmd['vy']:+.2f}  alt {alt_txt}"
-                 f"  flags 0x{cmd['flags']:02X}")
+                 f"  flags 0x{cmd['flags']:02X}{yaw_txt}")
     if not cmd["tx_on"]:
         lines.append(f"        (黙っている間、機体は {STALE_HOLD_S:.0f}s でホールド"
                      f" -> {STALE_LAND_S:.0f}s で自動着陸)")
@@ -470,9 +584,13 @@ def build_lines(link, cmd, tap, messages, rate_hz, help_on):
     if help_on:
         lines += [
             " h HOLD   t TAKEOFF(2回押し)   g GUIDED   l LAND   SPACE ABORT(=即HOLD)",
+            f" c 水平旋回{MANEUVER_LAPS}周  8 8の字  u 上昇旋回({MANEUVER_LAPS}周→{CLIMB_TURN_ALT_M:.1f}m→{MANEUVER_LAPS}周) "
+            f"v={MANEUVER_SPEED_MPS:.2f} ω={MANEUVER_YAW_RATE_DPS:+.0f} r~1.5m ※GUIDED中",
             " x 送信停止   w/s 前後   a/d 左右   0 速度ゼロ   r/f 目標高度   q 終了",
+            f" o ここをフェンス中心に (離陸後)   ★ {DEADMAN_S:.1f}s 操作が無いと速度は自動で 0",
             " S 地上局の状態   D 生データ表示   Z 統計クリア   C CSV出力ON   ? ヘルプ",
             " ★ w/a/s/d は機体座標 (機首向き基準)。緊急停止はプロポ。",
+            " ★ 旋回中にヨースティックへ触れると機体側が即中断する (安全網)。",
             " ★ PIDリセット/IMU校正/デバイス確認は ble_monitor.py (BLE) へ移動しました。",
         ]
     else:

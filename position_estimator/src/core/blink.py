@@ -206,6 +206,15 @@ class BlinkTracker:
             cv2.putText(frame, f"{t.score:.2f}/{t.depth:.0f}", (u + 8, v + 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
+    def best(self):
+        """ログ用: いちばんスコアの高いトラックの (score, depth)。トラックが無ければ (0, 0)。
+        「候補はあるのに黄色にならない」とき、score が低い (点滅が潰れている) のか
+        depth が低い (LED が暗い/小さい) のかをログから切り分けるため。"""
+        if not self._tracks:
+            return 0.0, 0.0
+        t = max(self._tracks, key=lambda t: t.score)
+        return t.score, t.depth
+
     def reset(self):
         self._tracks = []
         self._last_ts = None

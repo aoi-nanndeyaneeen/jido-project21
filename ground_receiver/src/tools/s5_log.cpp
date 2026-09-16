@@ -73,7 +73,7 @@ static const char CSV_HEADER[] =
     "rx_ms,t_ms,seq,lost,rssi,frame,"
     "mode,alt_state,armed,flow_ok,range_ok,range_valid,"
     "alt_en,alt_act,pos_hold,airborne,dry_run,sat,tx_drop,"
-    "guided,cmd_fresh,landed,"
+    "guided,cmd_fresh,landed,maneuver,frame_ok,"
     "thr,bad,"
     "roll,pitch,yaw,"
     "range_h,range_raw,alt_hold,climb,alt_vzt,alt_corr,alt_thr,"
@@ -139,7 +139,7 @@ static String rx_line;
 //  上りコマンド (PC -> ここ -> IM920 -> 機体)
 // ------------------------------------------------------------
 //  PC (position_estimator) が USB へ 1 行ずつ投げてくる:
-//      CMD,<req>,<vx_mmps>,<vy_mmps>,<alt_cm>,<yaw_rate_cdps>,<flags>[,<corr_n_mm>,<corr_e_mm>]
+//      CMD,<req>,<vx_mmps>,<vy_mmps>,<alt_cm>,<yaw_rate_cdps>,<flags>[,<corr_n_mm>,<corr_e_mm>[,<yaw_abs_cdeg>[,<laps>]]]
 //  ここは最新値を mailbox に持ち、**届いた次のループで即** 無線へ流す。
 //  PC はカメラのフレームレートで送ってきてよい (最新値だけが生き残る)。
 //
@@ -317,7 +317,7 @@ static void emitData(uint32_t rx_ms, uint32_t t_ms, uint8_t seq, int fresh) {
         "DATA,%lu,%lu,%u,%lu,%d,%d,"
         "%u,%u,%d,%d,%d,%d,"
         "%d,%d,%d,%d,%d,%d,%d,"
-        "%d,%d,%d,"
+        "%d,%d,%d,%d,%d,"
         "%.3f,%u,"
         "%.2f,%.2f,%.1f,"
         "%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,"
@@ -338,6 +338,7 @@ static void emitData(uint32_t rx_ms, uint32_t t_ms, uint8_t seq, int fresh) {
         flg(f, S5T::F_POS_HOLD), flg(f, S5T::F_AIRBORNE),
         flg(f, S5T::F_DRY_RUN), flg(f, S5T::F_SAT), flg(f, S5T::F_TX_DROP),
         flg(f, S5T::F_GUIDED), flg(f, S5T::F_CMD_FRESH), flg(f, S5T::F_LANDED),
+        flg(f, S5T::F_MANEUVER), flg(f, S5T::F_FRAME_OK),
         a.thr / 250.0f, (unsigned)b.bad,
         a.roll_cd / S5T::SC_CDEG, a.pitch_cd / S5T::SC_CDEG,
         a.yaw_dd / S5T::SC_DDEG,
@@ -525,8 +526,8 @@ static void printHelp() {
     Serial.println("#   d : IM920 の生の行をそのまま表示 (リンクの切り分け用)");
     Serial.println("#   z : 統計クリア");
     Serial.println("#   h : このヘルプ");
-    Serial.println("#   CMD,req,vx_mmps,vy_mmps,alt_cm,yawrate[,flags[,corrN,corrE]] : 上りコマンド");
-    Serial.println("#       req 0=IDLE 1=HOLD 2=TAKEOFF 3=GUIDED 4=LAND 5=ABORT");
+    Serial.println("#   CMD,req,vx_mmps,vy_mmps,alt_cm,yawrate[,flags[,corrN,corrE[,yawabs[,laps]]]] : 上りコマンド");
+    Serial.println("#       req 0=IDLE 1=HOLD 2=TAKEOFF 3=GUIDED 4=LAND 5=ABORT 6=CIRCLE 7=FIGURE8 8=CLIMB");
     Serial.println("#       届いた順に無線へ流す (最短 125ms 間隔)。1.5秒来なければ送信停止");
     Serial.printf ("#   ver=%u  A=%u B=%u D=%u P=%u byte (+checksum4 = %u, IM920sL上限 %u)\n",
                    (unsigned)S5T::VERSION,
@@ -700,10 +701,10 @@ static void handleLine(String& line) {
 // ------------------------------------------------------------
 static void handleCmdLine(char* line) {
     n_cmd_lines++;
-    long v[9];
+    long v[10];
     int  n = 0;
     char* p = line + 4;              // "CMD," の次から
-    while (n < 9 && *p) {
+    while (n < 10 && *p) {
         char* end = nullptr;
         v[n] = strtol(p, &end, 10);
         if (end == p) break;          // 数字が無い
@@ -730,6 +731,8 @@ static void handleCmdLine(char* line) {
     cmd_box.corr_n_mm     = (int16_t)constrain((n >= 8) ? v[6] : 0, -32768, 32767);
     cmd_box.corr_e_mm     = (int16_t)constrain((n >= 8) ? v[7] : 0, -32768, 32767);
     cmd_box.yaw_abs_cdeg  = (int16_t)constrain((n >= 9) ? v[8] : 0, -32768, 32767);
+    cmd_box.laps          = (uint8_t)constrain((n >= 10) ? v[9] : 0, 0, 255);
+    cmd_box.rsv           = 0;
     cmd_have       = true;
     cmd_dirty      = true;            // 次に蓋が開いた瞬間に出す
     cmd_last_pc_ms = millis();

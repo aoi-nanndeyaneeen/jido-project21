@@ -60,14 +60,28 @@ class FlightLogger(CsvLogger):
     HEADER = ["Epoch_s", "Time", "Detected",
               "Pos_X(m)", "Pos_Y(m)", "Pos_Z(m)", "Residual(m)",
               "N_Cand1", "N_Cand2", "U1", "V1", "U2", "V2",
-              "Pair_Rejected", "In_Dummy"]
+              "Pair_Rejected", "In_Dummy",
+              # ★ 2026-09-16: 両カメラで点滅確認できているのに位置が出ない
+              #   ときの理由 (residual / gate / reach) と、最も惜しかった
+              #   ペアの三角測量結果。これが無いと「基準5点の座標が
+              #   フィールド寸法と食い違っていた」ような不具合をログから
+              #   切り分けられない。
+              "Reject_Why", "Reject_X(m)", "Reject_Y(m)", "Reject_Z(m)",
+              "Reject_Residual(m)",
+              # 各カメラの最良トラックのロックインスコア (6Hz成分の割合, 0-1) と
+              # 変調深さ (輝度の標準偏差)。黄色 (確定) の条件は
+              # score>=BLINK_MIN_SCORE かつ depth>=BLINK_MIN_DEPTH。
+              "Blink1_Score", "Blink1_Depth", "Blink2_Score", "Blink2_Depth"]
 
     def __init__(self, log_path: Path):
         super().__init__(log_path, self.HEADER, mode="a")
 
     def write(self, P_vec, residual, n_cand1, n_cand2, uv1, uv2,
-              pair_rejected, in_dummy):
-        """毎フレーム呼ぶ。P_vec=None なら未検知として記録"""
+              pair_rejected, in_dummy, reject=None,
+              blink1=(0.0, 0.0), blink2=(0.0, 0.0)):
+        """毎フレーム呼ぶ。P_vec=None なら未検知として記録。
+        reject は PairSelector.last_reject = (理由, P, residual) か None。
+        blink1/blink2 は BlinkTracker.best() の (score, depth)。"""
         epoch, hms = self._stamp()
         row = [epoch, hms, int(P_vec is not None)]
         if P_vec is not None:
@@ -79,6 +93,12 @@ class FlightLogger(CsvLogger):
                 _f(uv1[0], 1) if uv1 else "", _f(uv1[1], 1) if uv1 else "",
                 _f(uv2[0], 1) if uv2 else "", _f(uv2[1], 1) if uv2 else "",
                 int(bool(pair_rejected)), int(bool(in_dummy))]
+        if reject is not None:
+            why, Pr, rr = reject
+            row += [why, _f(Pr[0]), _f(Pr[1]), _f(Pr[2]), _f(rr)]
+        else:
+            row += ["", "", "", "", ""]
+        row += [_f(blink1[0]), _f(blink1[1], 1), _f(blink2[0]), _f(blink2[1], 1)]
         self._writer.writerow(row)
         self._fh.flush()
 

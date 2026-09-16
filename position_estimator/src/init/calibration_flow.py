@@ -111,7 +111,7 @@ def _report_reprojection(label, object_points, image_points, K, dist, rvec, tvec
     if mean_px > REPROJ_FAIL_PX:
         print(f"           → 点{worst+1} が最も外れています ({per_point[worst]:.1f} px)")
         print("           → まずクリック順序と config の3D座標を疑ってください")
-        print("             順序: 手前左 → 手前右 → 奥右 → 奥左 → 4番の真上")
+        print("             順序: 手前左 → 手前右 → 奥右 → 奥左 → 4番(奥左)の真上")
     return mean_px
 
 
