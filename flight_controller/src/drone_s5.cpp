@@ -238,6 +238,7 @@ static void updateGuided() {
     in.stick_roll  = v.sbus.des[Ch::ROLL];
     in.stick_pitch = v.sbus.des[Ch::PITCH];
     in.stick_yaw   = v.sbus.des[Ch::YAW];
+    in.yaw_est_deg = v.heading.est();
     v.guided.update(in, v.s5rx, v.poshold, v.heading);
 }
 

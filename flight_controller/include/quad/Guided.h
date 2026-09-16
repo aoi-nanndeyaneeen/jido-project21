@@ -67,6 +67,7 @@ public:
         float stick_roll;     // sbus.des 生値 (符号適用前)
         float stick_pitch;
         float stick_yaw;
+        float yaw_est_deg;    // HeadingHold::est() (機体の実測ヨー。機動の周回判定に使う)
     };
 
     // ------------------------------------------------------------
@@ -78,6 +79,7 @@ public:
     void update(const Inputs& in, const S5C::Rx& rx, PositionHold& poshold, HeadingHold& heading) {
         if (!GUIDED_ENABLE) { _engaged = false; _gp = GP_OFF; return; }
         const uint32_t now = in.now_ms;
+        _yaw_est_deg = in.yaw_est_deg;   // 機動の周回判定 (Maneuver::update) が使う
 
         // --- 0) 入る資格があるか (毎回全部見る) ----------------------
         if (!in.armed) { disengage("ディスアーム"); _landed_latch = false; return; }
@@ -143,8 +145,10 @@ public:
             //   「ウェイポイントまでは地上局、そこから先は機体単独」の要。開始した
             //   瞬間の目標を Maneuver が持ったまま、新しいコマンドを待たずに進む。
             //   地上局が明示的に HOLD/ABORT/LAND を送ってくれば、新鮮な間だけ即反映。
-            //   進行は Maneuver が「指令ヨーレート × 経過時間」で機体の時計だけで数える。
-            _maneuver.update(now);
+            //   進行は Maneuver が「実測ヨーの積分」で数える (2026-09-17。機体が実際に 360°
+//   回るまで脚を終えないので、立ち上がりや揺れで円が閉じきる前に完了扱いになる
+//   のを防ぐ。回れないときのために脚ごとの時間上限あり。Maneuver.h 参照)。
+            _maneuver.update(now, _yaw_est_deg);
             _vx    = _maneuver.fwd();
             _vy    = 0.0f;
             _alt_m = _maneuver.altTarget();   // CLIMB_TURN は進行に合わせて動く
@@ -357,6 +361,7 @@ private:
 
     bool    _yaw_corr_seq_init = false;
     uint8_t _yaw_corr_last_seq = 0;
+    float   _yaw_est_deg = 0.0f;   // 直近の実測ヨー (update で control 側から受ける)
 };
 
 } // namespace Quad

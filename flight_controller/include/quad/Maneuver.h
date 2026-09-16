@@ -69,6 +69,10 @@ public:
         _n_legs = 0;
         _leg    = 0;
         _turned = 0.0f;
+        _turned_meas = 0.0f;
+        _have_yaw = false;
+        _prev_yaw = 0.0f;
+        _leg_start_ms = now_ms;
         _prev_ms = now_ms;
         _done    = false;
 
@@ -98,14 +102,44 @@ public:
     }
 
     // 毎ループ呼ぶ。全脚を消化したら done() が立つ。
-    void update(uint32_t now_ms) {
+    //   yaw_meas_deg : 機体の実測ヨー (HeadingHold::est()。アーム基準の相対方位)。
+    //
+    // ★ 2026-09-17: 周回の判定を「指令レート × 経過時間」から「実測ヨーの積分」に
+    //   変えた。旧方式は _rate_abs*dt を積算していたので、機体が指令レートに追いつく
+    //   前 (立ち上がり) や外乱で遅れたぶんを数えず、**円が閉じきる前に完了扱い**に
+    //   なっていた (2026-09-16: 水平旋回2周で指令720°に対し実測609°=1.69周。判定不成立)。
+    //   実測ヨーの絶対増分を積むことで、機体が実際に 360° 回るまで脚を終えない。
+    //
+    // ★ 「実測で数えると外乱で振られたぶんも進んだ扱いになり円が閉じない」という旧
+    //   コメントの懸念は、意図した一定レートの旋回では deliberate 成分が支配的なので
+    //   小さい。暴走 (回れないのに永久に続く) を防ぐため、脚ごとに時間上限を持たせる:
+    //   その脚の想定時間 (360/_rate_abs) の LEG_TIME_CAP 倍を超えたら、実測が 360 に
+    //   届いていなくても打ち切って次の脚へ進む。
+    void update(uint32_t now_ms, float yaw_meas_deg) {
         if (!active()) return;
         const float dt = (now_ms - _prev_ms) * 1e-3f;
         _prev_ms = now_ms;
-        _turned += _rate_abs * dt;
-        if (_turned >= 360.0f) {
+
+        _turned += _rate_abs * dt;              // 指令基準 (表示 progressDeg / doneDeg 用に残す)
+
+        // 実測ヨーの絶対増分を積む (±180 で折り返しを畳む。8の字の反転も abs で吸収)
+        if (_have_yaw) {
+            float d = yaw_meas_deg - _prev_yaw;
+            while (d >  180.0f) d -= 360.0f;
+            while (d < -180.0f) d += 360.0f;
+            _turned_meas += fabsf(d);
+        }
+        _prev_yaw = yaw_meas_deg;
+        _have_yaw = true;
+
+        const float leg_s   = (_rate_abs > 1.0f) ? 360.0f / _rate_abs : 1e9f;
+        const bool  closed  = _turned_meas >= 360.0f;                       // 実際に1周した
+        const bool  timeout = (now_ms - _leg_start_ms) * 1e-3f >= leg_s * LEG_TIME_CAP;
+        if (closed || timeout) {
             _leg++;
-            _turned -= 360.0f;   // 端数を次の脚へ持ち越す (次の脚の開始角がずれないように)
+            _turned      -= 360.0f;             // 端数を次の脚へ持ち越す (指令基準)
+            _turned_meas  = (closed && _turned_meas > 360.0f) ? _turned_meas - 360.0f : 0.0f;
+            _leg_start_ms = now_ms;
             if (_leg >= _n_legs) _done = true;
         }
     }
@@ -121,23 +155,29 @@ public:
     float fwd()     const { return active() ? _fwd : 0.0f; }                 // 機体座標 前+ [m/s]
     float yawRate() const { return active() ? cur().sign * _rate_abs : 0.0f; } // [deg/s]
     // 目標高度 [m]。上昇脚では進行に比例して開始→終了へ直線で動く。
+    //  ★ 進行の割合は実測ヨー基準 (_turned_meas)。機体が物理的に回った分だけ高度を
+    //    動かす (指令基準だと、機体がまだ回っていないのに高度だけ先に上がってしまう)。
     float altTarget() const {
         if (_n_legs == 0) return 0.0f;
         const Leg& L = _done ? _legs[_n_legs - 1] : cur();
         if (_done) return L.alt1;
-        const float f = constrain(_turned / 360.0f, 0.0f, 1.0f);
+        const float f = constrain(_turned_meas / 360.0f, 0.0f, 1.0f);
         return L.alt0 + (L.alt1 - L.alt0) * f;
     }
 
     // ---- 表示 / テレメトリ ----
-    float progressDeg() const { return _turned; }
+    float progressDeg() const { return _turned_meas; }        // 今の脚で実測した回転 [deg]
     int   leg()         const { return _leg; }
     int   legs()        const { return _n_legs; }
     float totalDeg()    const { return 360.0f * _n_legs; }
-    float doneDeg()     const { return 360.0f * _leg + _turned; }
+    float doneDeg()     const { return 360.0f * _leg + _turned_meas; }   // 実測基準の総進行
     bool  climbing()    const { return active() && cur().alt0 != cur().alt1; }
 
 private:
+    // 脚ごとの時間上限 = 想定時間 (360/rate) の何倍まで許すか。回れないのに永久に
+    // 回り続けるのを防ぐ安全弁。1.6 なら想定 12s の脚を最大 19s で打ち切る。
+    static constexpr float LEG_TIME_CAP = 1.6f;
+
     struct Leg { float sign; float alt0; float alt1; };
 
     void addLeg(float sign, float a0, float a1) {
@@ -152,7 +192,11 @@ private:
     Leg      _legs[MAX_LEGS] = {};
     int      _n_legs   = 0;
     int      _leg      = 0;
-    float    _turned   = 0.0f;
+    float    _turned   = 0.0f;      // 指令基準の積算 [deg] (表示・端数持ち越し用)
+    float    _turned_meas = 0.0f;   // 実測ヨーの積算 [deg] (完了判定・高度補間はこちら)
+    bool     _have_yaw = false;
+    float    _prev_yaw = 0.0f;
+    uint32_t _leg_start_ms = 0;     // 今の脚の開始時刻 (時間上限用)
     uint32_t _prev_ms  = 0;
 };
 
