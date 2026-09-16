@@ -22,12 +22,15 @@
         ③ 30フレーム未検出でダミー円軌道にフォールバック
                     │
                     ▼
-         [core/autopilot.py] SquarePatrol
-         位置PIDで四角形パトロールのRCコマンド算出
+         [core/yaw_source.py] YawArbiter   機首方位 ("camera" / "fixed") を決める
                     │
                     ▼
-      ui/view_rc.py で操縦スティックを可視化（現状は表示のみ）
+         [core/mission.py] WaypointMission   位置誤差 → 機体座標の目標速度 (10Hz 上限)
+                    │
+                    ▼
+         [core/s5_link.py] S5Link ──USB──> 地上局 ──IM920──> 機体 (setpoint だけを送る)
 ```
+※ 全体の周期と流れは [../SYSTEM_FLOW.md](../SYSTEM_FLOW.md)。
 
 ## 📁 ディレクトリ構成
 
@@ -39,38 +42,45 @@ position_estimator/
 ├── graph.py                 # 保存済みCSVから飛行軌跡を可視化するスクリプト
 ├── calib/                   # 保存済みキャリブレーションデータ（JSON）
 ├── logs/                    # フライトログ（CSV）
-├── used/                    # 過去の可視化コードなど、現行フローでは未使用のレガシー置き場（例: view_3d.py）
+├── used/                    # 使わなくなったコード置き場 (autopilot.py / controller.py / communication.py 等。used/README.md)
 ├── tools/                   # 単体診断・補助スクリプト群
 │   ├── make_checkerboard.py    # ★事前作業1: チェッカーボードの印刷データ(SVG)生成
 │   ├── calibrate_intrinsics.py # ★事前作業2: チェッカーボードでK/歪みを実測
 │   ├── test_cam2.py          # Camera2接続の単独診断スクリプト
 │   ├── test_remote.py        # RPiのCALIB→STREAMフロー単独テスト
 │   ├── find_camera.py        # 接続中のUSBカメラID探索
-│   ├── dummy_source.py       # カメラ/センサ代替の合成データ生成モジュール
-│   ├── receiver.py           # UDP受信の単独テスト
-│   ├── sensor_receiver.py    # 高度センサ受信の単独テスト
+│   ├── replay_detect.py      # 録画から検知を再生する
 │   └── test.py                # シリアル/カメラの雑多な動作確認スクリプト
 └── src/
     ├── main.py               # エントリーポイント（初期化～メインループ）
-    ├── test_view_rc.py       # RCスティック表示（ui/view_rc.py）の単体テスト
+    ├── console.py            # 見ながら指令を出す地上局コンソール (GROUND_CONSOLE_GUIDE.md)
+    ├── ble_monitor.py        # BLE だけで完結するデバッグツール (PID reset / IMU 校正)
+    ├── app/
+    │   └── main_loop.py       # FlightLoop: 追跡結果 → ヨー裁定 → ミッション → 可視化
     ├── core/
-    │   ├── camera.py          # ローカルUSBカメラ制御・フレーム差分検知
+    │   ├── camera.py          # ローカルUSBカメラ制御・検知
     │   ├── remote_camera.py   # RPiカメラとのソケット通信クライアント
-    │   ├── tracker.py         # 3D位置推定スレッド（ジャンプフィルタ・ダミーフォールバック含む）
+    │   ├── blink.py           # LED 点滅 (6Hz) のロックイン判定
+    │   ├── tracker.py         # 3D位置推定スレッド（ペア選択・ダミーフォールバック含む）
     │   ├── geometry.py        # レイキャスト・三角測量・座標変換
-    │   ├── autopilot.py       # 位置PIDによる四角形パトロール（SquarePatrol）
     │   ├── dummy_flight.py    # カメラ未検出時の仮想円軌道
-    │   ├── controller.py      # 高度制御PID（シリアル送信用）
-    │   └── communication.py   # RP2040とのシリアル通信（高度・加速度受信）
+    │   ├── yaw_estimator.py   # カメラΔv × 機体Δv のヨー推定
+    │   ├── yaw_source.py      # ミッションに渡す機首方位の裁定 ("camera"/"fixed")
+    │   ├── mission.py         # ウェイポイント飛行の状態機械 (外側位置ループ 10Hz)
+    │   ├── maneuver.py        # 定型機動 (旋回/8の字/上昇旋回) の送り方
+    │   ├── s5_link.py         # 地上局 XIAO との USB リンク (受信スレッド + CMD 送信 + CSV)
+    │   ├── s5_protocol.py     # ★自動生成 (../protocol/gen_py_protocol.py)。REQ_*/CF_*/MODE 名
+    │   └── ble_tap.py         # log_recorder からの BLE 125Hz ログ受信
     ├── ui/
     │   ├── dashboard.py       # 高度・XYグラフ表示ウィンドウ
-    │   ├── view_graph.py      # matplotlibグラフ描画
+    │   ├── view_graph.py      # グラフ描画
     │   ├── view_velocity.py   # トップビュー・速度・姿勢指示器（ADI）
-    │   └── view_rc.py         # RCスティックプレビュー（純OpenCV描画）
+    │   └── link_status.py     # 無線リンクの診断画面
     └── utils/
         ├── config.py          # 全パラメータ設定
         ├── calib_store.py     # キャリブレーション結果のJSON保存・復元
-        └── logger.py          # CSVフライトログ
+        ├── screen.py          # 流れない端末表示
+        └── logger.py          # CSV ログ (flight / mission / console)
 ```
 
 ## 🛠️ セットアップ
@@ -281,11 +291,17 @@ python tools/calibrate_intrinsics.py --label Camera1 --source 1 --cols 7 --rows 
 
 ## 🤖 オートパイロット（現状）
 
-`core/autopilot.py` の `SquarePatrol` が、高度3m・1辺6mの正方形を反時計回りに周回するウェイポイントを生成し、位置PIDでRCコマンド（throttle/pitch/roll/yaw）を算出します。
+PC は **setpoint (機体座標の目標速度と目標対地高度) だけ** を機体へ送る (`core/mission.py`)。
+姿勢やスロットルは一切計算しない。IM920sL の往復遅延 (100〜200ms) を姿勢ループに持ち込むと
+発振する、リンク断で「最後の傾け指令」が残る、の 2 点から旧方式 (`used/autopilot.py` の
+位置PID → RCコマンド) は廃止した (詳細は [../WAYPOINT_BRINGUP.md](../WAYPOINT_BRINGUP.md) §0)。
 
-機首方向は `core/yaw_estimator.py` のカメラ由来ヨー推定を使います（下記）。**速度ベクトルからは推定しません** — クアッドは真横にも真後ろにも飛べるため進行方向と機首方向が一致せず、取り違えると位置制御ループが正帰還になるためです。ヨー未確定のあいだは、アーム時の初期アラインメント値（`YAW_INITIAL_ALIGN_DEG`）を保持します。
-
-> ⚠️ **飛行前にベンチで指令の符号を確認してください。** 機体を手で持ち、目標を機首の右に置いたとき右へバンクするか、前に置いたとき機首が下がるかを目視確認します。詳細は `autopilot.py` の `SIGN_ROLL_FOR_RIGHT` / `SIGN_PITCH_FOR_FORWARD` のコメント参照。
+- `WaypointMission` が ARMING → TAKEOFF → CRUISE/DWELL (×WP) → (MANEUVER) → 帰投 → LAND → DONE
+  の順で進み、`SEND_HZ` (10Hz 上限) で `REQ_*` を地上局へ送る。
+- 機首方向は `core/yaw_source.py` が決める。カメラ由来ヨー推定 (`core/yaw_estimator.py`) が
+  収束していて機体のジャイロヨーと矛盾しなければそれを使い、そうでなければ機体のジャイロヨー
+  + 初期アラインメント (`YAW_INITIAL_ALIGN_DEG`) を使う。**速度ベクトルからは推定しない**。
+- 状態機械は `tests/test_mission_sim.py` の模擬機体で通せる (`python -m unittest tests.test_mission_sim`)。
 
 ## 🧭 ヨー方位推定
 
@@ -419,6 +435,18 @@ PID reset / IMU再キャリブレーション / デバイス確認 (I2C再走査
 | `max_candidates` | 各カメラが1フレームに返す候補の最大数 |
 | `use_background_subtractor` / `bg_*` | MOG2背景差分の設定。`bg_learning_rate` はほぼ0にする |
 | `vibration_reject_ratio` | 前景がこの割合を超えたフレームを丸ごと破棄 |
+| `detect_mode` / `bright_*` / `static_mask_*` | 輝度しきい値検知 (機体LED用) と静的輝点マスク。詳細はファイル内の `_comment_*` |
+| `camera_overrides` | **カメラ別の上書き** (キーは `Camera1` など)。PC側だけが読み、RPi側 (Camera2) には効かない。Camera1 (α6400) は遠方のLEDが3px角しか無いので、ぼかし・オープニングを切りしきい値を下げてある |
+
+点滅判定 (`core/blink.py`) のカメラ別係数は `config.BLINK_CAMERA_OVERRIDES`。
+
+**録画で検知を確認する**: Camera1 窓の画面録画やカメラの生映像を、実機を立ち上げずに同じ検知系へ流して検知率を出せます。しきい値を触ったら必ずこれで確認してください。
+
+```bash
+python tools/replay_detect.py "tests/画面録画 2026-09-16 164847.mp4"          # 10m 先の機体 (回帰テストにもなっている)
+python tools/replay_detect.py <video> --truth 527,384 --out annotated.mp4      # 候補を描いた動画を書き出す
+python tools/replay_detect.py <raw.mp4> --crop none --ignore none --truth ""   # カメラの生映像
+```
 
 ## 📌 今後の課題
 
@@ -441,23 +469,28 @@ src/main.py
   │      ├─→ utils/calib_store.py   (save/load/ask_use_saved)
   │      └─→ utils/config.py
   │
-  ├─→ app/main_loop.py
+  ├─→ app/main_loop.py  (FlightLoop)
   │      ├─→ core/tracker.py        (camera_thread_func)
-  │      │      ├─→ core/geometry.py       (get_ray, intersect_rays)
+  │      │      ├─→ core/blink.py          (BlinkTracker)
+  │      │      ├─→ core/geometry.py       (intersect_rays)
   │      │      ├─→ core/dummy_flight.py   (DummyFlight)
   │      │      └─→ utils/logger.py        (FlightLogger)
   │      │
-  │      ├─→ core/controller.py     (AltitudeController)
-  │      ├─→ core/autopilot.py      (SquarePatrol, RCCommand)
-  │      ├─→ core/geometry.py       (accel_to_angles)
+  │      ├─→ core/yaw_estimator.py  (YawEstimator)
+  │      ├─→ core/yaw_source.py     (YawArbiter)
+  │      ├─→ core/mission.py        (WaypointMission)
+  │      │      ├─→ core/maneuver.py       (ManeuverRunner)
+  │      │      └─→ core/s5_link.py        (REQ_* / CF_* ← core/s5_protocol.py)
+  │      ├─→ core/s5_link.py        (S5Link)
+  │      ├─→ core/ble_tap.py        (BleTap)
   │      │
   │      ├─→ ui/dashboard.py
   │      │      └─→ ui/view_graph.py
   │      ├─→ ui/view_velocity.py
-  │      └─→ ui/view_rc.py
-  │             └─→ core/autopilot.py  (RCCommand 型のみ参照)
+  │      ├─→ ui/link_status.py
+  │      └─→ utils/screen.py
   │
-  └─→ core/communication.py         (SerialReceiver、SERIAL_ENABLED時のみ)
+  └─→ (used/ 以下は現行フローから参照されない)
 ```
 
 ### レイヤーごとの役割

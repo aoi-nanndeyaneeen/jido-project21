@@ -30,13 +30,8 @@ from utils.config      import (MAX_RESIDUAL_M,
                                 GATE_X, GATE_Y, GATE_Z,
                                 TRACK_COAST_SEC,
                                 TRACK_MAX_SPEED_MPS,
-                                BLINK_DETECT_ENABLED,
                                 LED_BLINK_HZ,
-                                BLINK_MATCH_DIST_PX,
-                                BLINK_ROI_PX,
-                                BLINK_HISTORY_SEC,
-                                BLINK_MIN_SCORE,
-                                BLINK_MIN_DEPTH)
+                                blink_params_for)
 
 
 def _in_gate(P) -> bool:
@@ -133,20 +128,19 @@ def camera_thread_func(cam1, cam2,
 
     selector = PairSelector()
 
-    blink1, blink2 = (
-        BlinkTracker(cam.label, LED_BLINK_HZ,
-                     match_dist_px=BLINK_MATCH_DIST_PX,
-                     roi_px=BLINK_ROI_PX,
-                     history_sec=BLINK_HISTORY_SEC,
-                     min_score=BLINK_MIN_SCORE,
-                     min_depth=BLINK_MIN_DEPTH,
-                     enabled=BLINK_DETECT_ENABLED)
-        for cam in (cam1, cam2))
+    # 点滅判定の係数はカメラ別 (config.BLINK_CAMERA_OVERRIDES)。
+    blink1, blink2 = (BlinkTracker(cam.label, LED_BLINK_HZ, **blink_params_for(cam.label))
+                      for cam in (cam1, cam2))
 
     no_detect_count = 0
     in_dummy_mode   = False
     frame_count     = 0
     perf_print_time = time.time()
+
+    # ★ 2026-09-16: 毎フレーム print() していた頃は端末が流れて今の状態が
+    #   読めなかった。呼び出し元 (main_loop.py) が shared["say"] を置いていれば
+    #   そちらのメッセージ欄へ、無ければ (単体テストなど) 従来どおり print。
+    say = shared.get("say", print)
 
     print(f"[Tracker] 開始 - ログ: {log_path}")
     for camera in (cam1, cam2):
@@ -223,16 +217,16 @@ def camera_thread_func(cam1, cam2,
 
                 if P_vec is not None:
                     if in_dummy_mode:
-                        print("[Tracker] Camera detected again → REAL mode")
+                        say("[Tracker] Camera detected again → REAL mode")
                         in_dummy_mode = False
                     no_detect_count = 0
                 else:
                     no_detect_count += 1
                     if no_detect_count >= DUMMY_FALLBACK_FRAMES:
                         if not in_dummy_mode:
-                            print(f"[Tracker] No detection for {DUMMY_FALLBACK_FRAMES} frames"
-                                  f" → DUMMY mode (r={DUMMY_ORBIT_RADIUS}m "
-                                  f"alt={DUMMY_ORBIT_ALT}m)")
+                            say(f"[Tracker] No detection for {DUMMY_FALLBACK_FRAMES} frames"
+                                f" → DUMMY mode (r={DUMMY_ORBIT_RADIUS}m "
+                                f"alt={DUMMY_ORBIT_ALT}m)")
                             in_dummy_mode = True
                             dummy.reset()
                         P_vec    = dummy.get_position()
@@ -266,9 +260,6 @@ def camera_thread_func(cam1, cam2,
                           blink1=blink1.best(), blink2=blink2.best())
 
                 frame_count += 1
-                if frame_count % 300 == 0:
-                    log_status = "DUMMY" if in_dummy_mode else "REAL"
-                    print(f"[Tracker] {frame_count}フレーム処理済み（{log_status}）")
 
                 # ── 背景リセット ─────────────────────────────────
                 if shared.get("do_bg_reset", False):
@@ -278,7 +269,7 @@ def camera_thread_func(cam1, cam2,
                     selector.reset()   # 追従の基準位置もリセット
                     blink1.reset()
                     blink2.reset()
-                    print("[Tracker] Background reset")
+                    say("[Tracker] Background reset")
 
                 # ── plot_data 更新 ────────────────────────────────
                 with plot_lock:
@@ -316,14 +307,22 @@ def camera_thread_func(cam1, cam2,
                     "ReadErrors2": stats2.get("reader_errors", 0.0),
                 }
                 perf_log.write("tracker", perf_values)
+
+                # ── 状態画面用のスナップショット ─────────────────
+                #  ★ 以前はここで [PERF] tracker を2秒おきに print していたが、
+                #    端末が流れて読めなかった。main_loop.py の状態画面が
+                #    shared["tracker_status"] を毎フレーム読んで上書き表示する。
+                shared["tracker_status"] = {
+                    "frame_count": frame_count,
+                    "n_cand1": len(cands1), "n_cand2": len(cands2),
+                    "blink1": blink1.best(), "blink2": blink2.best(),
+                    "cam1_ms": cam1_ms, "cam2_ms": cam2_ms,
+                    "loop_ms": perf_values["Loop_ms"],
+                    "reader_fps1": perf_values["ReaderFPS1"],
+                    "reader_fps2": perf_values["ReaderFPS2"],
+                }
+
                 if time.time() - perf_print_time >= 2.0:
-                    print("[PERF] tracker "
-                          f"loop={perf_values['Loop_ms']:.1f}ms "
-                          f"cam1={cam1_ms:.1f}ms cam2={cam2_ms:.1f}ms "
-                          f"age=({perf_values['FrameAge1_ms']:.1f},"
-                          f"{perf_values['FrameAge2_ms']:.1f})ms "
-                          f"reader=({perf_values['ReaderFPS1']:.1f},"
-                          f"{perf_values['ReaderFPS2']:.1f})fps")
                     perf_print_time = time.time()
                     for cam, st in ((cam1, stats1), (cam2, stats2)):
                         fn = getattr(cam, "recheck_exposure", None)

@@ -69,8 +69,17 @@ LOCK_EXPOSURE_AFTER_CALIB = True
 #     -7       : 30fps /  498 / 11
 #   None だと自動露出が室内で選んだ -4 のまま固定され、16fps + 長露出で
 #   点滅の振幅が潰れ、地上で静止した機体でも Camera1 が検知を落とし続けた。
-#   LED が小さく/暗く写って候補が出なくなるなら -5 に戻す。
-TRACKING_EXPOSURE = -6
+#
+# ★ 2026-09-16: -6 -> -5。実測フィールド (6m x 9m) の対角奥 (Camera1から
+#   約10〜14m) で Camera1 だけ検知できず、Camera2 (RPi, 自動露出のまま)
+#   はできる件を調査 (camera_server.py 2026-09-16のコメント参照)。
+#   LEDの実光量は距離の2乗で落ちるため、-6 まで絞ると近距離でしか
+#   bright_threshold(230) を超えなくなっていた。-5 で約2倍明るくして
+#   奥まで届かせる。近距離で拾うクラッタが増える分は、static bright mask
+#   と 6Hz 点滅ロックイン (core/blink.py) 側で弾く前提
+#   (= 「点滅で確定する」を最終フィルタとして信用する)。
+#   これでも奥が拾えない/近距離の誤検知が増えすぎるなら次は -4 を試すこと。
+TRACKING_EXPOSURE = -5
 
 # α6400 は USB 出力だと OpenCV から露出制御できない場合が多い。
 # その場合はカメラ本体を M モード + MF に設定しておくこと（準備時間は増えない）。
@@ -509,7 +518,7 @@ MISSION_YAW_PROBE_VEL = 0.15
 #  False: [M] キーを押すまで何も送らない。
 #
 #  ★ ARMING 中に送るのは REQ_HOLD だけ。機体側は未アーム／フロー不良の
-#    あいだ GUIDED に入らない (drone_s5.cpp updateGuided) ので、
+#    あいだ GUIDED に入らない (flight_controller quad/Guided.h) ので、
 #    置いてあるだけの機体が勝手に動くことはない。
 #  ★ エッジ検出にしてあるのは、GUIDED に入りっぱなしの間 (例: 着陸直後、
 #    まだ THR_CUT していない) に毎フレーム start() を呼んで、着陸完了の
@@ -666,7 +675,11 @@ _DEFAULT_DETECTION = {
 
 
 def load_detection_params(path: Path = _DETECTION_JSON) -> dict:
-    """detection_params.json を読む。無い/壊れている場合は既定値で続行する。"""
+    """detection_params.json を読む。無い/壊れている場合は既定値で続行する。
+
+    戻り値は共通パラメータ。カメラ別の上書き ("camera_overrides") は
+    DETECTION_CAMERA_OVERRIDES に分けて持ち、detection_params_for() で合成する。
+    """
     params = dict(_DEFAULT_DETECTION)
     try:
         with open(path, encoding="utf-8") as f:
@@ -681,6 +694,20 @@ def load_detection_params(path: Path = _DETECTION_JSON) -> dict:
 
 
 DETECTION = load_detection_params()
+
+# ★ カメラ別の上書き。Camera1 (α6400, 遠方の LED が数 px) と Camera2 (RPi) は
+#   レンズも露出も違うので、しきい値・ぼかし・面積の係数を揃えないほうがよい
+#   (2026-09-16: 10m 先の機体を Camera1 だけ検知できなかった)。
+#   RPi 側 camera_server.py はこのキーを読まないので Camera2 には影響しない。
+DETECTION_CAMERA_OVERRIDES = DETECTION.pop("camera_overrides", {}) or {}
+
+
+def detection_params_for(label: str) -> dict:
+    """共通パラメータに、そのカメラ用の上書きを重ねたものを返す。"""
+    params = dict(DETECTION)
+    params.update({k: v for k, v in DETECTION_CAMERA_OVERRIDES.get(label, {}).items()
+                   if not k.startswith("_")})
+    return params
 
 # 既存モジュールが参照している名前（後方互換）
 DIFF_THRESHOLD = DETECTION["diff_threshold"]
@@ -738,3 +765,32 @@ BLINK_ROI_PX         = 8       # 輝度を測る ROI の半径 [px] (17x17)
 BLINK_HISTORY_SEC    = 1.2     # ロックインの窓 [s]。長いほど確実だが確定が遅い
 BLINK_MIN_SCORE      = 0.5     # 分散のうち 6Hz 成分の割合の下限 (矩形波で約0.81)
 BLINK_MIN_DEPTH      = 1.5     # ROI平均輝度の標準偏差の下限。静止光のノイズ相関を弾く
+
+# カメラ別の上書き (キーは BlinkTracker の引数名)。
+# ★ Camera1: 10m 先の LED は 1280x720 で 3px 角、ピーク輝度 200 程度しかない
+#   (tests/ の 2026-09-16 16:48 画面録画で実測)。半径 8 の ROI (289px) で
+#   平均すると変調が 5 階調・標準偏差 2.5 まで薄まり、min_depth=1.5 に
+#   対して余裕が無い。ROI を半径 3 (49px) に絞って変調を残す (実測 depth 35)。
+#   ホバリングの揺れは match_dist_px 側で追従するので ROI は小さくてよい。
+#   min_score は 0.5 -> 0.4。Camera1 は 16fps で 6Hz の 1 周期に 2.7 枚しか
+#   無く、取得時刻の揺らぎでスコアが 0.3〜0.9 を行き来する。0.5 だと
+#   録画で 1 秒ほど途切れる区間があった。静止した照明・反射のスコアは
+#   同じ録画で最大 0.29 (history 1.2s) なので 0.4 でも確定はしない。
+#   tools/replay_detect.py で再現できる。
+BLINK_CAMERA_OVERRIDES = {
+    "Camera1": {"roi_px": 3, "min_score": 0.4},
+}
+
+
+def blink_params_for(label: str) -> dict:
+    """BlinkTracker に渡すキーワード引数。共通値にカメラ別の上書きを重ねる。"""
+    params = {
+        "match_dist_px": BLINK_MATCH_DIST_PX,
+        "roi_px": BLINK_ROI_PX,
+        "history_sec": BLINK_HISTORY_SEC,
+        "min_score": BLINK_MIN_SCORE,
+        "min_depth": BLINK_MIN_DEPTH,
+        "enabled": BLINK_DETECT_ENABLED,
+    }
+    params.update(BLINK_CAMERA_OVERRIDES.get(label, {}))
+    return params

@@ -88,5 +88,27 @@
   "static_bright_mask": true,
   "static_mask_learn_frames": 120,
   "static_mask_ratio": 0.97,
-  "static_mask_dilate_px": 7
+  "static_mask_dilate_px": 7,
+  "_comment_camera_overrides": [
+    "カメラ別の上書き。キーは CameraTracker の label。PC 側 (src/core/camera.py) だけが",
+    "読む。RPi 側 camera_server.py はこのキーを知らないので Camera2 (RPi) には効かない。",
+    "",
+    "★ Camera1 (α6400 16mm, 1/200 F3.5 ISO100 -2.0EV): 2026-09-16 16:48 の画面録画",
+    "  (tests/, フィールド対角の約 10m に機体を静置) で調整。tools/replay_detect.py で再現できる。",
+    "  10m 先の LED は 1280x720 で 3px 角、ピーク輝度 200 程度で、共通値では 3 段階で消えていた:",
+    "    bright_threshold 230 : ピークが届かない            -> 140",
+    "    blur_kernel 5        : 5x5 でピークが 148 に落ちる   -> 1 (かけない)",
+    "    morph_kernel 5       : 5x5 オープニングで 3px は消滅 -> 1 (かけない)",
+    "    bright_min_area_px 4 : 面積は画素数で数えるようにし、孤立 1 画素だけ弾く -> 2",
+    "  しきい値を下げた分の雑音 (天井灯・OSD) は静的輝点マスクが覚え、残りは 6Hz 点滅",
+    "  ロックイン (core/blink.py, config.BLINK_CAMERA_OVERRIDES) が落とす。"
+  ],
+  "camera_overrides": {
+    "Camera1": {
+      "bright_threshold": 140,
+      "blur_kernel": 1,
+      "morph_kernel": 1,
+      "bright_min_area_px": 2
+    }
+  }
 }

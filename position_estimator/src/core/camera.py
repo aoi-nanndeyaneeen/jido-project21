@@ -14,16 +14,9 @@ from typing import NamedTuple
 import cv2
 import numpy as np
 
-from utils.config import (DETECT_MODE, BRIGHT_THRESHOLD, TRACKING_EXPOSURE,
-                         BRIGHT_MIN_AREA_PX, BRIGHT_MAX_AREA_PX,
-                         DIFF_THRESHOLD, MIN_AREA_PX, MAX_AREA_PX,
-                          BLUR_KERNEL, MORPH_KERNEL, CAMERA_FPS,
-                          MAX_CANDIDATES, USE_BG_SUBTRACTOR,
-                          BG_HISTORY, BG_VAR_THRESHOLD, BG_LEARNING_RATE,
-                          VIBRATION_REJECT_RATIO,
-                          STATIC_BRIGHT_MASK, STATIC_MASK_LEARN_FRAMES,
-                          STATIC_MASK_RATIO, STATIC_MASK_DILATE_PX,
-                          CAMERA_AUTOFOCUS, CAMERA_FOCUS_VALUE)
+from utils.config import (TRACKING_EXPOSURE, CAMERA_FPS,
+                          CAMERA_AUTOFOCUS, CAMERA_FOCUS_VALUE,
+                          DETECTION_CAMERA_OVERRIDES, detection_params_for)
 
 
 class Candidate(NamedTuple):
@@ -55,8 +48,11 @@ class StaticBrightMask:
       照明が変わったときや覚え間違えたときは [B] キーで再学習できる。
     """
 
-    def __init__(self, label: str):
+    def __init__(self, label: str, learn_frames: int, ratio: float, dilate_px: int):
         self.label = label
+        self.learn_frames = learn_frames
+        self.ratio = ratio
+        self.dilate_px = dilate_px
         self._acc = None
         self._frames = 0
         self.mask = None      # 学習完了後の除外マスク (255=除外)
@@ -67,7 +63,7 @@ class StaticBrightMask:
 
     def apply(self, bright_mask):
         """学習を進めつつ、学習済みなら静的画素を除いたマスクを返す。"""
-        if self._frames < STATIC_MASK_LEARN_FRAMES:
+        if self._frames < self.learn_frames:
             self._learn(bright_mask)
             return bright_mask
         if self.mask is None:
@@ -79,22 +75,21 @@ class StaticBrightMask:
             self._acc = np.zeros(bright_mask.shape, dtype=np.uint16)
         self._acc += (bright_mask > 0)
         self._frames += 1
-        if self._frames < STATIC_MASK_LEARN_FRAMES:
+        if self._frames < self.learn_frames:
             return
 
-        hits = int(STATIC_MASK_LEARN_FRAMES * STATIC_MASK_RATIO)
+        hits = int(self.learn_frames * self.ratio)
         mask = ((self._acc >= hits) * 255).astype(np.uint8)
-        if STATIC_MASK_DILATE_PX > 0:
+        if self.dilate_px > 0:
             k = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE,
-                (STATIC_MASK_DILATE_PX, STATIC_MASK_DILATE_PX))
+                cv2.MORPH_ELLIPSE, (self.dilate_px, self.dilate_px))
             mask = cv2.dilate(mask, k)
         self.mask = mask
         self._acc = None
 
         coverage = cv2.countNonZero(mask) / float(mask.size)
         print(f"  [{self.label}] 静的輝点マスクを学習完了 "
-              f"({STATIC_MASK_LEARN_FRAMES}フレーム, 画面の{coverage * 100:.1f}%を除外)")
+              f"({self.learn_frames}フレーム, 画面の{coverage * 100:.1f}%を除外)")
         if coverage > 0.20:
             print(f"  [{self.label}] [WARN] 除外領域が広すぎます。露出が明るすぎるか、"
                   "学習中に機体が写っていた可能性があります。[B]キーで再学習してください。")
@@ -106,11 +101,25 @@ class StaticBrightMask:
 
 
 class CameraTracker:
+    """
+    検知パラメータは detection_params.json の共通値に、そのカメラ用の
+    "camera_overrides" を重ねたもの (config.detection_params_for)。
+    Camera1 (α6400) と Camera2 (RPi) はレンズ・露出・LED の写る大きさが
+    違うので、係数は揃えない。
+
+    camera_url=None なら映像デバイスを開かない。録画を detect() に流す
+    オフライン再生 (tools/replay_detect.py, tests/) 用。
+    """
+
     def __init__(self, camera_url, width=1280, height=720, label="Camera"):
         self.label = label
         self.camera_url = camera_url
+        self.p = detection_params_for(label)
 
-        if isinstance(camera_url, int):
+        if camera_url is None:
+            self.cap = None
+            actual_w, actual_h = width, height
+        elif isinstance(camera_url, int):
             self.cap = self._open_local_camera(camera_url, width, height)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             fourcc = int(self.cap.get(cv2.CAP_PROP_FOURCC))
@@ -123,32 +132,46 @@ class CameraTracker:
             self.cap = cv2.VideoCapture(camera_url)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        actual_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        actual_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-        print(f"[{label}] 初期化完了: 要求 {width}x{height}@{CAMERA_FPS}fps "
-              f"-> 実際 {int(actual_w)}x{int(actual_h)}@{actual_fps:.1f}fps")
+        if self.cap is not None:
+            actual_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            actual_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+            print(f"[{label}] 初期化完了: 要求 {width}x{height}@{CAMERA_FPS}fps "
+                  f"-> 実際 {int(actual_w)}x{int(actual_h)}@{actual_fps:.1f}fps")
 
         self.width  = int(actual_w) if actual_w > 0 else width
         self.height = int(actual_h) if actual_h > 0 else height
 
-        self._apply_focus_settings()
+        if self.cap is not None:
+            self._apply_focus_settings()
 
-        # ── 検知パラメータ（detection_params.json 由来） ────────
-        self.blur_size      = (BLUR_KERNEL, BLUR_KERNEL)
-        self.diff_threshold = DIFF_THRESHOLD
-        self.min_area       = MIN_AREA_PX
-        self.max_area       = MAX_AREA_PX
-        self._morph_kernel  = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (MORPH_KERNEL, MORPH_KERNEL)
-        )
+        # ── 検知パラメータ（detection_params.json 由来、カメラ別上書き込み） ──
+        p = self.p
+        # カーネル 1 以下は「かけない」。遠方の LED は 3px 角しか無く、
+        # 5x5 のぼかしでピークが 7 割に落ち、5x5 のオープニングで消える。
+        self.blur_size      = ((p["blur_kernel"], p["blur_kernel"])
+                               if p["blur_kernel"] > 1 else None)
+        self.diff_threshold = p["diff_threshold"]
+        self.min_area       = p["min_area_px"]
+        self.max_area       = p["max_area_px"]
+        self._morph_kernel  = (cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (p["morph_kernel"], p["morph_kernel"]))
+            if p["morph_kernel"] > 1 else None)
+        overrides = {k: v for k, v in DETECTION_CAMERA_OVERRIDES.get(label, {}).items()
+                     if not k.startswith("_")}
+        if overrides:
+            print(f"  [{label}] 検知パラメータのカメラ別上書き: "
+                  + ", ".join(f"{k}={v}" for k, v in sorted(overrides.items())))
 
         self.prev_gray = None
         self._bg = None
-        if USE_BG_SUBTRACTOR:
+        if p["use_background_subtractor"]:
             self._bg = self._make_bg_subtractor()
 
-        self._static_bright = StaticBrightMask(label) if STATIC_BRIGHT_MASK else None
+        self._static_bright = (StaticBrightMask(label, p["static_mask_learn_frames"],
+                                                p["static_mask_ratio"],
+                                                p["static_mask_dilate_px"])
+                               if p["static_bright_mask"] else None)
 
         self.exposure_locked = False
         self.last_frame_time = 0.0
@@ -330,15 +353,15 @@ class CameraTracker:
         学習率が高いと静止した機体が背景に吸収されて消えてしまう。
         """
         return cv2.createBackgroundSubtractorMOG2(
-            history=BG_HISTORY,
-            varThreshold=BG_VAR_THRESHOLD,
+            history=self.p["bg_history"],
+            varThreshold=self.p["bg_var_threshold"],
             detectShadows=False,
         )
 
     def _foreground_mask(self, gray_blurred):
         """前景マスクを作る。背景差分器が無効なら前フレーム差分にフォールバック。"""
         if self._bg is not None:
-            mask = self._bg.apply(gray_blurred, learningRate=BG_LEARNING_RATE)
+            mask = self._bg.apply(gray_blurred, learningRate=self.p["bg_learning_rate"])
             _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
             return mask
 
@@ -361,7 +384,7 @@ class CameraTracker:
         窓や白い反射も同じように光るため、StaticBrightMask で
         「ずっと明るいまま動かない画素」を差し引く。
         """
-        _, mask = cv2.threshold(gray_blurred, BRIGHT_THRESHOLD, 255,
+        _, mask = cv2.threshold(gray_blurred, self.p["bright_threshold"], 255,
                                 cv2.THRESH_BINARY)
         if self._static_bright is not None:
             mask = self._static_bright.apply(mask)
@@ -378,55 +401,54 @@ class CameraTracker:
           bright           輝度しきい値のみ。静止ホバリングでも消えない
           bright_or_motion 両方の論理和。点滅LEDの消灯フレームを motion 側が埋める
         """
+        p = self.p
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_blurred = cv2.GaussianBlur(gray, self.blur_size, 0)
+        gray_blurred = (cv2.GaussianBlur(gray, self.blur_size, 0)
+                        if self.blur_size is not None else gray)
 
         self.vibration_rejected = False
         min_area, max_area = self.min_area, self.max_area
 
-        if DETECT_MODE == "bright":
+        mode = p["detect_mode"]
+        if mode == "bright":
             mask = self._bright_mask(gray_blurred)
-            min_area, max_area = BRIGHT_MIN_AREA_PX, BRIGHT_MAX_AREA_PX
-        elif DETECT_MODE == "bright_or_motion":
+            min_area, max_area = p["bright_min_area_px"], p["bright_max_area_px"]
+        elif mode == "bright_or_motion":
             bright = self._bright_mask(gray_blurred)
             motion = self._foreground_mask(gray_blurred)
             mask = bright if motion is None else cv2.bitwise_or(bright, motion)
             # 下限はLED側に合わせる (LEDは小さい)。上限は動体側の広いほうを使う。
-            min_area = BRIGHT_MIN_AREA_PX
+            min_area = p["bright_min_area_px"]
         else:
             mask = self._foreground_mask(gray_blurred)
         if mask is None:
             return []
 
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._morph_kernel)
+        if self._morph_kernel is not None:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._morph_kernel)
 
         # ── 振動・照明急変フレームの破棄 ───────────────────
         # 三脚が揺れる／自動露出が追従する／照明が変わると画面全体が
         # 前景になる。そのフレームは検知結果を丸ごと捨てる。
         fg_ratio = cv2.countNonZero(mask) / float(mask.size)
-        if fg_ratio > VIBRATION_REJECT_RATIO:
+        if fg_ratio > p["vibration_reject_ratio"]:
             self.vibration_rejected = True
             return []
 
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-
+        # ★ 面積は「画素数」で数える (connectedComponents)。findContours の
+        #   contourArea は輪郭の内側の面積なので、2x2 の光点で 1、3x3 で 4 と
+        #   実際の画素数の半分以下になり、遠方の LED が min_area を割っていた。
+        n, _, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
         candidates = []
-        for c in contours:
-            area = cv2.contourArea(c)
+        for i in range(1, n):
+            x, y, w, h, area = (int(v) for v in stats[i])
             if area < min_area or area > max_area:
                 continue
-            M = cv2.moments(c)
-            if M["m00"] == 0:
-                continue
-            cu = M["m10"] / M["m00"]
-            cv_ = M["m01"] / M["m00"]
-            x, y, w, h = cv2.boundingRect(c)
+            cu, cv_ = (float(v) for v in centroids[i])
             candidates.append(Candidate(cu, cv_, float(area), x, y, w, h))
 
         candidates.sort(key=lambda c: -c.area)
-        return candidates[:MAX_CANDIDATES]
+        return candidates[:p["max_candidates"]]
 
     def draw_candidates(self, frame, candidates, best_index=None):
         """候補を重ねて描く。採用された候補だけ強調する。"""
@@ -451,7 +473,7 @@ class CameraTracker:
             # 学習中は機体を画角に入れてはいけないので、はっきり出す
             cv2.putText(frame,
                         f"LEARNING STATIC BRIGHT "
-                        f"{self._static_bright.learned_frames}/{STATIC_MASK_LEARN_FRAMES}"
+                        f"{self._static_bright.learned_frames}/{self._static_bright.learn_frames}"
                         " - keep drone out of view",
                         (10, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
@@ -473,6 +495,8 @@ class CameraTracker:
             if frame is None:
                 return None, [], 0.0
         else:
+            if self.cap is None:
+                return None, [], 0.0
             ret, frame = self.cap.read()
             ts = time.time()
             seq = None
@@ -557,4 +581,5 @@ class CameraTracker:
         self._reader_stop.set()
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=1.0)
-        self.cap.release()
+        if self.cap is not None:
+            self.cap.release()
