@@ -25,7 +25,8 @@
          [core/yaw_source.py] YawArbiter   機首方位 ("camera" / "fixed") を決める
                     │
                     ▼
-         [core/mission.py] WaypointMission   位置誤差 → 機体座標の目標速度 (10Hz 上限)
+         [core/program.py] Step の列 (本番: 離陸→旋回→上昇旋回→8の字→着陸)
+         [core/mission.py] MissionRunner   位置誤差 → 機体座標の目標速度 (10Hz 上限)
                     │
                     ▼
          [core/s5_link.py] S5Link ──USB──> 地上局 ──IM920──> 機体 (setpoint だけを送る)
@@ -296,8 +297,10 @@ PC は **setpoint (機体座標の目標速度と目標対地高度) だけ** �
 発振する、リンク断で「最後の傾け指令」が残る、の 2 点から旧方式 (`used/autopilot.py` の
 位置PID → RCコマンド) は廃止した (詳細は [../WAYPOINT_BRINGUP.md](../WAYPOINT_BRINGUP.md) §0)。
 
-- `WaypointMission` が ARMING → TAKEOFF → CRUISE/DWELL (×WP) → (MANEUVER) → 帰投 → LAND → DONE
-  の順で進み、`SEND_HZ` (10Hz 上限) で `REQ_*` を地上局へ送る。
+- `MissionRunner` が `core/program.py` の Step 列 (本番: 滑走路内離陸 → 水平旋回 →
+  上昇旋回 → 8の字 → 帰投 → 着陸 → 静止判定) を順に実行し、`SEND_HZ` (10Hz 上限) で
+  `REQ_*` を地上局へ送る。各段階に制限時間があり、超えたら打ち切って次へ進む。
+  手順と時間配分は [../COMPETITION_RUNBOOK.md](../COMPETITION_RUNBOOK.md)。
 - 機首方向は `core/yaw_source.py` が決める。カメラ由来ヨー推定 (`core/yaw_estimator.py`) が
   収束していて機体のジャイロヨーと矛盾しなければそれを使い、そうでなければ機体のジャイロヨー
   + 初期アラインメント (`YAW_INITIAL_ALIGN_DEG`) を使う。**速度ベクトルからは推定しない**。
@@ -478,7 +481,8 @@ src/main.py
   │      │
   │      ├─→ core/yaw_estimator.py  (YawEstimator)
   │      ├─→ core/yaw_source.py     (YawArbiter)
-  │      ├─→ core/mission.py        (WaypointMission)
+  │      ├─→ core/mission.py        (MissionRunner)
+  │      │      └─→ core/program.py        (Step / build_competition_program)
   │      │      ├─→ core/maneuver.py       (ManeuverRunner)
   │      │      └─→ core/s5_link.py        (REQ_* / CF_* ← core/s5_protocol.py)
   │      ├─→ core/s5_link.py        (S5Link)

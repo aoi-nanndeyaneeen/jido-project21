@@ -289,37 +289,54 @@ def _connect_stream(w_default=1280, h_default=720, retries=5):
     return None
 
 
-def _request_rpi_points():
+def _request_rpi_points(retries=5):
     """
     RPiにCALIBを投げ、ラズパイ画面でクリックされた5点を受け取る。
+
+    ★ RPi 側は接続前に押された点も溜めている (camera_server.handle_calib)。
+      つまり **2人が同時にクリックしてよい**: PC 側で Camera1 の5点を押している
+      あいだにラズパイ側も押しておけば、ここに来た瞬間に5点が返ってくる。
+
+    ★ 2026-09-17: リトライを入れた。以前は1回の connect に失敗しただけで
+      pts=None を返し、呼び出し側が Camera2 をダミーに落としていた
+      (init/camera_setup.py 冒頭の経緯と同じ問題)。RPi 側が CALIB 接続を
+      畳んで accept に戻るまでの数百 ms に当たるだけでも失敗しうる。
 
     Returns:
         (pts, width, height) — 失敗時 pts は None
     """
     print(f"\n  ─── Camera2 キャリブレーション (プリセット: {CALIB_PRESET}) ───")
-    print("       ラズパイ画面でクリック:")
+    print("       ラズパイ画面でクリック (PC 側と同時に押して構いません):")
     for lbl in CALIB_POINT_LABELS:
         print(f"       {lbl}")
 
-    pts, w2, h2 = None, 1280, 720
-    sk = socket.socket()
-    sk.settimeout(120.0)
-    try:
-        sk.connect((RPI_HOST, RPI_PORT))
-        line, buf = _rline(sk)
-        info = json.loads(line)
-        w2, h2 = info["width"], info["height"]
-        sk.sendall(b"CALIB\n")
-        print("  [Camera2] CALIB送信 - クリック待ち...")
-        line, _ = _rline(sk, buf)
-        pts = json.loads(line)["calib_pts"]
-        print(f"  [Camera2] {len(pts)}点受信: {pts}")
-    except Exception as e:
-        print(f"  [FAIL] CALIB失敗: {e}")
-    finally:
-        sk.close()
-
-    return pts, w2, h2
+    w2, h2 = 1280, 720
+    for attempt in range(1, retries + 1):
+        sk = socket.socket()
+        sk.settimeout(180.0)      # 人がクリックし終わるまで待つ
+        try:
+            sk.connect((RPI_HOST, RPI_PORT))
+            line, buf = _rline(sk)
+            info = json.loads(line)
+            w2, h2 = info.get("width", w2), info.get("height", h2)
+            sk.sendall(b"CALIB\n")
+            print(f"  [Camera2] CALIB送信 - ラズパイ画面のクリック待ち... "
+                  f"(試行 {attempt}/{retries})")
+            line, _ = _rline(sk, buf)
+            pts = json.loads(line)["calib_pts"]
+            print(f"  [Camera2] {len(pts)}点受信: {pts}")
+            return pts, w2, h2
+        except Exception as e:
+            print(f"  [WARN] CALIB 試行 {attempt}/{retries} 失敗: {e}")
+            time.sleep(1.0)
+        finally:
+            try:
+                sk.close()
+            except OSError:
+                pass
+    print("  [FAIL] CALIB をあきらめました "
+          "(ラズパイで camera_server.py が動いているか確認してください)")
+    return None, w2, h2
 
 
 # ============================================================
@@ -391,7 +408,26 @@ def _verify_saved(label, points, K, dist, R, tvec, saved_reproj):
               "誤差が悪化しているなら外部パラメータも測り直してください。")
 
 
-def _calibrate_camera(label, source, available, fallback_pos, fallback_cam):
+def _use_saved(label, saved, mode):
+    """保存済みの外部パラメータを使うか。mode は "ask" / "saved" / "fresh"。
+
+    ★ 本番の 1 分の準備では y/n を打つ時間も惜しく、打ち間違いも怖い。
+      その日にカメラを据え直すなら答えは常に「測り直す」なので、
+      main.py --calib fresh で聞かずに決められるようにしてある。
+    """
+    if saved is None:
+        return False
+    if mode == "saved":
+        print(f"  [{label}] 保存済みを使います (--calib saved)")
+        return True
+    if mode == "fresh":
+        print(f"  [{label}] 保存済みがありますが測り直します (--calib fresh)")
+        return False
+    return ask_use_saved(label, saved)
+
+
+def _calibrate_camera(label, source, available, fallback_pos, fallback_cam,
+                      calib_mode="ask"):
     """
     1台分のキャリブレーションを行い (K, dist, R, tvec, points, cam) を返す。
 
@@ -408,7 +444,7 @@ def _calibrate_camera(label, source, available, fallback_pos, fallback_cam):
         return dummy()
 
     saved = load_calibration(label)
-    if saved is not None and ask_use_saved(label, saved):
+    if _use_saved(label, saved, calib_mode):
         points = saved.get("points")
         w = saved.get("width") or 1280
         h = saved.get("height") or 720
@@ -454,21 +490,35 @@ def _calibrate_camera(label, source, available, fallback_pos, fallback_cam):
 # フロー全体
 # ============================================================
 
-def run_calibration_phase(cam1, cam1_ok: bool, cam2_ok: bool, cam2_stub):
+def run_calibration_phase(cam1, cam1_ok: bool, cam2_ok: bool, cam2_stub,
+                         calib_mode="ask"):
     """
     Camera1・Camera2両方のキャリブレーションを実施し、
     (calib1, calib2, cam2) を返す。calib は CameraCalib。
+
+    calib_mode: "ask" (毎回 y/n を聞く) / "saved" (保存済みを使う) /
+                "fresh" (必ず測り直す。本番の既定)
     """
     print("\n[INIT 3/3]  フィールドキャリブレーション")
     print(f"  使用プリセット: {CALIB_PRESET}")
     print(f"  基準点の3D座標:\n{FIELD_POINTS}")
+    print("  ★ 5点は2人で同時に押して構いません "
+          "(ラズパイ側は接続前のクリックも溜めています)")
 
     K1, dist1, R1, tvec1, pts1, cam1 = _calibrate_camera(
-        "Camera1", _UsbSource(cam1), cam1_ok, [-8, -8, 2], cam1)
+        "Camera1", _UsbSource(cam1), cam1_ok, [-8, -8, 2], cam1, calib_mode)
 
     source2 = _UsbSource(cam2_stub) if CAMERA2_SOURCE == "USB" else _RpiSource()
     K2, dist2, R2, tvec2, pts2, cam2 = _calibrate_camera(
-        "Camera2", source2, cam2_ok, [8, -8, 2], cam2_stub)
+        "Camera2", source2, cam2_ok, [8, -8, 2], cam2_stub, calib_mode)
+
+    # ★ どちらかがダミーのまま飛ぶと三角測量できず、位置が一切出ない。
+    #   起動ログの途中に紛れると気づけないので、ここで強く出す。
+    for label, pts in (("Camera1", pts1), ("Camera2", pts2)):
+        if pts is None:
+            print(f"\n  ★★ {label} がダミーです。三角測量できないので "
+                  f"自動飛行はできません ★★")
+            print("     (このまま続けても位置は出ません。原因を直して再起動してください)")
 
     # ── 2カメラ整合の検証 ────────────────────────────────────
     if pts1 and pts2 and len(pts1) == 5 and len(pts2) == 5:

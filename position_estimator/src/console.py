@@ -60,6 +60,7 @@ USB は 1 本しかないので **この 2 つは同時に使えない**。結�
 """
 
 import argparse
+import math
 import sys
 import threading
 import time
@@ -71,7 +72,9 @@ from core.s5_link import (S5Link, REQ_ABORT, REQ_GUIDED, REQ_HOLD,
                           REQ_IDLE, REQ_LAND, REQ_TAKEOFF, REQ_NAME,
                           CF_ARMED_OK, CF_ALT_ABS, CF_POS_CORR, CF_POS_SHIFT)
 from core.maneuver import Circle, FigureEight, ClimbTurn, ManeuverRunner
-from utils.config import GROUND_LINK_PORT, LOG_DIR, MISSION_TAKEOFF_ALT_M
+from utils.config import (GROUND_LINK_PORT, LOG_DIR, MISSION_TAKEOFF_ALT_M,
+                          COMP_MANEUVER_SPEED, COMP_TURN_RADIUS_M,
+                          COMP_TURN_RIGHT, COMP_CIRCLE_LAPS, COMP_CLIMB_ALT_M)
 from utils.logger import CsvLogger
 from utils.screen import Screen
 
@@ -94,18 +97,21 @@ SEND_HZ = 10.0
 STALE_HOLD_S = 1.0
 STALE_LAND_S = 4.0
 
-# ---- 定型機動 (c 水平旋回 / 8 8の字 / u 上昇旋回) のベンチテスト値 --------
+# ---- 定型機動 (c 水平旋回 / 8 8の字 / u 上昇旋回) --------------------------
+#  ★ 本番 (main.py) と同じ値を使う。ここで別の値にすると、練習で確かめた挙動と
+#    本番の挙動が食い違う。変えたいときは utils/config.py の COMP_* を直すこと。
 #  半径 r[m] = 速度 / (ヨーレート * pi/180)。ルールブックは「概ね 1.5m 以上」。
-#    0.4 m/s, 15 deg/s → r≈1.53m、1周≈24秒。実測は指令より 2〜3割大きく出る
-#    (2026-09-16: 0.3/30 → 指令 0.57m、フィット 0.7〜0.78m)。
+#    実測は指令より 2〜3割大きく出る (2026-09-16: 指令 0.57m、フィット 0.7〜0.78m)。
 #  ★ 押した時点で機体が GUIDED に入って静止ホバリング中であること。
-#    円の中心は「開始地点から旋回方向へ r 横」。右回り(+)なら左寄りで
-#    始めること。6m 幅なら中心から始めて直径 3m + 流れ 0.5m で収まる。
+#    円の中心は「開始地点から旋回方向へ r 横」。右回り(+)なら左寄りで始める。
+#    (main.py は開始地点を機首から逆算して円の中心をフィールド中心に置くが、
+#     console.py は「今いる場所から」なので、位置は操縦者が決める)
 #    送り方は core/maneuver.py の ManeuverRunner (1秒バースト → IDLE)。
-MANEUVER_SPEED_MPS    = 0.4
-MANEUVER_YAW_RATE_DPS = 15.0
-MANEUVER_LAPS         = 2      # c: 連続2周 (1000点)。u: 低高度2周 + 高高度2周 (ルール)
-CLIMB_TURN_ALT_M      = 2.2    # 上昇旋回の到達高度 [m] (ポール以上。MISSION_FENCE_Z=2.5 未満に)
+MANEUVER_SPEED_MPS    = COMP_MANEUVER_SPEED
+MANEUVER_YAW_RATE_DPS = (1.0 if COMP_TURN_RIGHT else -1.0) * math.degrees(
+    COMP_MANEUVER_SPEED / COMP_TURN_RADIUS_M)
+MANEUVER_LAPS         = COMP_CIRCLE_LAPS   # c: 連続2周 (1000点) / u: 低・高それぞれ
+CLIMB_TURN_ALT_M      = COMP_CLIMB_ALT_M   # 上昇旋回の到達高度 [m] (MISSION_FENCE_Z 未満に)
 
 # ---- デッドマン --------------------------------------------------------
 #  ★ 2026-09-16: w/a/s/d で入れた速度指令は「次に押すまで残り続ける」ので、

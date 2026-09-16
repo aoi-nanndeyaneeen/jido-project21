@@ -11,7 +11,7 @@ PC (position_estimator) にまたがる自動操縦の **どこで何が何 Hz �
  │  メインスレッド app/main_loop.py  (FlightLoop)                                 │
  │    毎周   YawEstimator に位置 / 機体Δv (D フレーム) を入れる                   │
  │    新フレーム  YawArbiter (core/yaw_source.py) → 機首方位 "camera" / "fixed"   │
- │              WaypointMission.update (core/mission.py)                          │
+ │              MissionRunner.update (core/mission.py)   段階を順に実行           │
  │                └ SEND_HZ=10Hz 上限で間引き → link.send_command("CMD,...")       │
  │    5Hz    Velocity / Graph / Link Status の描画       2Hz  端末の状態画面        │
  │  core/s5_link.py  受信スレッド: DATA/PARAM/STAT 行 → state() スナップショット    │
@@ -54,6 +54,24 @@ PC (position_estimator) にまたがる自動操縦の **どこで何が何 Hz �
 GUIDED 中に通る制御経路は POSHOLD と完全に同一。違うのは「目標速度と目標高度を、
 スティックが決めるか地上局が決めるか」だけ (`quad/Guided.h`)。
 
+## 1-2. 本番で何を飛ぶか (core/program.py)
+
+PC 側は「Step の列」を順に実行する。各 Step に制限時間があり、超えたら打ち切って
+次へ進む。さらに 2 段の締切で必ず着陸へ倒す (着陸は 1.2x1.5^4 = 4860点 で最も高い)。
+
+```
+  TAKEOFF 滑走路内離陸 ─ GOTO 進入 ─ MANEUVER 水平旋回 ─ GOTO ─ MANEUVER 上昇旋回
+                                   ─ GOTO ─ MANEUVER 8の字 ─ GOTO 帰投 ─ LAND ─ (STILL 5秒)
+     budget 20s        25s        40s       20s        80s       20s     40s    30s   40s
+     COMP_LAND_BY_S       = 185s … 何をしていても帰投・着陸へ
+     COMP_FORCE_LAND_BY_S = 205s … 帰投を諦めてその場で降りる
+     ルールの締切          = 235s (3分55秒)。これを過ぎた着陸は 0 点
+```
+
+機動の開始地点は **機首の向きから逆算**して、円の中心が必ずフィールド中心に
+来るようにする (`core/program.entry_point`)。起動時に軌跡がフェンスに収まるかを
+実寸で検算して表示する (`check_geometry`)。手順は [COMPETITION_RUNBOOK.md](COMPETITION_RUNBOOK.md)。
+
 ## 2. 周期を決めている定数 (触るときはここ)
 
 | 周期 | 定数 | 場所 |
@@ -68,7 +86,9 @@ GUIDED 中に通る制御経路は POSHOLD と完全に同一。違うのは「�
 | 機体ログ 500Hz | `FlightLog::LOG_HZ` | `quad/FlightLog.h` |
 | 上り帯域 8Hz / キープアライブ / PC 途絶 | `CMD_MIN_GAP_MS` / `CMD_KEEPALIVE_MS` / `CMD_PC_TIMEOUT_MS` | `ground_receiver/include/GroundConfig.h` |
 | リンク断フェイルセーフ 1s / 4s | `GUIDED_STALE_HOLD_MS` / `GUIDED_STALE_LAND_MS` | `QuadConfig.h` §9 |
-| PC 指令 10Hz (上限) | `WaypointMission.SEND_HZ` | `position_estimator/src/core/mission.py` |
+| PC 指令 10Hz (上限) | `MissionRunner.SEND_HZ` | `position_estimator/src/core/mission.py` |
+| 本番の段階と制限時間 | `COMP_BUDGET_S` / `COMP_LAND_BY_S` / `COMP_FORCE_LAND_BY_S` | `position_estimator/src/utils/config.py` |
+| RPi の起動待ち 60s | `RPI_WAIT_S` | 同上 |
 | PC 描画 5Hz / 画面 2Hz | `MPL_RENDER_HZ` / `STATUS_REDRAW_S` | `app/main_loop.py` |
 | 位置補正 2s に 1 回 | `POS_CORR_PERIOD_S` | `utils/config.py` |
 
@@ -101,7 +121,7 @@ GUIDED 中に通る制御経路は POSHOLD と完全に同一。違うのは「�
 | 無線パケット定義 | `protocol/S5Cmd.h` `S5Telem.h` `Im920Frame.h` (共有) | 同左 | `core/s5_protocol.py` (生成: `python protocol/gen_py_protocol.py`) |
 | 周期・配線 | `quad/S5Features.h` | `include/GroundConfig.h` | `app/main_loop.py` 冒頭 |
 | ループ本体 | `src/drone_s5.cpp` | `src/main.cpp` | `app/main_loop.py` `FlightLoop` |
-| 地上局要求の翻訳 / ミッション | `quad/Guided.h` | `include/Uplink.h` | `core/mission.py` |
+| 地上局要求の翻訳 / ミッション | `quad/Guided.h` | `include/Uplink.h` | `core/mission.py` (実行) + `core/program.py` (何を飛ぶか) |
 | テレメトリ | `quad/S5Telemetry.h` | `include/TelemetryStore.h` | `core/s5_link.py` |
 | 手動操縦コンソール | — | — | `console.py` |
 | 使わなくなったもの | `src/archive/` | `used/` | `used/` |

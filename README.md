@@ -5,6 +5,7 @@
 
 ## 🌟 システム全体構成 (System Architecture)
 
+> **本番の手順は [COMPETITION_RUNBOOK.md](COMPETITION_RUNBOOK.md)。**
 > **処理の流れと周期 (何がどこで何 Hz で回っているか) は [SYSTEM_FLOW.md](SYSTEM_FLOW.md) を参照。**
 > 機体と地上局が共有する無線パケット定義は `protocol/` (S5Cmd.h / S5Telem.h / Im920Frame.h) に
 > 1 箇所だけあり、Python 側の定数は `python protocol/gen_py_protocol.py` で生成する。

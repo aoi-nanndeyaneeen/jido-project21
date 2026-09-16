@@ -39,17 +39,21 @@ import threading
 import time
 import msvcrt
 
+import utils.config as config
 from utils.config import (DISP_W, DISP_H,
                           YAW_ENABLED, YAW_INITIAL_ALIGN_DEG,
                           GROUND_LINK_ENABLED, GROUND_LINK_PORT,
-                          MISSION_WAYPOINTS, MISSION_TAKEOFF_ALT_M,
+                          MISSION_TAKEOFF_ALT_M,
                           MISSION_AUTOSTART, LOG_DIR,
+                          COMP_ENABLED, COMP_RULE_DEADLINE_S,
                           BLE_LOG_ENABLED, BLE_LOG_NAME)
 from core.tracker import camera_thread_func
 from core.yaw_estimator import YawEstimator
 from core.yaw_source import YawArbiter
 from core.s5_link import S5Link
-from core.mission import WaypointMission as Mission, Phase as MissionPhase
+from core.mission import MissionRunner, Phase as MissionPhase
+from core.program import (build_competition_program, build_waypoint_program,
+                          program_summary, check_geometry)
 from utils.logger import PerformanceLogger, MissionLogger
 from ui.dashboard import Dashboard
 from ui.view_velocity import ViewVelocity
@@ -82,6 +86,10 @@ class FlightLoop:
         self.calib1, self.calib2 = calib1, calib2
         self.log_path = log_path
         self.field_points = field_points
+        # 何を飛ぶか (core/program.py の Step 列)。本番プログラムか、段階確認用の
+        # ウェイポイント巡回か。中身の一覧と幾何チェックは _print_program() が出す。
+        self.program = (build_competition_program(config) if COMP_ENABLED
+                        else build_waypoint_program(config))
 
         # ---- カメラスレッドとの共有 ----
         self.plot_lock = threading.Lock()
@@ -113,7 +121,7 @@ class FlightLoop:
         self.mission_log = None
         self._last_n_tx = 0
         self._mission_aligned_logged = False
-        self._prev_guided = False         # MISSION_AUTOSTART のエッジ検出用
+        self._prev_armed = False          # MISSION_AUTOSTART のエッジ検出用
         self.ble_tap = None
         self.cam_thread = None
 
@@ -134,11 +142,32 @@ class FlightLoop:
             self.messages.append(line)
             del self.messages[:-MESSAGE_LINES]
 
+    def _print_program(self):
+        """何を何秒で飛ぶつもりかと、その軌跡がフェンスに収まるかを起動時に出す。
+
+        ★ ここで ★はみ出す★ が出たまま飛ばすと、機動の途中で機体側フェンスに
+          押し返されて円が崩れ、ミッションが判定されない。飛ばす前に必ず見ること。
+        """
+        print()
+        print("  ---- 飛行プログラム "
+              f"({'本番' if COMP_ENABLED else '段階確認 (COMP_ENABLED=False)'}) ----")
+        for line in program_summary(self.program, config):
+            print(line)
+        ok, lines = check_geometry(self.program, config, YAW_INITIAL_ALIGN_DEG)
+        print()
+        for line in lines:
+            print(line)
+        if not ok:
+            print("  ★★ このまま飛ばすと機動が崩れます。設定を直してください ★★")
+
     # ------------------------------------------------------------------ 起動
     def setup(self):
         if self.yaw_est is not None:
+            nose = {0.0: "フィールド奥 +y", 90.0: "フィールド右 +x",
+                    180.0: "フィールド手前 -y", -90.0: "フィールド左 -x",
+                    270.0: "フィールド左 -x"}.get(YAW_INITIAL_ALIGN_DEG, "?")
             print(f"[Yaw] 推定を有効化 (初期アラインメント "
-                  f"{YAW_INITIAL_ALIGN_DEG:+.1f}deg = 機首をフィールド奥+yへ)")
+                  f"{YAW_INITIAL_ALIGN_DEG:+.0f}deg = 機首を {nose} へ向けて置く)")
             print("[Yaw] 機体Δvは地上局リンク (S5Link, IM920のDフレーム) から受け取ります。"
                   "GROUND_LINK_ENABLED=False またはリンク未接続だと収束しません")
 
@@ -146,13 +175,23 @@ class FlightLoop:
         print("=" * 56)
         print("   ALL SYSTEMS GO  -  STEREO TRACKING STARTED")
         print("=" * 56)
+        self._print_program()
         print()
-        print("  [M]     ミッション待機の開始/やり直し (自動開始が有効なら押す必要はありません)")
-        print("  [X]     ミッション中断 (その場から自動着陸)")
-        print("  [C]/[8]/[U]  巡航中の今の場所から 水平旋回 / 8の字 / 上昇旋回 "
-              "(終了後は離陸地点へ帰投。半径・周回数は config MISSION_MANEUVER_*)")
-        print("  [B]     背景リセット (両カメラ)")
-        print("  [Q]     終了")
+        print("  ---- 本番の手順 (ここから先は PC に触らない) ----")
+        print("   1. プロポの THR_CUT を解除してアーム")
+        if MISSION_AUTOSTART:
+            print("      -> PC が自動でミッション待機に入り、REQ_HOLD を送り始めます")
+        else:
+            print("      -> [M] を押してミッション待機に入れてください "
+                  "(MISSION_AUTOSTART=False のため)")
+        print("   2. SW_HOVER を GUIDED (上) にして、スロットルを 15% 以上へ")
+        print("      -> 機体が GUIDED に入った瞬間に競技時計が 0 から走り、離陸します")
+        print("   3. あとは全自動 (離陸 -> 各ミッション -> 帰投 -> 着陸 -> 静止判定)")
+        print("   ★ 中断したくなったら [X] (その場から自動着陸)。")
+        print("     緊急停止はプロポ (THR_CUT / SW_HOVER を下げる)。")
+        print()
+        print("  [X] ミッション中断   [B] 背景リセット   [Q] 終了")
+        print("  (手動で1つだけ機動を試したいときは console.py の c / 8 / u)")
         print()
 
         # Ctrl+C は例外で抜けずに [Q] と同じ終了処理へ通す。例外で抜けるとミッション中断・
@@ -201,21 +240,18 @@ class FlightLoop:
             link = S5Link(port=GROUND_LINK_PORT, log_dir=LOG_DIR)
             if link.ok:
                 self.link = link
-                self.mission = Mission(link, MISSION_WAYPOINTS)
+                self.mission = MissionRunner(link, self.program)
                 self.mission.TAKEOFF_ALT_M = MISSION_TAKEOFF_ALT_M
                 self.mission_log = MissionLogger(
                     self.log_path.with_name(
                         self.log_path.stem.replace("flight_", "mission_") + ".csv"))
                 print(f"       ミッションログ: {self.mission_log.path.name}")
                 if MISSION_AUTOSTART:
-                    # start() はここでは呼ばない。SW_HOVER を GUIDED (up) に上げた瞬間
-                    # (= link.flag("guided") の立ち上がり) を _step_mission が見て始める。
-                    print("  [OK] 自動開始が有効です。プロポを GUIDED (SW_HOVERを上)"
-                          "にするたびにミッションが最初から走ります ([X] で中断)")
+                    # start() はここでは呼ばない。アームの立ち上がりを _step_mission が見る。
+                    print("  [OK] 自動開始が有効です。アームすると待機に入り、"
+                          "SW_HOVER を GUIDED にした瞬間に離陸します")
                 else:
-                    print("  [OK] ミッション準備完了。[M] で開始します")
-                for i, wp in enumerate(MISSION_WAYPOINTS):
-                    print(f"       WP{i}: ({wp[0]:+.2f}, {wp[1]:+.2f}, {wp[2]:.2f})")
+                    print("  [OK] ミッション準備完了。[M] で待機に入ります")
             else:
                 print("  [SKIP] 地上局に接続できません。ミッション指令は停止し、"
                       "ダミー追跡を含む表示のみで続行します")
@@ -224,11 +260,13 @@ class FlightLoop:
                   "ダミー追跡を含む表示のみで続行します")
 
     def _keyboard_thread(self):
+        # ★ 本番は離陸後 PC に触らない。機動は core/program.py のプログラムが
+        #   順番に実行するので、手動の機動要求 (旧 c/8/u) はここには置かない
+        #   (1つだけ試したいときは console.py)。
         simple = {b'q': ("[KEY] Q → 終了", "quit", True),
                   b'b': ("[KEY] B → 背景リセット", "do_bg_reset", True),
-                  b'm': ("[KEY] M → ミッション開始要求", "mission_request", "start"),
+                  b'm': ("[KEY] M → ミッション待機の開始要求", "mission_request", "start"),
                   b'x': ("[KEY] X → ミッション中断要求", "mission_request", "abort")}
-        maneuvers = {b'c': "circle", b'8': "figure8", b'u': "climb"}
         while not self.shared.get("quit", False):
             if msvcrt.kbhit():
                 key = msvcrt.getch().lower()
@@ -236,9 +274,6 @@ class FlightLoop:
                     msg, name, value = simple[key]
                     self.say(msg)
                     self.shared[name] = value
-                elif key in maneuvers:
-                    self.say(f"[KEY] {key.decode().upper()} → 定型機動 {maneuvers[key]} 要求")
-                    self.shared["mission_request"] = "maneuver:" + maneuvers[key]
             time.sleep(KEY_POLL_S)
 
     # ------------------------------------------------------------------ ループ
@@ -313,15 +348,21 @@ class FlightLoop:
             return
         mission, link = self.mission, self.link
 
-        # SW_HOVER を GUIDED (up) に上げた瞬間 (立ち上がりエッジ) に自動で開始。
-        # 入りっぱなしの間 (着陸直後でまだ THR_CUT していない) に毎フレーム start() を
-        # 呼ぶと着陸完了の瞬間にまた離陸するので、エッジだけを見る。
-        guided_now = bool(link.flag("guided"))
-        if (MISSION_AUTOSTART and guided_now and not self._prev_guided
+        # ★ アームの立ち上がりエッジで待機 (Phase.ARMING) に入る。
+        #   そこから PC が REQ_HOLD を送り続けるので、パイロットが SW_HOVER を
+        #   GUIDED (上) に上げてスロットルを 15% 以上にした瞬間に機体が GUIDED へ
+        #   入り、競技時計が 0 から走って離陸が始まる。
+        #   (旧: GUIDED のエッジで開始。機体は「新鮮な上りコマンド」が無いと GUIDED に
+        #    入れないのに PC は待機に入るまで何も送らない、という止まり方で
+        #    毎回 [M] を押す必要があった。2026-09-17 修正)
+        #   エッジで見るのは、着陸後アームしっぱなしのまま再離陸するのを防ぐため。
+        armed_now = bool(link.flag("armed"))
+        if (MISSION_AUTOSTART and armed_now and not self._prev_armed
                 and mission.phase in (MissionPhase.IDLE, MissionPhase.DONE, MissionPhase.ABORT)):
-            self.say("[Mission] GUIDED 検出 (SW_HOVER 上) -> ミッションを最初から開始")
+            self.say("[Mission] アーム検出 -> 待機開始 "
+                     "(SW_HOVER を GUIDED にすると離陸します)")
             mission.start()
-        self._prev_guided = guided_now
+        self._prev_armed = armed_now
 
         # キー要求は update() より先に処理する (同じフレームで「開始 → 1 回目の指令」まで進む)
         req = self.shared.get("mission_request")
@@ -331,8 +372,6 @@ class FlightLoop:
                 mission.start()
             elif req == "abort":
                 mission.abort("キー操作")
-            elif req.startswith("maneuver:"):
-                mission.request_maneuver(req.split(":", 1)[1])
 
         # カメラが機体を捉えているか。in_dummy (仮想円軌道) は「捉えていない」。
         # ここを True にすると架空の位置で位置ループを閉じることになる。
@@ -446,7 +485,7 @@ class FlightLoop:
         lines.append(f" PERF   display {self._display_values['Display_ms']:.1f}ms   "
                      f"loop {ts.get('loop_ms', 0.0):.1f}ms")
         lines.append(thin)
-        lines.append(" [M]開始/やり直し  [X]中断  [C]/[8]/[U]定型機動  [B]背景リセット  [Q]終了")
+        lines.append(" [M]待機開始  [X]中断(その場から着陸)  [B]背景リセット  [Q]終了")
         lines.append(thin)
         with self._msg_lock:
             lines += [" " + m[:70] for m in self.messages[-MESSAGE_LINES:]]

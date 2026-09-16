@@ -300,7 +300,7 @@ MISSION_WAYPOINTS = [(0.3, 0.0, 0.50)]     # 右へ 0.3m だけ
 
 ### Phase 6 — 正方形を1周
 
-`MISSION_SQUARE_M = 0.80`（既定）に戻して `M`。
+（2026-09-17: `MISSION_SQUARE_M` は廃止。段階確認は `COMP_ENABLED=False` +`MISSION_WAYPOINTS`）
 うまく行ったら `KP_POS` と `MAX_VEL` を少しずつ上げる。
 
 ---
@@ -403,6 +403,7 @@ Phase 5 の再現性が低かった (PC 側で `[M]` を押し忘れる／押す
 
 ### (2) 経路の先頭に必ずフィールド中心 (0,0) を挟む
 
+(2026-09-17: ここは `core/program.py` の Step 列に置き換わった。以下は当時の記録)
 `core/mission.py` の `WaypointMission.start()` が、`MISSION_WAYPOINTS`
 の前に `(0, 0, TAKEOFF_ALT_M)` を自動で追加する
 (`self._path = [(0, 0, TAKEOFF_ALT_M)] + self.waypoints`)。

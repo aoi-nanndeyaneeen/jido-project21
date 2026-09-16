@@ -122,6 +122,8 @@ class MissionLogger(CsvLogger):
         "Epoch_s", "Time",
         # PC 側のミッション状態 (Phase=送信時 / Phase_Next=送信後。違う行が遷移)
         "Phase", "Phase_Next", "WP_Idx", "Returning",
+        # 今どの段階 (core/program.py の Step) を、競技時計の何秒で飛んでいるか
+        "Step", "T_Mission(s)",
         "Tgt_X(m)", "Tgt_Y(m)", "Tgt_Z(m)", "Dist_H(m)",
         # カメラの見立て (これを真値の基準として扱う)
         "Cam_X(m)", "Cam_Y(m)", "Cam_Z(m)", "Pos_Valid", "In_Dummy", "Residual(m)",
@@ -156,7 +158,7 @@ class MissionLogger(CsvLogger):
     def write(self, mission_snap, cam, tel, yaw, event=""):
         """
         Args:
-            mission_snap: WaypointMission.snapshot()
+            mission_snap: MissionRunner.snapshot()
                           ("diff" = (diff_x,diff_y,diff_norm,drone_x,drone_y) か None、
                            "aligned" = 原点合わせが済んでいるか、
                            "corr" = この行で送った補正 (n_m,e_m) か None)
@@ -188,6 +190,7 @@ class MissionLogger(CsvLogger):
         self._writer.writerow([
             epoch, hms,
             m["phase"], m["phase_next"], m["wp_idx"], int(m["returning"]),
+            m.get("step", ""), _f(m.get("elapsed"), 1),
             _f(m["tgt"][0]) if m["tgt"] else "",
             _f(m["tgt"][1]) if m["tgt"] else "",
             _f(m["tgt"][2]) if m["tgt"] else "",
