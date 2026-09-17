@@ -19,11 +19,17 @@
 //  ★ send() は組み立てるだけ。実際の UART 書き込みは s5tx.service() が
 //    毎ループ空きぶんだけ進める。前のパケットが残っていれば捨てて
 //    F_TX_DROP で地上局に知らせる (制御ループを止めるより良い)。
+//
+//  ★ 2026-09-17: GROUND_LINK == BLE (S5Features.h) では tick() ではなく tickBle()
+//    を BLE_TELEM_HZ で呼ぶ。フレームの中身 (send*) は共通で、出口 (emit) だけが
+//    「IM920 の送信バッファ」か「束ねて LogLink の T_TELEM」かで変わる。
 // ============================================================
 #pragma once
 #include <Arduino.h>
 #include "S5Telem.h"
 #include "quad/S5Vehicle.h"
+#include "quad/LogLink.h"
+#include "quad/LogLinkProto.h"
 
 namespace S5 {
 
@@ -56,7 +62,53 @@ public:
         }
     }
 
+    // BLE 経路 (GROUND_LINK == BLE) の送信。BLE_TELEM_HZ で呼ぶ。
+    //  IM920 のように「1 回 1 枚」に縛られないので、毎回 A と B を送り、
+    //  C と D を交互に足して 1 フレームに束ねる。
+    //    POSHOLD/GUIDED : A,B + (C または D)   → A,B 20Hz / C,D 10Hz
+    //    ANGLE/ALTHOLD  : A,B,C                → D は送らない (tick() と同じ理由)
+    //  P は数秒に 1 回、枠を奪わずに同じ束へ足す。
+    //  ★ D は束の最後に置く。PC 側 (main_loop.py) は「最新行が D か」を
+    //    ポーリングしているので、後ろに別フレームが続くと D 行を見逃しやすい。
+    void tickBle(Vehicle& v) {
+        sendAlt(v);
+        sendPos(v);
+
+        _slot = (uint8_t)(_slot + 1);
+        const bool send_dv = v.holdMode() && (_slot & 1);
+
+        const uint32_t now = millis();
+        if (now - _last_param_ms >= TELEM_PARAM_MS) {
+            _last_param_ms = now;
+            sendParam(v);
+        }
+        if (send_dv) sendDv(v);
+        else         sendAtt(v);
+        flushBle();
+    }
+
 private:
+    // 1 パケットを地上局リンクへ出す。経路は GROUND_LINK で決まる。
+    //  IM920 : IM920::Tx の送信バッファへ (従来どおり 1 回 1 パケット)
+    //  BLE   : 束ねる箱に足すだけ。実際に積むのは tickBle() 末尾の flushBle()
+    template <typename T>
+    void emit(Vehicle& v, const T& pkt) {
+        if (USE_BLE_LINK) {
+            if (_ble_n + sizeof(T) > sizeof(_ble_bundle)) flushBle();
+            memcpy(_ble_bundle + _ble_n, &pkt, sizeof(T));
+            _ble_n += sizeof(T);
+            return;
+        }
+        if (!v.s5tx.send(pkt)) _tx_drop_flag = true;
+    }
+
+    // BLE: 束ねたぶんを 1 フレームで LogLink へ積む (UART へ流すのは LogLink::service)。
+    void flushBle() {
+        if (_ble_n == 0) return;
+        if (!LogLink::sendTelem(_ble_bundle, _ble_n)) _tx_drop_flag = true;
+        _ble_n = 0;
+    }
+
     // A/B/C/D 共通のヘッダを埋める。
     void fillHeader(Vehicle& v, S5T::Header& h, uint8_t type) {
         h.type = type;
@@ -112,7 +164,7 @@ private:
         a.alt_thr_corr    = S5T::q16(v.althold.thrCorr(), S5T::SC_1E4);
         a.alt_thr_out     = S5T::qu16(v.althold.active() ? v.althold.thrOut() : 0.0f, S5T::SC_1E4);
 
-        if (!v.s5tx.send(a)) _tx_drop_flag = true;
+        emit(v, a);
     }
 
     // B: 水平位置ループ
@@ -133,7 +185,7 @@ private:
         b.lean_roll_cd  = S5T::q16(v.poshold.leanRoll(),  S5T::SC_CDEG);
         b.lean_pitch_cd = S5T::q16(v.poshold.leanPitch(), S5T::SC_CDEG);
 
-        if (!v.s5tx.send(b)) _tx_drop_flag = true;
+        emit(v, b);
     }
 
     // C: 姿勢ループの内部 (モーター出力 / 角速度 / ミキサー飽和)
@@ -167,7 +219,7 @@ private:
             c.roll_stick  = (int8_t)constrain(lroundf(rs * S5T::SC_STICK), -127L, 127L);
             c.pitch_stick = (int8_t)constrain(lroundf(ps * S5T::SC_STICK), -127L, 127L);
         }
-        if (!v.s5tx.send(c)) _tx_drop_flag = true;
+        emit(v, c);
     }
 
     // D: ヨー推定用の機体Δv + 上りリンクの統計。POSHOLD/GUIDED でだけ送る。
@@ -192,7 +244,7 @@ private:
         d.cmd_seq    = v.s5rx.last().seq;
         d.cmd_rssi   = (int8_t)constrain(v.s5rx.rssi(), -128, 127);
 
-        if (!v.s5tx.send(d)) _tx_drop_flag = true;
+        emit(v, d);
     }
 
     // P: 今どのゲインで飛んでいるか。数秒に1回。
@@ -225,13 +277,17 @@ private:
         p.flow_max_lean = S5T::q16(Quad::FLOW_MAX_LEAN, S5T::SC_GAIN);
         p.alt_thr_auth  = S5T::q16(Quad::ALT_THR_AUTH,  S5T::SC_GAIN);
 
-        if (!v.s5tx.send(p)) _tx_drop_flag = true;
+        emit(v, p);
     }
 
     uint8_t  _seq           = 0;
     uint32_t _last_param_ms = 0;
     bool     _tx_drop_flag  = false;  // 直前の送信が捨てられたか (次パケットで通知)
     uint8_t  _slot          = 0;      // 枠カウンタ
+
+    // BLE 経路で 1 回ぶんのフレームを束ねる箱。A+B+C+P でも 28x4 = 112B で 255B に収まる。
+    uint8_t  _ble_bundle[LogLinkProto::TELEM_MAX_PAYLOAD];
+    size_t   _ble_n = 0;
 };
 
 } // namespace S5

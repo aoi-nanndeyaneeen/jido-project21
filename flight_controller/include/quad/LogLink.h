@@ -25,9 +25,10 @@
 //  【配線】 (既定は Teensy4.0 Serial4: TX=17 / RX=16)
 //     Teensy TX17 ---- RP2040(XIAO) D7/GP1 (RX)
 //     Teensy RX16 ---- RP2040(XIAO) D6/GP0 (TX)   ※状態表示 + BLE経由の
-//                                                    デバッグ指令(T_ACT)用。
-//                                                    省いても飛行はできるが、
-//                                                    BLE からの IMU校正等は使えない
+//                                                    デバッグ指令(T_ACT) +
+//                                                    操縦指令(T_CMD)用。
+//                                                    ★ drone_s5.cpp の GROUND_LINK
+//                                                    が BLE のときは必須
 //     GND         ---- GND                        ※必須
 //    電源は分ける (SD 書き込みの突入で FC を巻き込まないため)。GND だけ共通。
 // ============================================================
@@ -78,6 +79,16 @@ static uint32_t s_stat_n  = 0;
 static P::ActReq s_act_req   = {};
 static uint32_t  s_act_rx_n  = 0;   // 受信した ActReq の総数
 static uint32_t  s_act_seen_n = 0;  // pollAction() 済みの数
+
+// 地上局リンク (S5::GROUND_LINK == BLE) の上りコマンド。最新 1 個だけ持つ
+// mailbox。機体側 (S5C::Rx) が使うのも常に最新値だけなので、1 回の
+// pollStat() の中で複数届いたら古いほうは上書きでよい (seq の飛びとして
+// S5C::Rx が数える)。
+static uint8_t  s_cmd_buf[P::CMD_PAYLOAD];
+static uint32_t s_cmd_rx_n   = 0;   // 受信した T_CMD の総数
+static uint32_t s_cmd_seen_n = 0;   // pollCmd() 済みの数
+static uint32_t s_cmd_badlen = 0;   // 長さが CmdFrame と合わなかった T_CMD
+static uint32_t s_telem_drop = 0;   // T_TELEM をリングに積めなかった回数
 
 // ---- RX 診断カウンタ (配線の切り分け用) ----
 //  rx_bytes==0      : 線に何も来ていない → GND 未共通 / D6→RX16 断線 / RX16 不良
@@ -152,6 +163,13 @@ inline void pollStat() {
                 } else if (crc == c && type == P::T_ACT && len == sizeof(P::ActReq)) {
                     memcpy(&s_act_req, buf, sizeof(s_act_req));
                     s_act_rx_n++;
+                } else if (crc == c && type == P::T_CMD) {
+                    if (len == P::CMD_PAYLOAD) {
+                        memcpy(s_cmd_buf, buf, P::CMD_PAYLOAD);
+                        s_cmd_rx_n++;
+                    } else {
+                        s_cmd_badlen++;   // S5Cmd.h が機体とロガーでずれている
+                    }
                 } else if (crc != c) {
                     s_rx_crcfail++;
                 }
@@ -171,6 +189,29 @@ inline bool pollAction(P::ActReq& out) {
     s_act_seen_n = s_act_rx_n;
     out = s_act_req;
     return true;
+}
+
+// 地上局リンク (BLE) の上りコマンドを取り出す。前回から新着があれば true。
+//  out は P::CMD_PAYLOAD バイト以上。中身の検証 (magic/ver/seq) は
+//  S5C::Rx::acceptRaw() がやる (IM920 経由と同じカウンタに載せるため)。
+inline bool pollCmd(uint8_t* out) {
+    if (s_cmd_seen_n >= s_cmd_rx_n) return false;
+    s_cmd_seen_n = s_cmd_rx_n;
+    memcpy(out, s_cmd_buf, P::CMD_PAYLOAD);
+    return true;
+}
+inline uint32_t cmdRxCount()  { return s_cmd_rx_n; }
+inline uint32_t cmdBadLen()   { return s_cmd_badlen; }
+inline uint32_t telemDrops()  { return s_telem_drop; }
+
+// 地上局リンク (BLE) の下りテレメトリ。S5T の各フレームを連結したバイト列を
+// 1 フレームで送る。記録中かどうかに関係なく流す (非アーム中も地上局は
+// 機体の状態を見たい)。積めなければ false (呼び出し側が F_TX_DROP を立てる)。
+inline bool sendTelem(const uint8_t* p, size_t n) {
+    if (!s_ok || n == 0 || n > P::TELEM_MAX_PAYLOAD) return false;
+    if (sendFrame(P::T_TELEM, p, n)) return true;
+    s_telem_drop++;
+    return false;
 }
 
 // 上記の実行結果を FC -> ロガー -> BLE へ送る。既存の送信リング

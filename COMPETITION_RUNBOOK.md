@@ -13,7 +13,9 @@
 
 | 項目 | 確認 |
 |---|---|
-| ファーム | 機体 `pio run -e drone_s5 -t upload` / 地上局 `pio run -e xiao_s5_log -t upload` を**両方**焼いてある |
+| 地上局リンク | 既定は **BLE** (README「地上局リンクの経路」)。機体 `S5Features.h` の `GROUND_LINK` と `config.py` の `GROUND_LINK_BACKEND` が**同じ**経路を指している |
+| ファーム (BLE) | 機体 `pio run -e drone_s5 -t upload` / log_recorder `pio run -e xiao_logger_esp32c3 -t upload` を**両方**焼いてある。log_recorder TX(D6)→機体 RX7 が配線されている |
+| ファーム (IM920 に戻した場合) | 機体 `pio run -e drone_s5 -t upload` / 地上局 `pio run -e xiao_s5_log -t upload` を**両方**焼いてある |
 | プロトコル | 焼いた 2 つが同じ `protocol/` から作られている (違うと `# !! パケットバージョン不一致`) |
 | フィールド | `utils/config.py` の `FIELD_PROFILE = "large"` (6m x 9m) が実寸と合っている |
 | 基準点 | `FIELD_POINT_COORDS["large"]` の 4 隅と 5 点目の高さが実寸と合っている |

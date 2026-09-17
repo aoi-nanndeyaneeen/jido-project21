@@ -12,10 +12,12 @@
 //       100Hz  FLOW_LOOP_HZ               PMW3901 読み + de-rotation サンプル
 //        25Hz  FLOW_CTRL_HZ (÷4)          ↳ 窓を締めて PosHold (速度/位置ループ)
 //       100Hz  RANGE_LOOP_HZ              測距ポーリング → AltHold (新サンプルの回だけ PID)
-//       200Hz  TELEM_RX_HZ                IM920 上りコマンドの受信ポーリング
+//       200Hz  TELEM_RX_HZ                IM920 上りコマンドの受信ポーリング (GROUND_LINK=IM920)
+//      毎ループ                           BLE 上りコマンドの取り出し (GROUND_LINK=BLE。LogLink の mailbox)
 //       100Hz  GUIDED_HZ (÷10)            地上局要求 → 目標速度/高度への翻訳 (制御はしない)
 //       500Hz  FlightLog::LOG_HZ (÷2)     125Hz ログ 1 行を作って USB/RAM/SD/LogLink へ
-//         8Hz  TELEM_TX_HZ                下りテレメトリ 1 パケット (A,B,A,B,C,A,B,D 枠)
+//         8Hz  TELEM_TX_HZ                下りテレメトリ 1 パケット (A,B,A,B,C,A,B,D 枠) (GROUND_LINK=IM920)
+//        20Hz  BLE_TELEM_HZ               下りテレメトリ A+B+(C|D) を 1 束 (GROUND_LINK=BLE)
 //        10Hz  DEBUG_HZ                   シリアル画面
 //      毎ループ                           s5tx.service() / LogLink::service() / LED
 //
@@ -33,7 +35,24 @@ namespace S5 {
 constexpr bool USE_MPU   = true;
 constexpr bool USE_SBUS  = true;
 constexpr bool USE_MOTOR = true;
-constexpr bool USE_IM920 = true;   // 地上局 (position_estimator) との無線
+
+// ---- 地上局リンク (position_estimator との 操縦指令 + テレメトリ) の経路 ----
+//  ★ 2026-09-17: IM920 から BLE へ移した。ここ 1 行で切り替わる。
+//    BLE   : 機体 --UART(Serial2)--> log_recorder XIAO ESP32C3 --BLE--> PC
+//            上り (CmdFrame)・下り (S5Telem の各フレーム) を LogLink の
+//            T_CMD / T_TELEM に載せる (quad/LogLinkProto.h)。USE_LOGLINK 必須。
+//            IM920 モジュール (Serial3) には一切触らない。
+//    IM920 : 従来どおり Serial3 の IM920SL ⇄ ground_receiver。
+//  ★ IM920 に戻すとき (3 か所をそろえる):
+//    1) ここを GroundLink::IM920 にして焼き直す
+//    2) position_estimator/src/utils/config.py の GROUND_LINK_BACKEND = "im920"
+//    3) 地上局 XIAO + IM920 を PC の USB に挿す (ground_receiver のファーム)
+//    CmdFrame / S5Telem の中身は両経路で共通 (protocol/) なので、他は直さなくてよい。
+enum class GroundLink : uint8_t { IM920, BLE };
+constexpr GroundLink GROUND_LINK = GroundLink::BLE;
+
+constexpr bool USE_IM920    = (GROUND_LINK == GroundLink::IM920);  // Serial3 の IM920SL を使う
+constexpr bool USE_BLE_LINK = (GROUND_LINK == GroundLink::BLE);    // LogLink 経由で BLE へ
 constexpr bool USE_FLOW  = true;   // PMW3901 オプティカルフロー
 constexpr bool USE_RANGE = true;   // 測距 (QuadConfig の RANGE_BACKEND で ToF/SONAR)
 
@@ -48,6 +67,9 @@ static_assert(!(USE_FLOW && USE_SD),
 static_assert(!(USE_SD && USE_LOGLINK),
               "USE_SD と USE_LOGLINK は同時に true にできない "
               "(同じ Rec を2箇所に流すと、どちらが正のログか分からなくなる)。");
+static_assert(!USE_BLE_LINK || USE_LOGLINK,
+              "GROUND_LINK=BLE は log_recorder (USE_LOGLINK) を経由する。"
+              "USE_LOGLINK=true にするか、GROUND_LINK を IM920 に戻すこと。");
 
 // ---- 機能スイッチ ----------------------------------------------------
 // 高度ホールド (スロットルPID)。false にすると POSHOLD でも高度は手動のまま。
@@ -91,6 +113,15 @@ static_assert(MAIN_HZ % GUIDED_HZ == 0, "GUIDED_HZ は MAIN_HZ の約数にす�
 //  GUIDED では上り 8Hz と帯域を分け合うので 8Hz (UART 占有 下り30%+上り23%)。
 //  枠割りは S5Telemetry.h の tick()。経緯は TUNING_HISTORY §5。
 constexpr int TELEM_TX_HZ = Quad::GUIDED_ENABLE ? 8 : 15;
+
+// BLE 経路 (GROUND_LINK == BLE) の下りテレメトリ [Hz]。
+//  IM920 のような 32B / 15Hz の壁が無いので、1 回で A と B を毎回、C/D を 1 回
+//  おきに束ねて 1 フレームにする (S5Telemetry.h の tickBle)。20Hz なら A,B 各 20Hz
+//  (IM920 の 3Hz から約 7 倍)、C/D 各 10Hz。
+//  ★ 帯域の相手は BLE Notify。log_recorder は Notify を最短 5ms 間隔 (= 上限
+//    200 回/s) で出し、機体ログ REC が 125 回/s 乗っている。束ねているので
+//    こちらは 20 回/s、合計 145 回/s。上げるなら 30 まで。
+constexpr int BLE_TELEM_HZ = 20;
 
 // ゲイン一覧 (S5T::Param) を送る周期 [ms]。この回だけ State を1つ落とす。
 constexpr uint32_t TELEM_PARAM_MS = 5000;

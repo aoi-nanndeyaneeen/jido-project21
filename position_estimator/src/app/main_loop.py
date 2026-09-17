@@ -22,8 +22,9 @@ PC 側メインループ: カメラ追跡の結果を受けて、ヨー推定 �
     [2Hz]       端末の状態画面 (utils/screen.Screen で上書き)
     [毎周]      cv2.waitKey(1) → q / b キー
 
-    地上局リンク (core/s5_link.py) は別スレッドで USB を読み、state() のスナップショットを返す。
-    BLE (core/ble_tap.py) は機体 125Hz ログの受信だけで、追跡・ミッションには関与しない。
+    地上局リンク (GROUND_LINK_BACKEND: "ble" = core/ble_link.py / "im920" = core/s5_link.py)
+    は別スレッドで受信し、state() のスナップショットを返す。
+    BLE (core/ble_tap.py) は機体 125Hz ログの受信。"ble" のときは地上局リンクもこの接続に乗る。
 
 ★ ミッション指令のレートを決めているのは mission.py の SEND_HZ (10Hz) であって
   カメラの fps ではない。カメラが 60fps でも指令は 10Hz、15fps でも 10Hz。
@@ -42,7 +43,7 @@ import msvcrt
 import utils.config as config
 from utils.config import (DISP_W, DISP_H,
                           YAW_ENABLED, YAW_INITIAL_ALIGN_DEG,
-                          GROUND_LINK_ENABLED, GROUND_LINK_PORT,
+                          GROUND_LINK_ENABLED, GROUND_LINK_PORT, GROUND_LINK_BACKEND,
                           MISSION_TAKEOFF_ALT_M,
                           MISSION_AUTOSTART, LOG_DIR,
                           COMP_ENABLED, COMP_RULE_DEADLINE_S,
@@ -50,7 +51,7 @@ from utils.config import (DISP_W, DISP_H,
 from core.tracker import camera_thread_func
 from core.yaw_estimator import YawEstimator
 from core.yaw_source import YawArbiter
-from core.s5_link import S5Link
+from core.ble_link import open_ground_link
 from core.mission import MissionRunner, Phase as MissionPhase
 from core.program import (build_competition_program, build_waypoint_program,
                           program_summary, check_geometry)
@@ -168,7 +169,7 @@ class FlightLoop:
                     270.0: "フィールド左 -x"}.get(YAW_INITIAL_ALIGN_DEG, "?")
             print(f"[Yaw] 推定を有効化 (初期アラインメント "
                   f"{YAW_INITIAL_ALIGN_DEG:+.0f}deg = 機首を {nose} へ向けて置く)")
-            print("[Yaw] 機体Δvは地上局リンク (S5Link, IM920のDフレーム) から受け取ります。"
+            print(f"[Yaw] 機体Δvは地上局リンク ({GROUND_LINK_BACKEND} の Dフレーム) から受け取ります。"
                   "GROUND_LINK_ENABLED=False またはリンク未接続だと収束しません")
 
         print()
@@ -226,7 +227,9 @@ class FlightLoop:
             daemon=True)
         self.cam_thread.start()
 
-        # ---- BLE (機体 125Hz ログ)。地上局とは別デバイスなので、繋がらなくても続行 ----
+        # ---- BLE (機体 125Hz ログ)。繋がらなくても追跡は続行 ----
+        #  ★ GROUND_LINK_BACKEND="ble" のときは地上局リンクもこの接続に乗る
+        #    (同じ機体へ BLE 接続は 1 本しか張れないので、タップを共有する)。
         if BLE_LOG_ENABLED:
             from core.ble_tap import BleTap
             tap = BleTap(LOG_DIR, name=BLE_LOG_NAME)
@@ -236,8 +239,13 @@ class FlightLoop:
         #  ここが None のままだと、機体は一切動かない (見ているだけ)。
         if GROUND_LINK_ENABLED:
             print()
-            print("[INIT] 地上局 (XIAO / xiao_s5_log) へ接続中...")
-            link = S5Link(port=GROUND_LINK_PORT, log_dir=LOG_DIR)
+            if GROUND_LINK_BACKEND == "ble":
+                print(f"[INIT] 地上局リンク = BLE ('{BLE_LOG_NAME}' / log_recorder 経由)")
+            else:
+                print("[INIT] 地上局リンク = IM920 (XIAO / xiao_s5_log) へ接続中...")
+            link = open_ground_link(GROUND_LINK_BACKEND, port=GROUND_LINK_PORT,
+                                    tap=self.ble_tap if GROUND_LINK_BACKEND == "ble" else None,
+                                    ble_name=BLE_LOG_NAME, log_dir=LOG_DIR)
             if link.ok:
                 self.link = link
                 self.mission = MissionRunner(link, self.program)

@@ -36,13 +36,28 @@
 //    書くと、そのまま UART (D6 TX) 経由で機体へ中継する (Cmd:: 参照)。
 //    運べるのは PID reset / IMU校正 / デバイス確認の3種類だけで、速度・
 //    高度・離着陸要求のような操縦系のフィールドはプロトコル上存在しない。
-//    機体の操縦は今まで通り IM920 だけが担う (詳細は LogLinkProto.h)。
+//
+//  【地上局リンク (IM920 の代わり。2026-09-17 追加)】
+//    機体の drone_s5.cpp で S5::GROUND_LINK == BLE のとき、IM920 が担って
+//    いた地上局との通信をここが中継する (詳細は LogLinkProto.h)。
+//      上り: PC ─BLE Write(BLE_CHAR_CTRL_UUID, CmdFrame 22B)→ ここ
+//            ─UART T_CMD→ 機体。seq はここで振る。
+//      下り: 機体 ─UART T_TELEM→ ここ ─BLE Notify (ログと同じ char)→ PC
+//    ★ 上りの扱いは ground_receiver/src/tools/s5_log.cpp (IM920 地上局) と
+//      同じ: 最新値だけの mailbox / PC が黙っている間は 200ms ごとに再送 /
+//      PC から 1.5 秒来なければ送信停止 (機体はホールド -> 自動着陸)。
+//      さらに BLE が切れた瞬間にも送信を止める。
+//    ★ デバッグ指令 (上の ActReq) とは characteristic もフレーム型も別。
+//      ble_monitor.py などデバッグ用ツールから操縦が出ることはない。
+//    ★ 機体を IM920 に戻した場合、ここに操縦指令が来ても機体は読まない
+//      (T_CMD を見るのは GROUND_LINK == BLE のときだけ)。ファームはそのままでよい。
 //
 //  【配線】
 //     D7  RX  <---- Teensy TX17 (Serial4)
-//     D6  TX  ----> Teensy RX16          ※状態返信 + 上記デバッグ指令用。
-//                                           省略すると飛行はできるが、
-//                                           BLEからのデバッグ指令は使えない
+//     D6  TX  ----> Teensy RX16          ※状態返信 + デバッグ指令 + 操縦指令用。
+//                                           ★ 地上局リンクが BLE (既定) の
+//                                           ときは必須。無いと機体は PC の
+//                                           指令を 1 つも受け取れない
 //     GND     <--------> Teensy GND      ※必須
 //    ★ XIAO の電源は FC と分ける。GND だけ共通にすること。
 //
@@ -60,6 +75,7 @@
 #include <string>
 
 #include "quad/LogLinkProto.h"   // ★ flight_controller 側の実体を include
+#include "S5Cmd.h"               // 同上 (CmdFrame のサイズとオフセットだけ使う)
 
 namespace P = LogLinkProto;
 
@@ -94,6 +110,26 @@ static const char* BLE_CHAR_UUID      = "d5913037-2d8a-41ee-85b9-4e361aa5c8a7"; 
 //    速度・高度・離着陸要求のような操縦系は一切運べない設計にしてある
 //    (機体を操縦する経路は今まで通り IM920 だけ。詳細は LogLinkProto.h)。
 static const char* BLE_CHAR_CMD_UUID  = "d5913038-2d8a-41ee-85b9-4e361aa5c8a7";
+// PC -> 機体 の操縦指令 (Write / Write Without Response)。2026-09-17 追加。
+//  中身は S5Cmd.h の CmdFrame (22B) そのもの。IM920 で運んでいたのと同じ構造体。
+static const char* BLE_CHAR_CTRL_UUID = "d5913039-2d8a-41ee-85b9-4e361aa5c8a7";
+
+// ---- 地上局リンク (操縦指令の中継) -----------------------------------------
+//  値の意味は ground_receiver/src/tools/s5_log.cpp と同じにしてある。
+constexpr uint32_t CTRL_KEEPALIVE_MS  = 200;    // PC が黙っている間の再送間隔
+constexpr uint32_t CTRL_PC_TIMEOUT_MS = 1500;   // これだけ来なければ送信停止
+static_assert(sizeof(S5C::CmdFrame) == LogLinkProto::CMD_PAYLOAD,
+              "LogLinkProto::CMD_PAYLOAD を S5Cmd.h の CmdFrame に合わせること");
+
+// リングの滞留がこれを超えたら、送らずに古いフレームから捨てる。
+//  ★ 2026-09-17: 地上局リンクのテレメトリ (T_TELEM) も同じ FIFO を通る
+//    ようになった。BLE が詰まって REC の山が溜まると、その後ろのテレメトリ
+//    (= PC が操縦判断に使う機体状態) が数秒遅れで届く。それは「届かない」
+//    より危ない (PC は古い状態を今の状態だと思って指令を出す) ので、
+//    遅延の上限をここで切る。16KB = 機体側 500Hz の REC 約 0.26 秒ぶん。
+//    代わりに BLE が短時間切れたときの REC の穴埋め (旧: 128KB = 2 秒) は
+//    効かなくなる。ログの完全性より操縦の鮮度を優先した結果。
+constexpr uint32_t SHED_BYTES = 16u * 1024u;
 
 // ============================================================
 //  コア間 (タスク間) リング (SPSC)
@@ -123,6 +159,9 @@ struct Stats {
     volatile uint32_t orphan    = 0;   // START 前に来た REC
     volatile uint32_t worst_tx_us = 0;
     volatile uint32_t peak_ring = 0;
+    volatile uint32_t shed      = 0;   // 滞留超過で送らずに捨てたフレーム (SHED_BYTES)
+    volatile uint32_t telem_tx  = 0;   // BLE へ送った T_TELEM
+    volatile uint32_t telem_drop = 0;  // BLE 未接続/滞留超過で捨てた T_TELEM
 };
 static Stats g_st;
 
@@ -179,6 +218,105 @@ class WriteCallbacks : public BLECharacteristicCallbacks {
 };
 
 } // namespace Cmd
+
+// ============================================================
+//  §1.7  地上局リンク: PC -> 機体 の操縦指令 (BLE Write -> UART T_CMD)
+// ============================================================
+//  Cmd:: (デバッグ指令) と同じく、onWrite() では mailbox に置くだけで、
+//  Serial1 に書くのは loop() の service() だけ。
+//  ★ デバッグ指令と違い「最新値を送り続ける」性質のものなので、s5_log.cpp
+//    (IM920 地上局) の serviceCmdTx() と同じ振る舞いにしてある:
+//      ・新しい指令は届いた次のループで即送る
+//      ・PC が黙っている間は CTRL_KEEPALIVE_MS ごとに最後の指令を再送
+//      ・PC から CTRL_PC_TIMEOUT_MS 来なければ送信停止
+//      ・BLE が切れたら即送信停止 (IM920 版には無い。切断を確実に知れるので)
+//    止めたあと機体は「コマンドが来ない」としてホールド -> 自動着陸へ落ちる。
+namespace Ctrl {
+
+static portMUX_TYPE      s_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t           s_box[LogLinkProto::CMD_PAYLOAD];   // 最新の指令
+static uint32_t          s_box_gen    = 0;   // 指令が届くたびに進む (送信中の上書き検出)
+static uint32_t          s_last_pc_ms = 0;   // PC から最後に来た時刻 (0 = 未受信)
+// 以下は loop() 側だけが触る
+static bool     s_have       = false;        // 中継中
+static uint32_t s_sent_gen   = 0;            // 最後に UART へ出した指令の世代
+static uint32_t s_last_tx_ms = 0;
+static uint8_t  s_seq        = 0;
+static uint32_t s_n_rx = 0, s_n_bad = 0, s_n_tx = 0, s_n_busy = 0, s_n_stop = 0;
+
+static void onWrite(const uint8_t* data, size_t len) {
+    if (len != sizeof(s_box)) { s_n_bad++; return; }
+    portENTER_CRITICAL(&s_mux);
+    memcpy(s_box, data, sizeof(s_box));
+    s_box_gen++;
+    s_last_pc_ms = millis();
+    portEXIT_CRITICAL(&s_mux);
+    s_n_rx++;
+}
+
+static void stop(const char* why) {
+    if (!s_have) return;
+    s_have = false;
+    s_n_stop++;
+    Serial.printf("[CTRL] 操縦指令の中継を停止 (%s)。機体はホールド -> 自動着陸へ\n", why);
+}
+
+// loop() から毎回呼ぶ。Serial1 への書き込みはここでだけ行う。
+static void service() {
+    const uint32_t now = millis();
+
+    uint8_t  box[LogLinkProto::CMD_PAYLOAD];
+    uint32_t gen, last_pc;
+    portENTER_CRITICAL(&s_mux);
+    memcpy(box, s_box, sizeof(box));
+    gen     = s_box_gen;
+    last_pc = s_last_pc_ms;
+    portEXIT_CRITICAL(&s_mux);
+
+    const bool fresh_cmd = (gen != s_sent_gen);   // まだ送っていない指令がある
+
+    if (!g_st.ble_ok) {
+        stop("BLE 切断");
+        s_sent_gen = gen;          // 切断前の指令を再接続後に蒸し返さない
+        return;
+    }
+    if (last_pc == 0) return;
+    if (now - last_pc > CTRL_PC_TIMEOUT_MS) {
+        stop("PC から途切れた");
+        s_sent_gen = gen;
+        return;
+    }
+    if (!s_have) {
+        if (!fresh_cmd) return;    // 停止後は新しい指令が来るまで再開しない
+        s_have = true;
+        Serial.println("[CTRL] 操縦指令の中継を開始");
+    }
+    if (!fresh_cmd && now - s_last_tx_ms < CTRL_KEEPALIVE_MS) return;
+
+    // seq はここで振る (IM920 版では地上局 XIAO が振っていたのと同じ)。
+    //  機体の S5C::Rx は seq が同じなら重複として捨てるので、再送でも進める。
+    box[offsetof(S5C::CmdFrame, seq)] = s_seq;
+    uint8_t f[LogLinkProto::MAX_FRAME];
+    static uint8_t link_seq = 0;
+    const size_t n = LogLinkProto::buildFrame(f, LogLinkProto::T_CMD, link_seq,
+                                              box, sizeof(box));
+    if ((size_t)Serial1.availableForWrite() < n) { s_n_busy++; return; }   // 次のループで
+    Serial1.write(f, n);
+    link_seq++;
+    s_seq++;
+    s_n_tx++;
+    s_last_tx_ms = now;
+    s_sent_gen   = gen;
+}
+
+class WriteCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* c) override {
+        const std::string v = c->getValue();
+        Ctrl::onWrite((const uint8_t*)v.data(), v.size());
+    }
+};
+
+} // namespace Ctrl
 
 // ============================================================
 //  §1  rx役 : UART 受信 + フレーム検証 + リングへ push
@@ -374,6 +512,13 @@ static void init() {
         BLE_CHAR_CMD_UUID, BLECharacteristic::PROPERTY_WRITE);
     cmd_char->setCallbacks(new Cmd::WriteCallbacks());
 
+    // PC -> 機体 の操縦指令 (CmdFrame 22B)。応答なし Write を許すのは遅延を
+    // 減らすため (最新値を送り続ける性質なので、1 発落ちても次で上書きされる)。
+    BLECharacteristic* ctrl_char = svc->createCharacteristic(
+        BLE_CHAR_CTRL_UUID,
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+    ctrl_char->setCallbacks(new Ctrl::WriteCallbacks());
+
     svc->start();
 
     BLEAdvertising* adv = BLEDevice::getAdvertising();
@@ -439,6 +584,10 @@ static void drainRing() {
         const auto discard = [&]() {
             __atomic_store_n(&g_tail, tail + flen, __ATOMIC_RELEASE);
         };
+        // 滞留が SHED_BYTES を超えていたら、送らずに古いほうから捨てる
+        // (理由は SHED_BYTES のコメント)。BLE 未接続でもここは進むので、
+        // リングは常に「直近 SHED_BYTES ぶん」程度しか持たない。
+        const bool shed = used > SHED_BYTES;
 
         switch (type) {
             case P::T_START: {
@@ -447,6 +596,7 @@ static void drainRing() {
                 // FC は同じヘッダを 1Hz で再送してくる。同じ t0 なら継続中の
                 // セッションの続き = 送らずに捨てる。違えば別フライト。
                 if (s_recording && t0 == s_t0) { discard(); break; }
+                if (shed) { discard(); g_st.shed++; break; }   // 1Hz で再送されてくる
                 if (!readyToSend()) return;   // pop せず次回に持ち越す
                 discard();
                 s_t0        = t0;
@@ -459,6 +609,7 @@ static void drainRing() {
             case P::T_REC: {
                 if (!s_recording) { discard(); g_st.orphan++; break; }
                 s_last_rec_ms = millis();
+                if (shed) { discard(); g_st.shed++; s_rec_pending = false; break; }
                 // 帯域対策の間引き。捨てた分は drop に数えない (意図的な間引きのため)。
                 // ★ s_rec_pending が立っていなければ「まだこの REC の間引き判定を
                 //   していない」ので一度だけ判定する。gate 待ちで戻ってきた再訪
@@ -480,6 +631,12 @@ static void drainRing() {
             }
             case P::T_STOP: {
                 if (!s_recording) { discard(); break; }
+                if (shed) {
+                    // 送れないが、記録終了の状態遷移だけはやる
+                    discard(); g_st.shed++;
+                    s_recording = false; g_st.recording = false; s_bytes = 0;
+                    break;
+                }
                 if (!readyToSend()) return;   // pop せず次回に持ち越す
                 discard();
                 sendFrame(f, flen);
@@ -492,10 +649,23 @@ static void drainRing() {
             case P::T_ACT_ACK: {
                 // デバッグ指令(T_ACT)の実行結果。記録中かどうかに関係なく、
                 // 常に転送する (recording state gate の対象外)。
+                if (shed) { discard(); g_st.shed++; break; }
                 if (!readyToSend()) return;   // pop せず次回に持ち越す
                 discard();
                 sendFrame(f, flen);
                 Serial.println("[BLE] ACT_ACK 送信");
+                break;
+            }
+            case P::T_TELEM: {
+                // 地上局リンクの下りテレメトリ。記録中かどうかに関係なく送る。
+                //  ★ BLE 未接続なら待たずに捨てる。つながった後に古い状態を
+                //    まとめて送っても PC を惑わせるだけ (機体は 20Hz で
+                //    新しいものを送り続けている)。
+                if (shed || !s_connected) { discard(); g_st.telem_drop++; break; }
+                if (!readyToSend()) return;   // pop せず次回に持ち越す
+                discard();
+                sendFrame(f, flen);
+                g_st.telem_tx++;
                 break;
             }
             default:
@@ -551,6 +721,15 @@ static void printStatus() {
     Serial.printf("  最悪tx    : %lu us\n", (unsigned long)g_st.worst_tx_us);
     Serial.printf("  デバッグ指令(BLE->機体): 受信 %lu 件  不正 %lu 件\n",
                   (unsigned long)Cmd::s_n_rx, (unsigned long)Cmd::s_n_bad);
+    Serial.printf("  操縦指令(BLE->機体)    : %s  受信 %lu  UART送信 %lu  不正 %lu  "
+                  "詰まり %lu  停止 %lu 回\n",
+                  Ctrl::s_have ? "中継中" : "停止",
+                  (unsigned long)Ctrl::s_n_rx, (unsigned long)Ctrl::s_n_tx,
+                  (unsigned long)Ctrl::s_n_bad, (unsigned long)Ctrl::s_n_busy,
+                  (unsigned long)Ctrl::s_n_stop);
+    Serial.printf("  テレメトリ(機体->BLE)  : 送信 %lu  破棄 %lu   滞留超過で破棄 %lu フレーム\n",
+                  (unsigned long)g_st.telem_tx, (unsigned long)g_st.telem_drop,
+                  (unsigned long)g_st.shed);
     if (g_st.crc_err || g_st.seq_gap)
         Serial.println("  ★ crc_err/seq_gap が増える = UART が化けている。"
                        "配線を短く / GND を確実に / 両側の BAUD を 1000000 へ");
@@ -592,6 +771,7 @@ void loop() {
         Rx::sendStat();
     }
     Cmd::service();   // BLE から指令が来ていれば、ここで初めて Serial1 へ書く
+    Ctrl::service();  // 操縦指令の中継 (地上局リンク)。同上
 
     // USB コンソール
     if (Serial.available()) {
@@ -600,6 +780,7 @@ void loop() {
         if (c == 'r') { g_st.drop_ring = 0;
                         g_st.crc_err = g_st.seq_gap = 0;
                         g_st.orphan = 0; g_st.peak_ring = 0; g_st.worst_tx_us = 0;
+                        g_st.shed = 0; g_st.telem_tx = 0; g_st.telem_drop = 0;
                         Serial.println("統計をリセットしました"); }
         if (c == 't') Dbg::injectDummy();
     }

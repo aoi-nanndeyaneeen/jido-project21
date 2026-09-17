@@ -1,6 +1,11 @@
 // ============================================================
-//  S5Cmd.h  -  地上局 -> 機体 の上りコマンド (IM920SL)
+//  S5Cmd.h  -  地上局 -> 機体 の上りコマンド (IM920SL / BLE)
 // ============================================================
+//  ★ 2026-09-17: 地上局リンクを BLE でも運べるようにした (flight_controller
+//    quad/S5Features.h の GROUND_LINK)。CmdFrame の中身は同じで、運び方だけが
+//    「IM920 の TXDA 16進行」か「LogLink の T_CMD フレーム」(quad/LogLinkProto.h)
+//    かが違う。受信は Rx::poll() (IM920) か Rx::acceptRaw() (BLE) のどちらか
+//    一方だけを使う。統計・重複排除は共通。下の【帯域】は IM920 のときの話。
 //  ★ このファイルはリポジトリ直下の protocol/ にあり、flight_controller と
 //    ground_receiver の両方が platformio.ini の -I ../protocol で同じ実体を
 //    読む (以前は両プロジェクトに手コピーしていた)。Python 側の定数は
@@ -264,6 +269,18 @@ public:
     uint32_t lastRxMs()     const { return _last_rx_ms; }
     bool     everReceived() const { return _last_rx_ms != 0; }
 
+    // BLE 経由 (LogLink の T_CMD) で届いた CmdFrame の生バイト列を取り込む。
+    //  IM920 の行デコード (16進・4B チェックサム) を通らないだけで、magic/ver/seq
+    //  の検査と統計は poll() と同じ (accept())。新しいコマンドなら true。
+    //  ★ poll() と同じインスタンスで両方を呼ばないこと (seq が混ざる)。
+    bool acceptRaw(const uint8_t* p, size_t n) {
+        if (n != sizeof(CmdFrame)) { _bad_len++; return false; }
+        _rssi = -1;                      // BLE では機体側に RSSI が無い
+        CmdFrame f;
+        memcpy(&f, p, sizeof(f));
+        return accept(f);
+    }
+
     // max_age_ms 以内に正常なコマンドが届いているか
     bool fresh(uint32_t max_age_ms) const {
         return _last_rx_ms != 0 && (millis() - _last_rx_ms) < max_age_ms;
@@ -294,6 +311,11 @@ private:
 
         CmdFrame f;
         memcpy(&f, buf, sizeof(f));
+        return accept(f);
+    }
+
+    // IM920 / BLE 共通の検査。magic/ver を見て、seq で重複と欠落を数える。
+    bool accept(const CmdFrame& f) {
         if (f.magic != MAGIC)   { _bad_len++; return false; }
         if (f.ver   != VERSION) { _bad_ver++; return false; }
 

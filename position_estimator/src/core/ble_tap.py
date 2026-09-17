@@ -38,6 +38,17 @@ zip して dict にしている。125Hz 全部を文字列化すると無駄な�
         seq = tap.next_action_seq()
         tap.fire_action(ACT_PID_RESET, seq)   # デバッグ指令 (BLE Write)
         ack, age = tap.last_ack()             # 実行結果 (来ていれば dict)
+
+--------------------------------------------------------------------------
+地上局リンク (2026-09-17 追加)
+--------------------------------------------------------------------------
+IM920 の代わりに BLE で機体と操縦指令・テレメトリをやり取りするとき
+(utils/config.py の GROUND_LINK_BACKEND = "ble")、core/ble_link.py の
+BleS5Link がこのタップの上に乗る。ここが持つのは運び方だけ:
+    add_telem_listener(fn)  … T_TELEM フレームの payload を fn に渡す
+    send_ctrl(payload)      … CmdFrame (22B) を操縦用 characteristic へ Write
+★ 1 台の PC から同じ機体への BLE 接続は 1 本しか張れない。BleS5Link は
+  必ずこのタップを共有する (別に BleakClient を作らない)。
     tap.stop()
 """
 
@@ -138,6 +149,14 @@ class BleTap:
 
         self._ble = None             # ble_receiver モジュール
         self._b2c = None             # bin2csv モジュール
+
+        # 地上局リンク (core/ble_link.py の BleS5Link) 用
+        self._telem_listeners = []   # T_TELEM の payload を受け取る関数
+        self._n_telem = 0            # 受け取った T_TELEM の総数
+        self._ctrl_latest = None     # まだ書いていない最新の操縦指令 (bytes)
+        self._ctrl_busy = False      # 書き込みコルーチンが走っているか
+        self._n_ctrl_tx = 0          # BLE へ書けた操縦指令の数
+        self._n_ctrl_err = 0         # 書き込みに失敗した数
         self._names = None           # CSV の列名
 
     # ------------------------------------------------------------ 起動
@@ -190,6 +209,8 @@ class BleTap:
         with self._lock:
             st = {"connected": self._connected, "rate_hz": self._rate_hz,
                   "n_rec": self._n_rec, "err": self._err,
+                  "n_telem": self._n_telem, "n_ctrl_tx": self._n_ctrl_tx,
+                  "n_ctrl_err": self._n_ctrl_err,
                   "rec_size_ok": self._rec_size_ok,
                   "path": None, "seq_gap": 0, "open": False}
         if self._logger is not None:
@@ -222,8 +243,10 @@ class BleTap:
         """デバッグ指令 (PID reset/IMU校正/デバイス確認) を BLE Write で送る。
         接続していなければ False (呼び出し側がメッセージを出すこと)。
         ★ ここで運べるのは action + action_seq の 2byte だけ。速度・高度・
-          離着陸要求のような操縦系は絶対に足さないこと (S5Cmd.h のコメント
-          と同じ理由: BLE 経由で機体を操縦する経路を作らない設計)。"""
+          離着陸要求のような操縦系は絶対に足さないこと。操縦指令は
+          send_ctrl() (別の characteristic・別のフレーム型) だけが運ぶ。
+          デバッグ用の口と操縦の口を分けておくことで、ble_monitor.py の
+          ようなデバッグツールからは構造的に操縦が出ないままにしている。"""
         if self._loop is None or not self._connected:
             return False
         payload = bytes([int(action) & 0xFF, int(action_seq) & 0xFF])
@@ -232,6 +255,68 @@ class BleTap:
         except RuntimeError:
             return False
         return True
+
+    def add_telem_listener(self, fn):
+        """T_TELEM (地上局リンクの下りテレメトリ) の payload を fn(bytes) に渡す。
+        fn は BLE の受信スレッドから呼ばれるので、中でロックを取ること。"""
+        self._telem_listeners.append(fn)
+
+    def send_ctrl(self, payload):
+        """操縦指令 (S5Cmd.h の CmdFrame 22B) を BLE Write で送る。
+        未接続なら False。
+
+        ★ 最新値だけを送る。前の書き込みが終わる前に次が来たら、前の未送信分は
+          捨てて新しいほうを書く (指令は毎回「今どう飛ばしたいか」の全量なので、
+          古いものを律儀に全部送るほど遅れるだけ)。
+        ★ 応答なし Write を使う (遅延を減らすため)。1 発落ちても次で上書き
+          されるし、機体側は seq と鮮度で欠落を数えている。"""
+        if self._loop is None or not self._connected:
+            return False
+        payload = bytes(payload)
+        start = False
+        with self._lock:
+            self._ctrl_latest = payload
+            if not self._ctrl_busy:
+                self._ctrl_busy = True
+                start = True
+        if start:
+            try:
+                asyncio.run_coroutine_threadsafe(self._ctrl_writer(), self._loop)
+            except RuntimeError:
+                with self._lock:
+                    self._ctrl_busy = False
+                return False
+        return True
+
+    async def _ctrl_writer(self):
+        try:
+            while True:
+                with self._lock:
+                    payload = self._ctrl_latest
+                    self._ctrl_latest = None
+                    if payload is None:
+                        self._ctrl_busy = False
+                        return
+                client = self._client
+                if client is None or not client.is_connected:
+                    continue            # 捨てる (切断中の指令は送らない)
+                try:
+                    await client.write_gatt_char(self._ble.BLE_CHAR_CTRL_UUID,
+                                                 payload, response=False)
+                    with self._lock:
+                        self._n_ctrl_tx += 1
+                except Exception as e:
+                    with self._lock:
+                        self._n_ctrl_err += 1
+                        first = (self._n_ctrl_err == 1)
+                    if first:
+                        self._say(f"[BLE] 操縦指令の送信に失敗: {e}  "
+                                  "(log_recorder のファームが古い = 操縦用 "
+                                  "characteristic が無い可能性)")
+        except BaseException:
+            with self._lock:
+                self._ctrl_busy = False
+            raise
 
     async def _write_action(self, payload: bytes):
         client = self._client
@@ -255,6 +340,19 @@ class BleTap:
 
         # まず保存 (ble_receiver.BinLogger と完全に同じ .BIN ができる)
         self._logger.on_frame(type_, seq, payload)
+
+        if type_ == getattr(self._ble, "T_TELEM", None):
+            # 地上局リンクの下りテレメトリ。.BIN には書かれない (BinLogger は
+            # 型を見て無視する。seq の数え上げのためだけに上で渡している)。
+            with self._lock:
+                self._n_telem += 1
+                listeners = list(self._telem_listeners)
+            for fn in listeners:
+                try:
+                    fn(payload)
+                except Exception as e:
+                    self._say(f"[BLE] テレメトリの解釈で例外: {e}")
+            return
 
         if type_ == self._ble.T_START:
             # 32B ヘッダの rec_size が今の bin2csv と食い違っていたら、
@@ -369,6 +467,7 @@ class BleTap:
                 with self._lock:
                     self._connected = False
                     self._client = None
+                    self._ctrl_latest = None
 
             if not self._stop.is_set():
                 self._say("[BLE] 切断。再接続します")

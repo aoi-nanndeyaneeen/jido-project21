@@ -454,24 +454,34 @@ YAW_ENTRY_MODE_ENABLED = True
 YAW_ENTRY_MAX_DVY_BODY = 0.4   # |dvy_body| がこれ未満なら「ほぼ純前進」とみなす [m/s]
 
 # ==========================================
-# 地上局リンク（機体との IM920 経由の双方向通信）
+# 地上局リンク（機体との双方向通信: 操縦指令 + テレメトリ）
 # ==========================================
-# core/s5_link.py が XIAO ESP32C3 (ground_receiver の env:xiao_s5_log) を開く。
+# ★ 2026-09-17: IM920 から BLE へ移した。どちらを使うかはここ 1 行で決まる。
+#   "ble"   : core/ble_link.py。log_recorder (XIAO ESP32C3) と BLE でつなぐ。
+#             機体125Hzログ (下の BLE_LOG_*) と同じ BLE 接続を共有する。
+#   "im920" : core/s5_link.py。地上局 XIAO (ground_receiver の env:xiao_s5_log)
+#             を USB で開き、IM920 経由で機体とつなぐ (旧経路)。
+# ★ IM920 に戻すときは機体側もそろえること:
+#   flight_controller/include/quad/S5Features.h の GROUND_LINK = GroundLink::IM920
+#   にして焼き直す (片方だけ変えると、機体は指令を 1 つも受け取らない =
+#   GUIDED に入らない。飛行中なら 1 秒でホールド -> 4 秒で自動着陸)。
+GROUND_LINK_BACKEND = "ble"
 #
-# ★ ground_receiver/tools/s5_logger.py を同時に起動しないこと。
+# ★ im920 のとき: ground_receiver/tools/s5_logger.py を同時に起動しないこと。
 #   USB シリアルは1プロセスしか開けない。テレメトリの CSV 保存は
-#   S5Link 側がやる（logs/s5_link_*.csv）。
+#   S5Link 側がやる（logs/s5_link_*.csv）。BLE でも同じ名前・同じ列で残る。
 GROUND_LINK_ENABLED = True
-GROUND_LINK_PORT    = None    # None = VID:PID (303A:1001 / 旧RP2040 2E8A:000A) で自動検出
+GROUND_LINK_PORT    = None    # im920 のみ。None = VID:PID (303A:1001 / 旧RP2040 2E8A:000A) で自動検出
 
 # ==========================================
 # core/ble_tap.py が log_recorder (XIAO ESP32C3, BLE) から機体125Hzログを
-# 受けて LOGnnnn.BIN に保存する。GROUND_LINK_ENABLED (IM920/USB) とは
-# 別デバイス・別インターフェースなので同時に開いても衝突しない。
+# 受けて LOGnnnn.BIN に保存する。
 #
 # ★ bleak が未導入 / log_recorder の電源が入っていないだけなら、
 #   黙って諦めて追跡・ミッションはそのまま続行する (BleTap.start() 参照)。
 #   「付けっぱなしで害がない」設計なので、既定で有効にしてある。
+# ★ GROUND_LINK_BACKEND = "ble" のときは、ここが False でも地上局リンクの
+#   ために BLE 接続は張る (その場合も .BIN は残る。BleTap は常に保存するため)。
 BLE_LOG_ENABLED = True
 BLE_LOG_NAME    = "S5-LogBLE"  # log_recorder/src/main.cpp の BLE_DEVICE_NAME と一致させる
 

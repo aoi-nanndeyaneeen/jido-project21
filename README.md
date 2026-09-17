@@ -80,6 +80,39 @@ VSCode + PlatformIO を推奨します。
 
 ---
 
+## 📶 地上局リンクの経路 (BLE / IM920) の切り替え
+
+**2026-09-17 から、機体との通信 (操縦指令 + テレメトリ) は既定で BLE** を使う。
+IM920 が担っていた役割をそのまま BLE へ移しただけで、送る中身
+(`protocol/S5Cmd.h` の `CmdFrame` / `protocol/S5Telem.h` の各フレーム) は両経路で共通。
+
+```
+[BLE (既定)]
+  機体 drone_s5 ──UART(Serial2)── log_recorder (XIAO ESP32C3) ──BLE── PC
+    上り: CmdFrame (22B) を BLE Write → log_recorder が T_CMD で機体へ中継
+    下り: A,B (20Hz) + C/D (10Hz) + P を束ねた T_TELEM → BLE Notify
+    機体125Hzログ (.BIN) も同じ BLE 接続に乗る
+
+[IM920 (旧経路)]
+  機体 drone_s5 ──IM920── 地上局 XIAO (ground_receiver: xiao_s5_log) ──USB── PC
+```
+
+| 場所 | BLE (今) | IM920 に戻すとき |
+|------|----------|------------------|
+| `flight_controller/include/quad/S5Features.h` | `GROUND_LINK = GroundLink::BLE` | `GroundLink::IM920` にして `drone_s5` を焼き直す |
+| `position_estimator/src/utils/config.py` | `GROUND_LINK_BACKEND = "ble"` | `"im920"` (console.py は `--link im920` でも可) |
+| 地上局ハード | log_recorder に最新ファーム (`pio run -e xiao_logger_esp32c3 -t upload`) | 地上局 XIAO + IM920 を USB に挿す (`xiao_s5_log`) |
+
+★ 機体側と PC 側は必ずそろえること。片方だけ変えると機体は指令を1つも受け取らない
+(GUIDED に入らない。飛行中なら 1 秒でホールド → 4 秒で自動着陸)。
+★ フェイルセーフの構造は IM920 と同じ。PC が黙れば log_recorder は 1.5 秒で中継を止め、
+BLE が切れたら即止める。
+★ BLE 版では **log_recorder の TX (D6) → 機体 RX7 の配線が必須** (操縦指令がここを通る)。
+★ BLE 版では PC から機体への BLE 接続は 1 本だけ。`console.py` / `main.py` の実行中は
+`ble_monitor.py` を同時に使えないので、PID リセット / IMU 校正 / デバイス確認は
+`console.py` の `P` / `k` / `i` キーから送る。
+★ テレメトリの CSV (`s5_link_*.csv`) は地上局版と同じ列で残る (`rx_ms` は PC 時刻、`rssi` は -1)。
+
 ## 🎮 地上局コンソール (見ながら指令を出す)
 
 テレメトリを1画面に出しながら、キー入力で機体へ指令を出せる対話コンソールです。

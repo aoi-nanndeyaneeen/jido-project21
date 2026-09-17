@@ -57,6 +57,11 @@ class LinkStatusView:
             cv2.imshow("Link Status", image)
             return
 
+        if getattr(link, "backend", "im920") == "ble":
+            self._render_ble(image, link)
+            cv2.imshow("Link Status", image)
+            return
+
         stat = link.diagnostics()
         telemetry_age = link.age()
         if math.isfinite(telemetry_age):
@@ -154,6 +159,96 @@ class LinkStatusView:
                    fc_up_detail)
         self._line(image, 298, "Flight controller", fc_value, fc_state, fc_detail)
         cv2.imshow("Link Status", image)
+
+    @classmethod
+    def _uplink_as_seen_by_aircraft(cls, stat):
+        """機体が D フレームで報告する上りの受信状況 (IM920/BLE 共通)。"""
+        fc_good = stat.get("fc_cmd_good")
+        fc_lost = int(stat.get("fc_cmd_lost", 0))
+        fc_age_cs = int(stat.get("fc_cmd_age_cs", 0xFFFF))
+        if fc_good is None:
+            return "idle", "NO D FRAME", "waiting for the aircraft's uplink report"
+        if fc_age_cs == 0xFFFF:
+            return "bad", "NEVER RECEIVED", "the aircraft has not seen a single command"
+        fc_good = int(fc_good)
+        fc_total = fc_good + fc_lost
+        fc_loss = 100.0 * fc_lost / fc_total if fc_total else 0.0
+        fc_age_s = fc_age_cs / 100.0
+        detail = f"got {fc_good}, lost {fc_lost}, last {fc_age_s:.2f}s ago"
+        if fc_age_s > 1.0 or fc_loss >= 25.0:
+            state = "bad"
+        elif fc_age_s > 0.5 or fc_loss >= 10.0:
+            state = "warn"
+        else:
+            state = "ok"
+        return state, f"{fc_loss:.0f}% lost", detail
+
+    def _render_ble(self, image, link):
+        """GROUND_LINK_BACKEND="ble" のとき。区間は PC-BLE / 下り / 上り / 機体。"""
+        stat = link.diagnostics()
+
+        if stat.get("ble_connected"):
+            ble_state, ble_value = "ok", "CONNECTED"
+            ble_detail = link.port
+        else:
+            ble_state, ble_value = "bad", "SCANNING"
+            ble_detail = str(stat.get("ble_err") or "looking for log_recorder")
+
+        frames = int(stat.get("telem_frames", 0))
+        if frames:
+            relay_state, relay_value = "ok", "OK"
+            relay_detail = f"{frames} telemetry bundles via log_recorder"
+        elif stat.get("ble_connected"):
+            relay_state, relay_value = "bad", "NO TELEMETRY"
+            relay_detail = "check FC GROUND_LINK=BLE / UART to log_recorder"
+        else:
+            relay_state, relay_value, relay_detail = "idle", "UNKNOWN", ""
+
+        telemetry_age = link.age()
+        if math.isfinite(telemetry_age):
+            down_state = "ok" if telemetry_age < 1.0 else "bad"
+            down_value = "OK" if down_state == "ok" else "LOST"
+            down_detail = f"last packet {telemetry_age * 1000:.0f} ms ago"
+        else:
+            down_state, down_value, down_detail = "bad", "WAITING", "no DATA packet yet"
+        received = int(stat.get("alt", 0) + stat.get("pos", 0) + stat.get("att", 0)
+                       + stat.get("dv", 0) + stat.get("param", 0))
+        lost = int(stat.get("lost", 0))
+        total = received + lost
+        loss = 100.0 * lost / total if total else 0.0
+        if received and (loss >= 10.0 or stat.get("badlen", 0)) and down_state == "ok":
+            down_state = "warn"
+
+        ctrl_err = int(stat.get("ctrl_err", 0))
+        up_detail = f"BLE writes {int(stat.get('ctrl_tx', 0))}, failed {ctrl_err}"
+        if not stat.get("cmd_have"):
+            up_state, up_value, up_detail = "idle", "IDLE", "PC is not commanding the aircraft"
+        elif link.flag("cmd_fresh"):
+            up_state, up_value = "ok", "OK"
+        else:
+            up_state, up_value = "bad", "NOT ACKNOWLEDGED"
+
+        fc_up_state, fc_up_value, fc_up_detail = self._uplink_as_seen_by_aircraft(stat)
+
+        st = link.state()
+        if not st:
+            fc_state, fc_value, fc_detail = "idle", "WAITING", "no flight-controller telemetry"
+        else:
+            flags = [n for k, n in (("armed", "ARMED"), ("guided", "GUIDED"),
+                                    ("flow_ok", "FLOW"), ("range_valid", "RANGE"))
+                     if bool(st.get(k, 0))]
+            fc_value = " ".join(flags) if flags else "NOT READY"
+            fc_state = "ok" if bool(st.get("flow_ok", 0)) and bool(st.get("range_valid", 0)) else "warn"
+            fc_detail = f"mode {int(st.get('mode', -1))}"
+
+        self._line(image, 78, "PC - BLE", ble_value, ble_state, ble_detail)
+        self._line(image, 122, "log_recorder - FC UART", relay_value, relay_state, relay_detail)
+        self._line(image, 166, "Drone -> PC telemetry", down_value, down_state,
+                   f"{down_detail}; loss {loss:.1f}%")
+        self._line(image, 210, "PC -> Drone command", up_value, up_state, up_detail)
+        self._line(image, 254, "  ... as seen by aircraft", fc_up_value, fc_up_state,
+                   fc_up_detail)
+        self._line(image, 298, "Flight controller", fc_value, fc_state, fc_detail)
 
     def close(self):
         cv2.destroyWindow("Link Status")

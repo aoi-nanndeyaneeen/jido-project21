@@ -4,6 +4,20 @@
 PC (position_estimator) にまたがる自動操縦の **どこで何が何 Hz で回っているか** を 1 枚に
 まとめたもの。個々の使い方は README.md / GROUND_CONSOLE_GUIDE.md / WAYPOINT_BRINGUP.md。
 
+★ 2026-09-17: 地上局リンクは既定で **BLE** になった。下の図の「地上局 ground_receiver +
+IM920」の段は `GROUND_LINK=IM920` に戻したときの経路。BLE のときはその段が次に置き換わる
+(切り替え方は README「地上局リンクの経路」):
+
+```
+ PC  core/ble_link.py (BleS5Link。S5Link と同じ API) ── BLE (core/ble_tap.py と接続を共有)
+      上り: CmdFrame 22B を Write (SEND_HZ=10Hz のまま)
+      下り: T_TELEM を分解 → TelemetryStore と同じ列の state() / s5_link_*.csv
+ log_recorder (XIAO ESP32C3)  src/main.cpp
+      上り: mailbox → UART T_CMD (新指令は即 / 200ms キープアライブ / PC 1.5s 無音 or BLE 切断で停止)
+      下り: UART の T_TELEM を Notify (REC と同じ FIFO。滞留 16KB 超で古いものから捨てる)
+ 機体  毎ループ LogLink::pollCmd → s5rx.acceptRaw  /  20Hz TelemetryTx::tickBle (A+B+(C|D) を 1 束)
+```
+
 ```
  ┌─ PC (position_estimator) ─────────────────────────────────────────────────────┐
  │  カメラスレッド core/tracker.py           15〜60Hz (カメラの fps)               │
@@ -92,7 +106,7 @@ PC 側は「Step の列」を順に実行する。各 Step に制限時間があ
 | PC 描画 5Hz / 画面 2Hz | `MPL_RENDER_HZ` / `STATUS_REDRAW_S` | `app/main_loop.py` |
 | 位置補正 2s に 1 回 | `POS_CORR_PERIOD_S` | `utils/config.py` |
 
-★ IM920 は半二重。上り (地上局 `CMD_MIN_GAP_MS`) と下り (機体 `TELEM_TX_HZ`) は
+★ (IM920 のとき) IM920 は半二重。上り (地上局 `CMD_MIN_GAP_MS`) と下り (機体 `TELEM_TX_HZ`) は
   **必ずセットで**見て、UART 占有率 55% 程度を上限にする (2026-09-16 現在 53%)。
 
 ★ PC の `SEND_HZ` は**上限**。実際の送信はカメラのフレームが来たときにしか起きないので、

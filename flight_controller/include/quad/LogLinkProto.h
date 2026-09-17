@@ -33,6 +33,9 @@
 //    逆方向      : RP2040 -> T_STAT を 2Hz。Teensy の 's' 表示に出る
 //    デバッグ    : RP2040 -> T_ACT (BLE Write を中継。PID reset/IMU校正/
 //                  デバイス確認のみ)。Teensy -> T_ACT_ACK (実行結果)
+//    地上局リンク: (2026-09-17 追加。drone_s5.cpp の S5::GROUND_LINK == BLE のとき)
+//                  Teensy -> T_TELEM (S5Telem.h のフレームを束ねたもの)
+//                  ロガー -> T_CMD   (S5Cmd.h の CmdFrame。BLE Write を中継)
 // ============================================================
 #pragma once
 #include <stdint.h>
@@ -48,9 +51,11 @@ constexpr uint8_t T_START = 0x01;   // payload = 32B の BIN ヘッダ ("S5LOG".
 constexpr uint8_t T_REC   = 0x02;   // payload = FlightLog::Rec
 constexpr uint8_t T_STOP  = 0x03;   // payload なし
 constexpr uint8_t T_ACT_ACK = 0x04; // payload = ActAck (下記)。単発。定期送信ではない
+constexpr uint8_t T_TELEM = 0x05;   // payload = S5T の各フレームを連結したもの (下記)
 // ロガー -> FC
 constexpr uint8_t T_STAT  = 0x81;   // payload = Stat
 constexpr uint8_t T_ACT   = 0x82;   // payload = ActReq (下記)。単発。BLE から来る
+constexpr uint8_t T_CMD   = 0x83;   // payload = S5C::CmdFrame (22B) そのもの。BLE から来る
 
 // ------------------------------------------------------------
 //  BLE 経由の単発メンテナンス指令 (2026-09-14 追加)
@@ -59,11 +64,13 @@ constexpr uint8_t T_ACT   = 0x82;   // payload = ActReq (下記)。単発。BLE 
 //  ロガー ─BLE Notify→ PC、という往復。デバッグ用 (IMU再校正/デバイス確認/
 //  PIDリセット) 専用の経路で、S5Cmd.h の Action をそのまま運ぶ。
 //
-//  ★★ ここが一番大事: このフレームには action と action_seq しか無い。
-//    速度・高度・離着陸要求などの操縦系フィールドは存在しない (=構造的に
-//    入れられない)。BLE 経由で機体を操縦することは絶対にしない、という
-//    要件をプロトコルレベルで保証するための設計。操縦は今まで通り
-//    IM920 (S5Cmd.h の CmdFrame) だけが担う。
+//  ★ このフレームには action と action_seq しか無い。操縦系 (速度・高度・
+//    離着陸要求) はここには絶対に混ぜない。
+//    2026-09-17 に地上局リンク (操縦 + テレメトリ) を IM920 から BLE へ
+//    移したが、それは下の T_CMD / T_TELEM という「別のフレーム型・別の
+//    BLE characteristic」で運ぶ。デバッグ用の単発指令と操縦指令を同じ
+//    口に入れないことで、ble_monitor.py のようなデバッグツールからは
+//    今までどおり構造的に操縦できないままにしてある。
 //
 //  action_seq の重複排除は FC 側 (drone_s5.cpp handleBleAction()) が
 //  S5Cmd.h の CmdFrame.action_seq と同じ流儀 (値が変わった最初の1回だけ
@@ -81,6 +88,24 @@ struct __attribute__((packed)) ActAck {
     uint8_t imu_ok;        // SELFTEST のときだけ意味を持つ
     uint8_t i2c_found;     // 同上
 };
+
+// ------------------------------------------------------------
+//  地上局リンク (IM920 の代わり。2026-09-17 追加)
+// ------------------------------------------------------------
+//  IM920 で運んでいたものを「中身はそのまま・運び方だけ」差し替える。
+//    下り T_TELEM : S5Telem.h の AltFrame/PosFrame/AttFrame/DvFrame/ParamFrame
+//                   を 1 個以上そのまま連結したもの。各フレームの先頭 1B が
+//                   type なので、S5T::payloadBytesFor(type) で切り分けられる。
+//                   IM920 の 32B 制限が無いので 1 フレームに複数枚束ねて、
+//                   BLE Notify の回数 (= 帯域) を節約する。
+//                   IM920 版に付いていた 4B チェックサムは付けない
+//                   (LogLink の CRC8 が同じ役をする)。
+//    上り T_CMD   : S5Cmd.h の CmdFrame (22B) そのもの。seq はロガーが振り直す
+//                   (IM920 版で地上局 XIAO が振っていたのと同じ役割分担)。
+//  ★ 中身の構造体は IM920 と完全に共通。S5::GROUND_LINK を IM920 に戻せば
+//    旧経路 (ground_receiver の xiao_s5_log) がそのまま動く。
+constexpr size_t  TELEM_MAX_PAYLOAD = 255;
+constexpr size_t  CMD_PAYLOAD       = 22;    // sizeof(S5C::CmdFrame)。S5Cmd.h 側で static_assert
 
 constexpr size_t  HDR_LEN     = 5;    // SOF1 SOF2 type len seq
 constexpr size_t  OVERHEAD    = HDR_LEN + 1;          // + crc

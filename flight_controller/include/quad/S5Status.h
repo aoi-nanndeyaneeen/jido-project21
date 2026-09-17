@@ -28,11 +28,22 @@ inline void printStatus(Vehicle& v, uint32_t dt_us) {
                   Quad::GUIDED_ENABLE ? " (資格切れ中はPOSHOLD)" : "");
     SelfTest::printCompact(Serial);   // 起動時に何がつながっていたか (画面に残す)
 
+    if (USE_BLE_LINK) {
+        // BLE 経路。テレメトリは LogLink のリングへ積むだけなので、drop が増えるなら
+        // リング (8KB) が詰まっている = UART かロガーが止まっている。
+        Serial.printf("GROUND LINK: BLE (log_recorder 経由)  TELEM drop=%lu  "
+                      "CMD 中継受信=%lu 長さ不正=%lu\n",
+                      (unsigned long)LogLink::telemDrops(),
+                      (unsigned long)LogLink::cmdRxCount(),
+                      (unsigned long)LogLink::cmdBadLen());
+    }
     if (USE_IM920) {
         // 下りテレメトリの送信状況。drop が増え続けるなら TELEM_TX_HZ が速すぎる。
         Serial.printf("TELEM tx=%lu drop=%lu %s\n",
                       (unsigned long)v.s5tx.sent(), (unsigned long)v.s5tx.dropped(),
                       v.s5tx.busy() ? "(sending)" : "");
+    }
+    if (USE_IM920 || USE_BLE_LINK) {
 
         // ---- 上りコマンド (GUIDED) --------------------------------
         //  ★ ベンチで「地上局のコマンドが届いているか」を確認する唯一の場所。

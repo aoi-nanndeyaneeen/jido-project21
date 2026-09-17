@@ -1,9 +1,15 @@
 """
 console.py  -  機体の状態を見ながら指令を出す地上局コンソール
 
-    機体 (drone_s5) ──IM920 15Hz──> 地上局 XIAO ──USB──> ここ ──> 画面
-                    <──IM920 5Hz───          <──USB──  ここ <── キー入力
-    機体 (drone_s5) ──UART──> log_recorder XIAO ──BLE 125Hz──> ここ (--ble)
+    [BLE 版 (既定。utils/config.py の GROUND_LINK_BACKEND = "ble")]
+    機体 (drone_s5) ──UART──> log_recorder XIAO ──BLE──> ここ ──> 画面
+                    <──UART──                  <──BLE──  ここ <── キー入力
+      (テレメトリ 20Hz / 指令 10Hz / 機体125Hzログを 1 本の BLE 接続で)
+
+    [IM920 版 (--link im920 / 旧経路)]
+    機体 (drone_s5) ──IM920 8Hz──> 地上局 XIAO ──USB──> ここ ──> 画面
+                    <──IM920 8Hz──          <──USB──  ここ <── キー入力
+    機体 (drone_s5) ──UART──> log_recorder XIAO ──BLE 125Hz──> ここ
 
 ==========================================================================
 これは何か
@@ -68,11 +74,13 @@ from datetime import datetime
 from pathlib import Path
 
 from core.keyreader import KeyReader
-from core.s5_link import (S5Link, REQ_ABORT, REQ_GUIDED, REQ_HOLD,
+from core.ble_link import open_ground_link
+from core.s5_link import (REQ_ABORT, REQ_GUIDED, REQ_HOLD,
                           REQ_IDLE, REQ_LAND, REQ_TAKEOFF, REQ_NAME,
                           CF_ARMED_OK, CF_ALT_ABS, CF_POS_CORR, CF_POS_SHIFT)
 from core.maneuver import Circle, FigureEight, ClimbTurn, ManeuverRunner
-from utils.config import (GROUND_LINK_PORT, LOG_DIR, MISSION_TAKEOFF_ALT_M,
+from utils.config import (GROUND_LINK_BACKEND, BLE_LOG_NAME,
+                          GROUND_LINK_PORT, LOG_DIR, MISSION_TAKEOFF_ALT_M,
                           COMP_MANEUVER_SPEED, COMP_TURN_RADIUS_M,
                           COMP_TURN_RIGHT, COMP_CIRCLE_LAPS, COMP_CLIMB_ALT_M)
 from utils.logger import CsvLogger
@@ -342,6 +350,7 @@ class KeyHandler:
         self.say = say
         self.help_on = True
         self._t_takeoff = 0.0
+        self._t_imu_cal = 0.0
 
     def handle(self, ch):
         """処理して True。q が押されたら False (呼び出し側が終了する)。"""
@@ -412,11 +421,7 @@ class KeyHandler:
         elif ch == "f":
             cmdr.nudge(dalt=-ALT_STEP_M)
         elif ch in ("P", "k", "i"):
-            # ★ 2026-09-14: PID reset / IMU校正 / デバイス確認は IM920 から
-            #   廃止した (IM920は操縦専用に戻した)。BLEだけで完結する
-            #   ble_monitor.py の同じキーを使うこと。
-            self.say("[Console] P/k/i はIM920では廃止しました。"
-                     "ble_monitor.py を使ってください (BLE経由)")
+            self._maintenance(ch, now)
         elif ch in ("S", "D", "Z", "C"):
             # 地上局 XIAO のキーをそのまま転送する (ground_receiver main.cpp の handleKey)
             fwd = {"S": "s", "D": "d", "Z": "z", "C": "1"}[ch]
@@ -425,6 +430,36 @@ class KeyHandler:
         elif ch == "?":
             self.help_on = not self.help_on
         return True
+
+    def _maintenance(self, ch, now):
+        """PID reset / IMU校正 / デバイス確認 (BLE のデバッグ指令)。
+
+        ★ IM920 版: 使えない (IM920 は操縦専用)。ble_monitor.py を別に起動する。
+        ★ BLE 版: 地上局リンクと同じ BLE 接続を使うので、ble_monitor.py は
+          同時に接続できない (1 台の PC から同じ機体へは 1 本だけ)。代わりに
+          ここから送る。キーと確認手順は ble_monitor.py と同じ。
+        """
+        tap = getattr(self.link, "tap", None)
+        if tap is None:
+            self.say("[Console] P/k/i は IM920 経由では使えません。"
+                     "ble_monitor.py を使ってください (BLE経由)")
+            return
+        from core.ble_tap import ACT_PID_RESET, ACT_IMU_CAL, ACT_SELFTEST
+        if ch == "k" and now - self._t_imu_cal >= self.TAKEOFF_CONFIRM_S:
+            self._t_imu_cal = now
+            self.say("[Console] IMU校正? 機体を水平に置いて静止させ、"
+                     f"{self.TAKEOFF_CONFIRM_S:.0f}秒以内にもう一度 k (アーム中は機体が拒否)")
+            return
+        action, label = {"P": (ACT_PID_RESET, "PID reset"),
+                         "k": (ACT_IMU_CAL, "IMU校正"),
+                         "i": (ACT_SELFTEST, "デバイス確認")}[ch]
+        if ch == "k":
+            self._t_imu_cal = 0.0
+        seq = tap.next_action_seq()
+        if tap.fire_action(action, seq):
+            self.say(f"[Console] {label} を送信 (BLE, seq={seq})。結果は [BLE] ACK 行に出ます")
+        else:
+            self.say(f"[Console] {label} を送れませんでした (BLE 未接続)")
 
 
 # ==========================================================================
@@ -548,10 +583,11 @@ def build_lines(link, cmd, tap, messages, rate_hz, help_on):
             f"v={MANEUVER_SPEED_MPS:.2f} ω={MANEUVER_YAW_RATE_DPS:+.0f} r~1.5m ※GUIDED中",
             " x 送信停止   w/s 前後   a/d 左右   0 速度ゼロ   r/f 目標高度   q 終了",
             f" o ここをフェンス中心に (離陸後)   ★ {DEADMAN_S:.1f}s 操作が無いと速度は自動で 0",
-            " S 地上局の状態   D 生データ表示   Z 統計クリア   C CSV出力ON   ? ヘルプ",
+            " S 地上局の状態   D 生データ表示   Z 統計クリア   C CSV出力ON   ? ヘルプ"
+            "  (S/D/C は IM920 版のみ)",
+            " P PIDリセット  k IMU校正(2回押し)  i デバイス確認  (BLE版のみ。IM920版は ble_monitor.py)",
             " ★ w/a/s/d は機体座標 (機首向き基準)。緊急停止はプロポ。",
             " ★ 旋回中にヨースティックへ触れると機体側が即中断する (安全網)。",
-            " ★ PIDリセット/IMU校正/デバイス確認は ble_monitor.py (BLE) へ移動しました。",
         ]
     else:
         lines.append(" ? キーでヘルプ")
@@ -593,14 +629,18 @@ def build_plain_line(link, cmd, tap, rate_hz):
 def main():
     ap = argparse.ArgumentParser(
         description="機体テレメトリを見ながら上りコマンドを出す地上局コンソール")
+    ap.add_argument("--link", choices=("ble", "im920"), default=GROUND_LINK_BACKEND,
+                    help="地上局リンクの経路 (既定: utils/config.py の "
+                         "GROUND_LINK_BACKEND)。機体側 S5Features.h の "
+                         "GROUND_LINK とそろえること")
     ap.add_argument("--port", default=GROUND_LINK_PORT,
-                    help="地上局 XIAO の COM ポート (既定: VID:PID で自動検出)")
+                    help="[im920] 地上局 XIAO の COM ポート (既定: VID:PID で自動検出)")
     ap.add_argument("--no-ble", action="store_true",
                     help="log_recorder の BLE 125Hzログを受けない。"
                         "既定では自動で探しにいく (bleak 未導入 / 機体が"
                         "見つからないときは黙って諦めて続行するので、"
                         "付けなくても害はない)")
-    ap.add_argument("--ble-name", default="S5-LogBLE", help="BLE デバイス名")
+    ap.add_argument("--ble-name", default=BLE_LOG_NAME, help="BLE デバイス名")
     ap.add_argument("--log-dir", default=str(LOG_DIR),
                     help="ログの保存先 (既定: position_estimator/src/logs)")
     ap.add_argument("--alt", type=float, default=MISSION_TAKEOFF_ALT_M,
@@ -625,11 +665,25 @@ def main():
     screen.clear()
     print("地上局を探しています...", flush=True)
 
-    link = S5Link(port=args.port, log_dir=log_dir, on_message=say)
-    if not link.ok:
-        print("\n".join(messages))
-        print("\n地上局につながりません。USB とファーム (env:xiao_s5_log) を確認してください。")
-        return 1
+    tap = None
+    if args.link == "ble":
+        # BLE 版: 地上局リンクと機体125Hzログは同じ BLE 接続 (link 側が起こす)。
+        if args.no_ble:
+            say("[Console] --link ble では地上局リンクに BLE を使うので --no-ble は無視します")
+        link = open_ground_link("ble", ble_name=args.ble_name, log_dir=log_dir,
+                                on_message=say)
+        if not link.ok:
+            print("\n".join(messages))
+            print("\nBLE を使えません。bleak (pip install bleak) を確認してください。"
+                  "IM920 に戻すなら --link im920 (機体側も戻すこと)。")
+            return 1
+        tap = link.tap
+    else:
+        link = open_ground_link("im920", port=args.port, log_dir=log_dir, on_message=say)
+        if not link.ok:
+            print("\n".join(messages))
+            print("\n地上局につながりません。USB とファーム (env:xiao_s5_log) を確認してください。")
+            return 1
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     clogger = ConsoleLogger(log_dir / f"console_{ts}.csv")
@@ -640,8 +694,7 @@ def main():
     #   (テレメトリ・操作ログ・機体125Hz) が全部そろうようにするため。
     #   bleak が無い / log_recorder が見つからないだけなら黙って諦めて
     #   続行する (BleTap.start() 参照) ので、付けっぱなしでも害はない。
-    tap = None
-    if not args.no_ble:
+    if args.link == "im920" and not args.no_ble:
         from core.ble_tap import BleTap
         tap = BleTap(log_dir, name=args.ble_name, on_event=say)
         if not tap.start():
@@ -680,9 +733,9 @@ def main():
         say("[Console] Ctrl+C")
     finally:
         cmdr.close()
-        if tap is not None:
+        link.close()          # 最後に必ず ABORT を送って閉じる (BLE 版はタップもここで止まる)
+        if tap is not None and args.link == "im920":
             tap.stop()
-        link.close()          # 最後に必ず ABORT を送って閉じる
         clogger.close()
         if not args.plain:
             # 全画面表示だと、終了後の画面に何も残らない。最後の数行だけ戻す。

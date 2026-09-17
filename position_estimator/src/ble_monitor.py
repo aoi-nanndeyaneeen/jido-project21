@@ -17,17 +17,20 @@ ble_monitor.py  -  log_recorder (XIAO ESP32C3) 経由で、BLE だけで完結�
 ★ 2. は完全にデバッグ用限定。機体の操縦 (離着陸・速度・高度など) は
   ここからは絶対にできない。プロトコル (LogLinkProto.h の ActReq) に
   action と action_seq の2byteしかフィールドが無く、操縦系を送ろうにも
-  送る場所が無い、という構造で保証してある。操縦は今まで通り
-  console.py / main.py (IM920) だけが担う。
+  送る場所が無い、という構造で保証してある。操縦は console.py / main.py
+  だけが担う (2026-09-17 から既定は BLE 経由だが、操縦指令は別の
+  characteristic・別のフレーム型で運ぶので、このツールからは出ない)。
 
 ★ 新しい無線プロトコルを画面表示のために足したわけではない。BLE 経由で
   既に受け取っている FlightLog::Rec (bin2csv.py が解釈しているのと同じ
   バイナリ) を文字列にしているだけ。指令のほうは log_recorder 側に
   新設した Write 用 characteristic を使う (詳細は core/ble_tap.py)。
 
-★ 地上局 (IM920 / COM ポート) には一切触らない。console.py / main.py と
-  同時に起動しても構わない (BLE Notify は複数クライアントが繋がっても
-  平気)。ただし操縦の代わりにはならない (見る・単発指令を送るだけ)。
+★ 地上局 (IM920 / COM ポート) には一切触らない。
+★ console.py / main.py と同時に起動できるのは GROUND_LINK_BACKEND="im920"
+  のときだけ。"ble" (既定) では console.py / main.py が同じ機体へ BLE 接続を
+  張っているので、ここからは接続できない (1 台の PC から同じ機体へは 1 本)。
+  その場合 P/k/i は console.py の同じキーから送れる。
 
 ==========================================================================
 使い方

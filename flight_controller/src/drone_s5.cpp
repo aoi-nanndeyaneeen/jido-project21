@@ -62,6 +62,9 @@
 namespace Q = Quad;
 using S5::Vehicle;
 
+static_assert(sizeof(S5C::CmdFrame) == LogLinkProto::CMD_PAYLOAD,
+              "quad/LogLinkProto.h の CMD_PAYLOAD を protocol/S5Cmd.h の CmdFrame に合わせること");
+
 // ============================================================
 //  § 1  インスタンス
 // ============================================================
@@ -73,7 +76,8 @@ static Q::Ticker  main_tick    (S5::MAIN_HZ);        // 1000Hz
 static Q::Ticker  flow_tick    (Q::FLOW_LOOP_HZ);    //  100Hz  フロー読み (制御は FLOW_CTRL_HZ)
 static Q::Ticker  range_tick   (Q::RANGE_LOOP_HZ);   //  100Hz  測距ポーリング
 static Q::Ticker  telem_rx_tick(S5::TELEM_RX_HZ);    //  200Hz  上りコマンド受信
-static Q::Ticker  telem_tick   (S5::TELEM_TX_HZ);    //    8Hz  下りテレメトリ
+static Q::Ticker  telem_tick   (S5::USE_BLE_LINK ? S5::BLE_TELEM_HZ   //   20Hz  下りテレメトリ (BLE)
+                                                  : S5::TELEM_TX_HZ);   //    8Hz  下りテレメトリ (IM920)
 static Q::Ticker  debug_tick   (S5::DEBUG_HZ);       //   10Hz  画面
 static Q::Divider guided_div   (S5::GUIDED_DIV);     //  100Hz  地上局要求の翻訳
 static Q::Divider log_div      (FlightLog::DIV);     //  500Hz  ログ 1 行
@@ -609,7 +613,13 @@ void loop() {
     const uint32_t t4 = micros();
 
     // --- 地上局 ---
-    if (S5::USE_IM920 && telem_rx_tick.ready()) v.s5rx.poll();       // 200Hz  上りコマンド受信
+    if (S5::USE_IM920 && telem_rx_tick.ready()) v.s5rx.poll();       // 200Hz  上りコマンド受信 (IM920)
+    if (S5::USE_BLE_LINK && v.link_ok) {                              // 毎ループ 上りコマンド (BLE)
+        // log_recorder が中継してきた T_CMD (前のループの LogLink::service() が
+        // mailbox に置いたもの) を IM920 と同じ s5rx へ。統計・鮮度も共通。
+        uint8_t cmd[LogLinkProto::CMD_PAYLOAD];
+        if (LogLink::pollCmd(cmd)) v.s5rx.acceptRaw(cmd, sizeof(cmd));
+    }
     if (guided_div.tick()) updateGuided();                            // 100Hz  要求 → 目標 (制御はしない)
     const uint32_t t5 = micros();
 
@@ -632,6 +642,7 @@ void loop() {
     S5::Console::handleBleAction(v);                                  // BLE 経由のデバッグ指令 (あれば)
 
     if (S5::USE_IM920 && telem_tick.ready()) telem.tick(v);           //   8Hz  下りテレメトリ (積むだけ)
+    if (S5::USE_BLE_LINK && v.link_ok && telem_tick.ready()) telem.tickBle(v);   // 20Hz  同 (BLE。束ねて LogLink へ)
     if (S5::USE_IM920) v.s5tx.service();                              // 送りかけを毎ループ吐き出す (非ブロッキング)
 
     // ログ中は画面表示を止める (同じ USB を奪い合うとログが落ちる)
