@@ -11,6 +11,7 @@
 #pragma once
 #include <Arduino.h>
 #include "Config.h"   // enum Sw / enum Ch を使う
+#include "quad/BoardPins.h"   // MOTOR_PIN の実体 (板ごと)
 
 namespace Quad {
 
@@ -57,7 +58,9 @@ constexpr int MOTOR_COUNT = 4;
 // MOTOR_PIN[0] = M1(左前), [1] = M2(右前), [2] = M3(右後), [3] = M4(左後)
 // ↓ 旧 drone.cpp の motor1..motor4 の割り当てをそのまま初期値にしてあります。
 //    Stage 1 の実測結果で必ず並べ替えてください。
-constexpr int MOTOR_PIN[MOTOR_COUNT] = { 1,2,3,4 };
+//    実際のピン番号は板ごとに quad/BoardPins.h (Teensy {1,2,3,4} / XIAO RP2040 {D0..D3})。
+constexpr int MOTOR_PIN[MOTOR_COUNT] = { BOARD_MOTOR_PIN[0], BOARD_MOTOR_PIN[1],
+                                         BOARD_MOTOR_PIN[2], BOARD_MOTOR_PIN[3] };
 
 // ※ motor::write() (src/sub_lib/Actuators.cpp) は 0.0-1.0 を 1000-2000us 相当に
 //   固定でマッピングしており、set_minPWM / set_maxPWM は参照していません。

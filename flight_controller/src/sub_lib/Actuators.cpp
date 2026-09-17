@@ -53,11 +53,22 @@ void motor::begin() {
     //   ESCが受け付けないパルス幅になって回らなくなっていた。
     //   分解能の設定は全モーター共通で最初の1回だけにする。
     static bool s_resolution_set = false;
+#ifdef ARDUINO_ARCH_RP2040
+    // arduino-pico: 周波数も分解能も全ピン共通のグローバル設定 (ピン引数なし)。
+    // 4 モーター全部 400Hz/12bit なので 1 回設定すれば十分。duty の式 (1638〜3277/4095)
+    // は Teensy と同じ 12bit 前提のまま使える。
+    if (!s_resolution_set) {
+        analogWriteFreq(400);
+        analogWriteRange(4095);
+        s_resolution_set = true;
+    }
+#else
     if (!s_resolution_set) {
         analogWriteResolution(12);   // 12-bit分解能 (0-4095)
         s_resolution_set = true;
     }
     analogWriteFrequency(_pin, 400); // PWM周波数を400Hzに設定
+#endif
 
     // ★ 修正: 以前は write(0.0f) を _built = true の前で呼んでいたため、
     //   write() 冒頭の if(!is_ready()) return; に弾かれて

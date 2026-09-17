@@ -31,6 +31,77 @@
 //                                                    が BLE のときは必須
 //     GND         ---- GND                        ※必須
 //    電源は分ける (SD 書き込みの突入で FC を巻き込まないため)。GND だけ共通。
+//
+// ============================================================
+//  【2026-09-17 Teensy 故障時の移行方針 (実装済み。env: drone_s5_rp2040)】
+// ============================================================
+//  Teensy 4.0 が故障した。手持ちは XIAO RP2040 x1 / XIAO ESP32C3 x2。
+//  買い足さずに 2 枚で組む場合の結論を残す。
+//
+//  ★ 結論: FC = XIAO RP2040 / C3 = BLE 中継 + フロー読み の 2 枚。
+//    鍵は「PMW3901 を FC から C3 側へ移す」こと。C3 とは元々この UART が
+//    張ってあるので、線も UART も増えない。
+//
+//  --- ピン収支 (XIAO は両方とも 11 パッド) -------------------------------
+//                          RP2040(FC)   ESP32C3(BLE+フロー)
+//      モーター PWM x4          4            -
+//      I2C (MPU/BMP/VL53L1X)    2            -
+//      SBUS RX                  1            -
+//      SPI (PMW3901)            -            4
+//      相互 UART TX/RX          2            2
+//      BLE                      -            内蔵 (0)
+//      StatusLed                オンボード NeoPixel (0)
+//                             ----         ----
+//                              9/11         6/11
+//
+//    フローの SPI 4 本が FC から消えるのが効く (13 本 -> 9 本で 11 に収まる)。
+//    ★ 訂正: RP2040 の UART1 RX が使える GPIO {5,9,21,25} は XIAO のパッドに
+//      1 本も出ていない。ハード UART で RX を取れるのは UART0 (D6/D7) だけ
+//      なので、LogLink (2Mbaud 双方向) を UART0、SBUS (100k 反転 RX のみ) を
+//      SerialPIO に置く (src/trainer.cpp と同じ。実績あり)。ピンは quad/BoardPins.h。
+//
+//  --- プロトコル拡張 -----------------------------------------------------
+//    T_FLOW = 0x84 を 1 つ足すだけ (0x8X = ロガー->FC の既存規約に乗る)。
+//    payload は PMW3901 の生デルタ + タイムスタンプ。
+//    ★ de-rotation はジャイロとの時刻同期が要るので必ず FC 側に残すこと。
+//      C3 は「生デルタを投げるだけ」。そうすれば FlowObs / PosHold は無改造で、
+//      OpticalFlow の読み取り部だけが「LogLink から最新値を取る」に変わる。
+//
+//  --- なぜモーター出力のほうを別基板に割らないか -------------------------
+//    モーターを割ると 1000Hz のレートループの内側に遅延とジッタが入る
+//    (1 サンプル = 1ms、交差 ~30Hz で約 11 度の位相損失)。さらにリンク断時に
+//    「最後の PWM を保持したまま」になるため、ウォッチドッグとフェイルセーフを
+//    新規に書く必要がある (飛行実績ゼロのコードが安全系に入る)。
+//    フロー側なら 100Hz 入力 + 0.3Hz 帯の位置ループなので位相損失は約 1 度で済み、
+//    かつリンク断は既存の flowAlive() -> MODE_ALTHOLD 縮退がそのまま効く
+//    (drone_s5.cpp の mode 決定部。新しい安全コードが要らない)。
+//
+//  --- 移植時の作業 -------------------------------------------------------
+//    1. ★ 1000Hz が回るかの実測検証。ここが唯一の本当の山。
+//       RP2040 は 133MHz Cortex-M0+ で FPU 無し (ESP32C3 も FPU 無し)。
+//       1000Hz で走るのは IMU 読み + レート PID + ミキサーのみ (角度 200Hz /
+//       フロー 100Hz は間引き済み) で、うち IMU の I2C 約 360us はバス律速。
+//       概算では 600〜700us/1000us に収まるが未検証。dt_us と StallLog で測る。
+//       ダメなら 500Hz へ落とすが、それは PID 再調整を意味する。
+//    2. RamLog を 8 秒 -> 2 秒へ (FlightLog.h の SECONDS)。
+//       RP2040 の SRAM は 264KB。実測で RamLog と SdLog リングを除いた
+//       下限は約 55KB。2 秒 (116KB) で実ビルド RAM 140KB (53%)。
+//       ※ 0.23Hz の発振調査には 125Hz の BLE ストリームで足りるので、
+//         RamLog が縮むこと自体は当面の解析に影響しない。
+//    3. begin() の addMemoryForWrite() -> arduino-pico の setFIFOSize()
+//       (下の begin() がテンプレートなのは Teensy の HardwareSerialIMXRT
+//        都合。RP2040 に移すならここも書き換える)
+//    4. Actuators.cpp の analogWriteResolution/Frequency(400Hz) を
+//       RP2040 の PWM スライス設定へ
+//    5. SBUS の反転は arduino-pico の setInvertRX(true) (begin より前に呼ぶ)。
+//       外付けインバータ不要。
+//    6. C3 側に SPI 読み + T_FLOW 送出を追加 (100 行程度)
+//
+//  --- 比較 ---------------------------------------------------------------
+//    Teensy 4.0 買い直し (~5000 円) なら移植ゼロで即復帰できる。
+//    上の移植は数日かかるので、発振調査を止めてまでやるかは要判断。
+//    なお XIAO 系は ESP32S3 も 11 パッドなので、3 枚目を買うなら
+//    RP2040-Zero (~500 円, GPIO 20 本) のほうがピン問題ごと消える。
 // ============================================================
 #pragma once
 #include <Arduino.h>
@@ -50,7 +121,9 @@ constexpr uint32_t STAT_TIMEOUT_MS = 2000;     // これだけ T_STAT が来な�
 
 // ---- 内部状態 (include するのは drone_s5.cpp だけ。SdLog.h と同じ流儀) ----
 static uint8_t  s_ring[RING_BYTES];
-static uint8_t  s_txbuf[TXBUF_BYTES];
+#ifndef ARDUINO_ARCH_RP2040
+static uint8_t  s_txbuf[TXBUF_BYTES];   // Teensy: addMemoryForWrite 用
+#endif
 static HardwareSerial* s_port = nullptr;
 
 static bool     s_ok        = false;
@@ -90,6 +163,15 @@ static uint32_t s_cmd_seen_n = 0;   // pollCmd() 済みの数
 static uint32_t s_cmd_badlen = 0;   // 長さが CmdFrame と合わなかった T_CMD
 static uint32_t s_telem_drop = 0;   // T_TELEM をリングに積めなかった回数
 
+// ロガー側に載せた PMW3901 の生カウント (T_FLOW)。累積和で来るので、
+// pollFlow() は「前回返した時点の sum との差」を返す (取りこぼしても次で吸収)。
+constexpr uint32_t FLOW_TIMEOUT_MS = 200;   // これだけ T_FLOW が来なければ STALE
+static P::FlowFrame s_flow      = {};
+static uint32_t     s_flow_ms   = 0;
+static uint32_t     s_flow_rx_n = 0;
+static int32_t      s_flow_last_sum_dx = 0, s_flow_last_sum_dy = 0;
+static bool         s_flow_primed = false;   // 最初の 1 フレームは差分を取らず基準にする
+
 // ---- RX 診断カウンタ (配線の切り分け用) ----
 //  rx_bytes==0      : 線に何も来ていない → GND 未共通 / D6→RX16 断線 / RX16 不良
 //  rx_bytes>0 crc>0 : 線は生きているが化けている → BAUD が速すぎ (1000000 へ) / 配線を短く
@@ -108,6 +190,15 @@ inline bool statFresh() {
 inline bool loggerSdOk() {
     return statFresh() && (s_stat.flags & P::STAT_SD_OK);
 }
+inline bool flowFresh() {
+    return s_flow_ms != 0 && (millis() - s_flow_ms) < FLOW_TIMEOUT_MS;
+}
+// ロガー側の PMW3901 が begin() に応答したか (T_STAT の flags)。
+inline bool loggerFlowOk() {
+    return statFresh() && (s_stat.flags & P::STAT_FLOW_OK);
+}
+inline uint32_t flowRxCount() { return s_flow_rx_n; }
+inline uint8_t  flowSqual()   { return s_flow.squal; }
 
 // リングへ n バイト積む。入らなければ「1 バイトも積まず」false。
 //  ★ 途中まで積むとフレームが千切れてロガー側が同期を失うので、
@@ -163,6 +254,10 @@ inline void pollStat() {
                 } else if (crc == c && type == P::T_ACT && len == sizeof(P::ActReq)) {
                     memcpy(&s_act_req, buf, sizeof(s_act_req));
                     s_act_rx_n++;
+                } else if (crc == c && type == P::T_FLOW && len == sizeof(P::FlowFrame)) {
+                    memcpy(&s_flow, buf, sizeof(s_flow));
+                    s_flow_ms = millis();
+                    s_flow_rx_n++;
                 } else if (crc == c && type == P::T_CMD) {
                     if (len == P::CMD_PAYLOAD) {
                         memcpy(s_cmd_buf, buf, P::CMD_PAYLOAD);
@@ -200,6 +295,32 @@ inline bool pollCmd(uint8_t* out) {
     memcpy(out, s_cmd_buf, P::CMD_PAYLOAD);
     return true;
 }
+// ロガー経由のフロー生カウント。前回 pollFlow() からの累積差分を dx/dy に返す。
+//  新着が無ければ dx=dy=0 で false (呼び出し側は 0,0 を updateFrom に渡す)。
+//  最初の 1 フレームは基準にするだけで差分を返さない (起動からの累積を
+//  「今の移動」と誤認しないため)。
+inline bool pollFlow(int16_t& dx, int16_t& dy, uint8_t& squal) {
+    static uint32_t seen_n = 0;
+    squal = s_flow.squal;
+    if (seen_n == s_flow_rx_n) { dx = dy = 0; return false; }
+    seen_n = s_flow_rx_n;
+    if (!s_flow_primed) {
+        s_flow_last_sum_dx = s_flow.sum_dx;
+        s_flow_last_sum_dy = s_flow.sum_dy;
+        s_flow_primed = true;
+        dx = dy = 0;
+        return false;
+    }
+    const int32_t ddx = s_flow.sum_dx - s_flow_last_sum_dx;
+    const int32_t ddy = s_flow.sum_dy - s_flow_last_sum_dy;
+    s_flow_last_sum_dx = s_flow.sum_dx;
+    s_flow_last_sum_dy = s_flow.sum_dy;
+    // 100Hz 同士なので通常 1 サンプルぶん (数十カウント)。int16 に収まる。
+    dx = (int16_t)constrain(ddx, -32768, 32767);
+    dy = (int16_t)constrain(ddy, -32768, 32767);
+    return true;
+}
+
 inline uint32_t cmdRxCount()  { return s_cmd_rx_n; }
 inline uint32_t cmdBadLen()   { return s_cmd_badlen; }
 inline uint32_t telemDrops()  { return s_telem_drop; }
@@ -212,6 +333,19 @@ inline bool sendTelem(const uint8_t* p, size_t n) {
     if (sendFrame(P::T_TELEM, p, n)) return true;
     s_telem_drop++;
     return false;
+}
+
+// モード表示 LED の色をロガーへ送る (S5::STATUS_LED_VIA_LINK)。毎ループ呼んでよい。
+//  色が変わった瞬間と、変わらなくても 500ms ごと (キープアライブ) に 1 フレーム。
+//  ロガーは 1 秒来なければ消灯する。
+inline void serviceLed(uint8_t rgb) {
+    static uint8_t  last_rgb = 0xFF;
+    static uint32_t last_ms  = 0;
+    if (!s_ok) return;
+    const uint32_t now = millis();
+    if (rgb == last_rgb && (now - last_ms) < 500) return;
+    P::LedFrame f{rgb};
+    if (sendFrame(P::T_LED, &f, sizeof(f))) { last_rgb = rgb; last_ms = now; }
 }
 
 // 上記の実行結果を FC -> ロガー -> BLE へ送る。既存の送信リング
@@ -237,11 +371,17 @@ inline bool begin(PortT& port, uint16_t rec_size, uint8_t rec_ver,
     s_rec_size = rec_size;
     s_rec_ver  = rec_ver;
     s_rate_hz  = rate_hz;
-    port.begin(baud);
     // 既定の送信バッファは数十バイトしかない。500Hz × 122B を service() で
     // 捌ききるために 2KB 足す (足さないと availableForWrite() が常に小さく、
     // リング側に溜まって drop する)。
+#ifdef ARDUINO_ARCH_RP2040
+    // arduino-pico: begin() より前に setFIFOSize()。バッファは core が確保する。
+    port.setFIFOSize(TXBUF_BYTES);
+    port.begin(baud);
+#else
+    port.begin(baud);
     port.addMemoryForWrite(s_txbuf, sizeof(s_txbuf));
+#endif
     resetRing();
     s_ok = true;
     return s_ok;
@@ -391,6 +531,11 @@ inline void status() {
                   (s_stat.flags & P::STAT_SD_OK) ? "OK" : "NG",
                   (s_stat.flags & P::STAT_REC) ? 1 : 0,
                   (unsigned)s_stat.file_idx, (unsigned long)s_stat.kbytes);
+    Serial.printf("    フロー(T_FLOW): %s  受信 %lu  squal=%u  sum=(%ld,%ld)  PMW3901@ロガー=%s\n",
+                  flowFresh() ? "fresh" : "stale",
+                  (unsigned long)s_flow_rx_n, (unsigned)s_flow.squal,
+                  (long)s_flow.sum_dx, (long)s_flow.sum_dy,
+                  loggerFlowOk() ? "OK" : "NG");
     Serial.printf("    ロガー: drop(rec)=%lu  crc_err=%lu  seq_gap=%lu  "
                   "最悪write=%lu us  リング=%u%%\n",
                   (unsigned long)s_stat.drop_rec, (unsigned long)s_stat.crc_err,

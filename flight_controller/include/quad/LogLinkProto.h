@@ -52,10 +52,46 @@ constexpr uint8_t T_REC   = 0x02;   // payload = FlightLog::Rec
 constexpr uint8_t T_STOP  = 0x03;   // payload なし
 constexpr uint8_t T_ACT_ACK = 0x04; // payload = ActAck (下記)。単発。定期送信ではない
 constexpr uint8_t T_TELEM = 0x05;   // payload = S5T の各フレームを連結したもの (下記)
+constexpr uint8_t T_LED   = 0x06;   // payload = LedFrame (下記)。モード表示 LED をロガー側で光らせる
 // ロガー -> FC
 constexpr uint8_t T_STAT  = 0x81;   // payload = Stat
 constexpr uint8_t T_ACT   = 0x82;   // payload = ActReq (下記)。単発。BLE から来る
 constexpr uint8_t T_CMD   = 0x83;   // payload = S5C::CmdFrame (22B) そのもの。BLE から来る
+constexpr uint8_t T_FLOW  = 0x84;   // payload = FlowFrame (下記)。ロガーに載せた PMW3901 の生値
+
+// ------------------------------------------------------------
+//  オプティカルフロー中継 (2026-09-17 追加。Teensy 故障 → RP2040 移行に伴う)
+// ------------------------------------------------------------
+//  FC を XIAO RP2040 にするとピンが 11 本しか無く、PMW3901 の SPI 4 本が
+//  収まらない。そこで PMW3901 をロガー (ESP32C3) 側に載せ、生カウントを
+//  この UART で FC へ送る。経緯と収支は quad/LogLink.h の冒頭を参照。
+//
+//  ★ 累積和で送る。PMW3901 の motion レジスタは読むとクリアされるので、
+//    差分を送ると UART 取りこぼし 1 回でその区間の移動が永久に消える。
+//    累積和なら次のフレームが吸収する。FC は「前回見た sum との差」を
+//    そのループの dx/dy として使う (LogLink::pollFlow)。
+//  ★ de-rotation (ジャイロ補正) は FC 側でやる。ここには生カウントしか
+//    載せない。ロガーは 100Hz で読んで即送るだけ。
+struct __attribute__((packed)) FlowFrame {
+    uint32_t t_us;      // ロガーの micros() (鮮度判定用。FC の時計とは無関係)
+    int32_t  sum_dx;    // 起動からの累積カウント
+    int32_t  sum_dy;
+    uint16_t n;         // 累積サンプル数 (wrap してよい)
+    uint8_t  squal;     // 最新の SQUAL (追える模様の量。低いと信用しない)
+};
+static_assert(sizeof(FlowFrame) == 15, "FlowFrame のサイズが変わった");
+
+// ------------------------------------------------------------
+//  モード表示 LED の中継 (2026-09-17 追加)
+// ------------------------------------------------------------
+//  XIAO RP2040 の FC はピンを使い切ったので、モード表示の RGB LED (StatusLed) を
+//  ロガー (ESP32C3) 側に付ける。FC は色が変わったとき + 0.5 秒ごとに送る。
+//  ロガーは 1 秒来なければ消灯する (= 「FC と繋がっていない」の表示)。
+//  点滅は FC 側で作る (FC が on/off を送る)。ロガーは言われた色を出すだけ。
+struct __attribute__((packed)) LedFrame {
+    uint8_t rgb;    // bit0=R bit1=G bit2=B (1 = 点灯)
+};
+constexpr uint8_t LED_R = 1u << 0, LED_G = 1u << 1, LED_B = 1u << 2;
 
 // ------------------------------------------------------------
 //  BLE 経由の単発メンテナンス指令 (2026-09-14 追加)
@@ -128,6 +164,7 @@ struct __attribute__((packed)) Stat {
 };
 constexpr uint8_t STAT_SD_OK  = 1u << 0;
 constexpr uint8_t STAT_REC    = 1u << 1;
+constexpr uint8_t STAT_FLOW_OK = 1u << 2;  // ロガー側の PMW3901 が begin() に応答した
 
 // ロガーが T_REC の途切れを検出して勝手にファイルを閉じるまでの時間。
 // STOP フレームが化けても BIN が open のまま残らないための保険。

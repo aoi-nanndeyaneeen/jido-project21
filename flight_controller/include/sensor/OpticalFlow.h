@@ -37,6 +37,13 @@ public:
         _height_m = Quad::FLOW_ASSUMED_HEIGHT_M;
         return _ok_init;
     }
+    // センサがこの板に無く、生カウントが外から来る構成 (S5::FLOW_VIA_LINK)。
+    // SPI には触らない。生カウントは updateFrom() で渡す。
+    bool beginLinked() {
+        _ok_init  = true;
+        _height_m = Quad::FLOW_ASSUMED_HEIGHT_M;
+        return _ok_init;
+    }
     bool initialized() const { return _ok_init; }
 
     // 換算スケールに使う高度 [m] をセットする。
@@ -65,7 +72,23 @@ public:
         int16_t dx = 0, dy = 0;
         if (Quad::FLOW_USE_BURST) { readMotionBurst(_cs, &dx, &dy, &_squal); }
         else                      { _sensor.readMotionCount(&dx, &dy); _squal = 255; }
+        process(dt_s, gyro_roll_rate_dps, gyro_pitch_rate_dps, dx, dy);
+    }
 
+    // 生カウントを外 (LogLink 経由の T_FLOW) からもらう版。update() と同じ数学。
+    //  dx/dy は「前回呼び出しからの累積」。新着が無かった回は 0,0 を渡す。
+    //  squal は最新値 (SQUAL ゲートに使う)。
+    void updateFrom(float dt_s, float gyro_roll_rate_dps, float gyro_pitch_rate_dps,
+                    int16_t dx, int16_t dy, uint8_t squal) {
+        if (!_ok_init || dt_s <= 0.0f) return;
+        _squal = squal;
+        process(dt_s, gyro_roll_rate_dps, gyro_pitch_rate_dps, dx, dy);
+    }
+
+private:
+    // update()/updateFrom() 共通の本体。ここから先はセンサの読み方に依存しない。
+    void process(float dt_s, float gyro_roll_rate_dps, float gyro_pitch_rate_dps,
+                 int16_t dx, int16_t dy) {
         // 生カウント → 機体座標 (FRD)
         float fx = (float)dx, fy = (float)dy;
         if (Quad::FLOW_SWAP_XY) { const float t = fx; fx = fy; fy = t; }
@@ -129,6 +152,7 @@ public:
         _fresh = true;
     }
 
+public:
     // 直近 update() の結果 -----------------------------------------
     float raw_x   = 0.0f, raw_y   = 0.0f;   // 機体座標に直しただけの生カウント [px]
     float derot_x = 0.0f, derot_y = 0.0f;   // de-rotation 後 [px]

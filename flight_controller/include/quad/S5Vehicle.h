@@ -25,6 +25,7 @@
 #include "S5Telem.h"
 #include "S5Cmd.h"
 
+#include "quad/BoardPins.h"
 #include "quad/QuadConfig.h"
 #include "quad/QuadPID.h"
 #include "quad/Mixer.h"
@@ -99,12 +100,13 @@ struct RangeObs {
 struct Vehicle {
     // --- デバイス ---
     IMU   mpu{&Wire};
-    Sbus  sbus{&Serial5};
+    Sbus  sbus{&BOARD_SBUS_SERIAL};
     motor motors[Quad::MOTOR_COUNT];
-    // IM920SL は Serial3。送信 (下りテレメトリ) と受信 (上りコマンド) が同じポート。
+    // IM920SL のポート (Teensy: Serial3 / RP2040: 未接続ダミー。quad/BoardPins.h)。
+    // 送信 (下りテレメトリ) と受信 (上りコマンド) が同じポート。
     // ★ 送信は必ず非ブロッキング (s5tx.service() を毎ループ)。受信は s5rx だけが読む。
-    S5T::Tx s5tx{&Serial3};
-    S5C::Rx s5rx{&Serial3};
+    S5T::Tx s5tx{&BOARD_IM920_SERIAL};
+    S5C::Rx s5rx{&BOARD_IM920_SERIAL};
     OpticalFlow flow;          // PMW3901 (SPI, CS = QuadConfig FLOW_CS_PIN)
     Rangefinder rangefinder;   // ToF/SONAR (QuadConfig RANGE_BACKEND)
 

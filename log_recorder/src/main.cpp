@@ -72,6 +72,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <SPI.h>
+#include <Bitcraze_PMW3901.h>
 #include <string>
 
 #include "quad/LogLinkProto.h"   // ★ flight_controller 側の実体を include
@@ -319,6 +321,163 @@ class WriteCallbacks : public BLECharacteristicCallbacks {
 } // namespace Ctrl
 
 // ============================================================
+//  §0c  オプティカルフロー (PMW3901) 読み → T_FLOW で FC へ (2026-09-17)
+// ============================================================
+//  Teensy 故障で FC を XIAO RP2040 にしたところ PMW3901 の SPI 4 本が
+//  収まらなくなったので、センサをこの板に載せて生カウントだけ FC へ送る。
+//  経緯と全体像は flight_controller/include/quad/LogLink.h の冒頭。
+//
+//  やること: 100Hz でバースト読み → 累積和を更新 → T_FLOW を Serial1 へ。
+//  de-rotation (ジャイロ補正) は FC 側。ここは生値しか触らない。
+//
+//  ★ 送信は loop() からだけ (Serial1 に書くのは loop() だけ、の規約)。
+//  ★ 累積和で送る理由は LogLinkProto.h の FlowFrame を参照。
+//  ★ SPI はストラップピン (GPIO2/8/9) を避けて D1〜D4 (GPIO3/4/5/6) に置く。
+//    XIAO の既定 SPI パッド (D8/D9/D10 = GPIO8/9/10) を使うと、リセット中に
+//    PMW3901 の MISO が GPIO9 を引いてブートモードが化けることがある。
+//    ESP32 は GPIO マトリクスでどのピンにも SPI を振れる (4MHz なので性能差なし)。
+//    これで CS のプルアップ抵抗は不要。
+//  ★ PMW3901 が居なくても起動は続ける (BLE 中継が本業)。FC には
+//    STAT_FLOW_OK を立てないことで「フロー無し」を伝える。
+namespace Flow {
+
+constexpr uint8_t  PIN_SCK  = 3;    // D1  (ストラップピン GPIO2/8/9 を避ける)
+constexpr uint8_t  PIN_MISO = 4;    // D2
+constexpr uint8_t  PIN_MOSI = 5;    // D3
+constexpr uint8_t  PIN_CS   = 6;    // D4
+constexpr uint32_t PERIOD_US = 10000;   // 100Hz (FC の FLOW_LOOP_HZ と同じ)
+
+static Bitcraze_PMW3901 s_sensor(PIN_CS);
+static bool     s_ok     = false;
+static int32_t  s_sum_dx = 0, s_sum_dy = 0;
+static uint16_t s_n      = 0;
+static uint8_t  s_squal  = 0;
+static uint32_t s_last_us = 0;
+static uint32_t s_n_tx   = 0;    // 送った T_FLOW
+static uint32_t s_n_busy = 0;    // availableForWrite 不足で見送った回数
+
+inline bool ok() { return s_ok; }
+
+// flight_controller/include/sensor/OpticalFlow.h の readMotionBurst() と同一。
+//   CS LOW → 0x16 → tSRAD → 12B 連続読み → CS HIGH。SPI は 4MHz/MSB/MODE3。
+static void readMotionBurst(int16_t* dx, int16_t* dy, uint8_t* squal) {
+    uint8_t buf[12];
+    SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE3));
+    digitalWrite(PIN_CS, LOW);
+    delayMicroseconds(50);
+    SPI.transfer(0x16);
+    delayMicroseconds(50);
+    for (int i = 0; i < 12; ++i) buf[i] = SPI.transfer(0);
+    digitalWrite(PIN_CS, HIGH);
+    SPI.endTransaction();
+    *dx = (int16_t)(((uint16_t)buf[3] << 8) | buf[2]);
+    *dy = (int16_t)(((uint16_t)buf[5] << 8) | buf[4]);
+    *squal = buf[6];
+}
+
+static void begin() {
+    pinMode(PIN_CS, OUTPUT);
+    digitalWrite(PIN_CS, HIGH);
+    SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+    s_ok = s_sensor.begin();
+    Serial.printf("FLOW: PMW3901 %s (SCK=%u MISO=%u MOSI=%u CS=%u)\n",
+                  s_ok ? "OK" : "応答なし (配線/電源を確認)",
+                  PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+    s_last_us = micros();
+}
+
+// loop() から毎回呼ぶ。100Hz を超えない範囲で読んで送る。
+static void service() {
+    if (!s_ok) return;
+    const uint32_t now = micros();
+    if (now - s_last_us < PERIOD_US) return;
+    s_last_us = now;
+
+    int16_t dx = 0, dy = 0;
+    readMotionBurst(&dx, &dy, &s_squal);
+    s_sum_dx += dx;
+    s_sum_dy += dy;
+    s_n++;
+
+    P::FlowFrame fr;
+    fr.t_us   = now;
+    fr.sum_dx = s_sum_dx;
+    fr.sum_dy = s_sum_dy;
+    fr.n      = s_n;
+    fr.squal  = s_squal;
+
+    uint8_t f[P::MAX_FRAME];
+    static uint8_t seq = 0;
+    const size_t n = P::buildFrame(f, P::T_FLOW, seq, &fr, sizeof(fr));
+    // 21B × 100Hz = 2.1kB/s。詰まっていたら見送る (累積和なので次で吸収される)。
+    if ((size_t)Serial1.availableForWrite() >= n) {
+        Serial1.write(f, n);
+        seq++;
+        s_n_tx++;
+    } else {
+        s_n_busy++;
+    }
+}
+
+} // namespace Flow
+
+// ============================================================
+//  §0d  モード表示 LED (StatusLed) をこの板で光らせる (2026-09-17)
+// ============================================================
+//  FC (XIAO RP2040) はピンを使い切ったので、モード表示の RGB LED をこちらに付ける。
+//  FC が T_LED (bit0=R bit1=G bit2=B) を色変化時 + 0.5 秒ごとに送ってくる。
+//  1 秒来なければ消灯 = 「FC と繋がっていない」の表示。点滅は FC が作る。
+//
+//  配線はコモンアノード (Teensy 時代と同じ): 3V3 → LED → 抵抗 → ピン。
+//  LOW で点灯、HIGH で消灯 (負論理)。各色に抵抗 1 本ずつ必須。
+//  ★ D8/D9 (GPIO8/9) は ESP32C3 のストラップピンだが、コモンアノードの LED は
+//    ピンを「3V3 側へ引く」ことしかできないので、リセット中に Low へ落とす
+//    ことは無く、ブートモードに影響しない (SPI の MISO とは事情が違う)。
+namespace Led {
+
+constexpr uint8_t PIN_R = 8;    // D8
+constexpr uint8_t PIN_G = 9;    // D9
+constexpr uint8_t PIN_B = 10;   // D10
+constexpr uint32_t TIMEOUT_MS = 1000;
+
+static uint32_t s_last_ms = 0;
+static uint32_t s_n_rx    = 0;
+static uint8_t  s_rgb     = 0;
+
+static void apply(uint8_t rgb) {
+    digitalWrite(PIN_R, (rgb & P::LED_R) ? LOW : HIGH);
+    digitalWrite(PIN_G, (rgb & P::LED_G) ? LOW : HIGH);
+    digitalWrite(PIN_B, (rgb & P::LED_B) ? LOW : HIGH);
+}
+
+static void begin() {
+    pinMode(PIN_R, OUTPUT);
+    pinMode(PIN_G, OUTPUT);
+    pinMode(PIN_B, OUTPUT);
+    apply(0);
+}
+
+// onFrame() (rx役) から T_LED のたびに呼ばれる
+static void onLed(const uint8_t* pay, uint8_t len) {
+    if (len != sizeof(P::LedFrame)) return;
+    s_rgb = pay[0];
+    s_last_ms = millis();
+    s_n_rx++;
+    apply(s_rgb);
+}
+
+// loop() から毎回。FC が黙ったら消灯
+static void service() {
+    if (s_last_ms != 0 && millis() - s_last_ms > TIMEOUT_MS) {
+        s_last_ms = 0;
+        s_rgb = 0;
+        apply(0);
+    }
+}
+
+} // namespace Led
+
+// ============================================================
 //  §1  rx役 : UART 受信 + フレーム検証 + リングへ push
 // ============================================================
 namespace Rx {
@@ -358,6 +517,9 @@ static void onFrame() {
     s_seq_prev = s_seq;
     s_seq_init = true;
 
+    // T_LED はこの板で消費する (BLE へは流さない)
+    if (s_type == P::T_LED) { Led::onLed(s_pay, s_len); return; }
+
     uint8_t f[P::MAX_FRAME];
     const size_t n = P::buildFrame(f, s_type, s_seq, s_pay, s_len);
     if (n && !push(f, (uint32_t)n) && s_type == P::T_REC) g_st.drop_ring++;
@@ -395,7 +557,8 @@ static void feed(const uint8_t* p, size_t n) {
 static void sendStat() {
     P::Stat s = {};
     s.flags     = (uint8_t)((g_st.ble_ok ? P::STAT_SD_OK : 0) |
-                            (g_st.recording ? P::STAT_REC : 0));
+                            (g_st.recording ? P::STAT_REC : 0) |
+                            (Flow::ok() ? P::STAT_FLOW_OK : 0));
     s.ring_pct  = (uint8_t)((uint64_t)ringUsed() * 100 / RING_BYTES);
     s.file_idx  = 0;
     s.kbytes    = g_st.bytes / 1024;
@@ -719,6 +882,14 @@ static void printStatus() {
                   (unsigned long)g_st.crc_err,
                   (unsigned long)g_st.seq_gap, (unsigned long)g_st.orphan);
     Serial.printf("  最悪tx    : %lu us\n", (unsigned long)g_st.worst_tx_us);
+    Serial.printf("  フロー    : %s  送信 %lu  詰まり %lu  sum=(%ld,%ld) n=%u squal=%u\n",
+                  Flow::ok() ? "PMW3901 OK" : "PMW3901 無し",
+                  (unsigned long)Flow::s_n_tx, (unsigned long)Flow::s_n_busy,
+                  (long)Flow::s_sum_dx, (long)Flow::s_sum_dy,
+                  (unsigned)Flow::s_n, (unsigned)Flow::s_squal);
+    Serial.printf("  LED       : %s  rgb=%u  受信 %lu\n",
+                  Led::s_last_ms ? "FC から受信中" : "消灯 (FC 未受信)",
+                  (unsigned)Led::s_rgb, (unsigned long)Led::s_n_rx);
     Serial.printf("  デバッグ指令(BLE->機体): 受信 %lu 件  不正 %lu 件\n",
                   (unsigned long)Cmd::s_n_rx, (unsigned long)Cmd::s_n_bad);
     Serial.printf("  操縦指令(BLE->機体)    : %s  受信 %lu  UART送信 %lu  不正 %lu  "
@@ -750,6 +921,9 @@ void setup() {
     Serial1.setRxBufferSize(UART_FIFO);   // ★ begin() より前に呼ぶこと
     Serial1.begin(LINK_BAUD, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX);
 
+    Flow::begin();    // PMW3901。居なくても続行 (STAT_FLOW_OK が立たないだけ)
+    Led::begin();     // モード表示 LED (FC からの T_LED で光る)
+
     // BLE 送信役 (ESP32C3 はシングルコアなので専用タスクに分離)。
     xTaskCreate(Ble::task, "ble_task", 4096, nullptr, 1, nullptr);
 }
@@ -772,6 +946,8 @@ void loop() {
     }
     Cmd::service();   // BLE から指令が来ていれば、ここで初めて Serial1 へ書く
     Ctrl::service();  // 操縦指令の中継 (地上局リンク)。同上
+    Flow::service();  // PMW3901 を 100Hz で読んで T_FLOW を送る。同上
+    Led::service();   // FC が黙ったら LED を消す
 
     // USB コンソール
     if (Serial.available()) {

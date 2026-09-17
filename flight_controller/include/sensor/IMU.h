@@ -87,6 +87,9 @@ public:
         c.gy = Config::sensor::s_gy_bias;  c.gz = Config::sensor::s_gz_bias;
         c.sum = calSum(c);
         EEPROM.put(CAL_ADDR, c);
+#ifdef ARDUINO_ARCH_RP2040
+        EEPROM.commit();   // arduino-pico はフラッシュエミュ。commit しないと書かれない
+#endif
         Serial.println("INFO: キャリブレーション値を EEPROM に保存しました (次回起動時に読み込みます)");
     }
 
@@ -105,11 +108,17 @@ public:
     void clearCalibration() {
         CalStore c{};
         EEPROM.put(CAL_ADDR, c);   // magic が壊れるので次回は読まれない
+#ifdef ARDUINO_ARCH_RP2040
+        EEPROM.commit();
+#endif
         Serial.println("INFO: EEPROM のキャリブレーション値を消しました "
                        "(次回起動から Config.h の値に戻ります)");
     }
 
     void begin() {
+#ifdef ARDUINO_ARCH_RP2040
+        EEPROM.begin(256);   // arduino-pico はサイズ指定の begin() が必須 (CAL_ADDR + sizeof(Cal) が収まる)
+#endif
         wire->begin();
         wire->setClock(400000);
 

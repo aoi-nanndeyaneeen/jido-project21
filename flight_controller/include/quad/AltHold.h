@@ -297,6 +297,7 @@ public:
 
     // --- ゲイン調整 (シリアルメニューから) ------------------------
     Pid&  ratePid()          { return _rate_pid; }
+    const Pid& ratePid() const { return _rate_pid; }
     float posKp() const      { return _pos_kp; }
     void  setPosKp(float kp) { _pos_kp = kp; }
 

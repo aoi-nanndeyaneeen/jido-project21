@@ -285,7 +285,13 @@ namespace Ram {
 constexpr float    THR_GATE = 0.20f;
 // 何秒ぶん持つか。500Hz x 8秒 x 116B ≒ 464KB (OCRAM2 512KBに収まる)。
 // RAM2 が足りなくなったら、まずここを 8 -> 6 に減らす (~116KB 空く)。
+// ★ XIAO RP2040 は SRAM が 264KB しか無いので 2 秒 (116KB)。0.23Hz 発振の解析は
+//   125Hz の BLE ストリームで足りる (quad/LogLink.h 冒頭の移行方針を参照)。
+#ifdef ARDUINO_ARCH_RP2040
+constexpr uint32_t SECONDS  = 2;
+#else
 constexpr uint32_t SECONDS  = 8;
+#endif
 constexpr uint32_t CAPACITY = SECONDS * LOG_HZ;   // 4000
 
 // OCRAM2 (DMAMEM) に置く。RAM1 (スタック/大半の変数) と競合しない。

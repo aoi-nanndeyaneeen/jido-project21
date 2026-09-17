@@ -1,7 +1,9 @@
 //出力系
 #pragma once
 #include <Servo.h>
-#include <DShot.h>
+#ifndef ARDUINO_ARCH_RP2040
+#include <DShot.h>   // Teensy 専用ライブラリ (platformio.ini で RP2040 は lib_ignore)
+#endif
 #include "Config.h"
 
 

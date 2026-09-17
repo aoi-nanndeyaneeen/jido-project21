@@ -34,11 +34,11 @@ struct Dev {
 static Dev devs[] = {
     { "IMU MPU6050",  "I2C 0x68", ST_SKIP, "" },
     { "Rangefinder",  "I2C/PW",   ST_SKIP, "" },
-    { "PMW3901 flow", "SPI CS10", ST_SKIP, "" },
+    { "PMW3901 flow", S5::FLOW_VIA_LINK ? "ロガー経由 T_FLOW" : "SPI CS10", ST_SKIP, "" },
     { "SD HW-125",    "SPI CS9",  ST_SKIP, "" },
-    { "RP2040 logger","Serial2",  ST_SKIP, "" },
-    { "SBUS RX",      "Serial5",  ST_SKIP, "" },
-    { "IM920",        "Serial3",  ST_SKIP, "" },
+    { "C3 logger",    BOARD_LOGLINK_DESC, ST_SKIP, "" },
+    { "SBUS RX",      BOARD_SBUS_DESC,  ST_SKIP, "" },
+    { "IM920",        BOARD_IM920_DESC, ST_SKIP, "" },
 };
 constexpr int N = sizeof(devs) / sizeof(devs[0]);
 enum { D_IMU, D_RANGE, D_FLOW, D_SD, D_LINK, D_SBUS, D_IM920 };
@@ -171,12 +171,12 @@ inline void probe(Vehicle& v) {
 
     // --- IM920: RDID を送って ~300ms 応答を待つ ---
     if (USE_IM920) {
-        while (Serial3.available()) Serial3.read();      // 掃除
-        Serial3.print("RDID\r\n");
+        while (BOARD_IM920_SERIAL.available()) BOARD_IM920_SERIAL.read();      // 掃除
+        BOARD_IM920_SERIAL.print("RDID\r\n");
         String resp;
         const uint32_t t0 = millis();
         while (millis() - t0 < 300) {
-            while (Serial3.available()) resp += (char)Serial3.read();
+            while (BOARD_IM920_SERIAL.available()) resp += (char)BOARD_IM920_SERIAL.read();
         }
         resp.trim();
         if (resp.length() > 0) {
@@ -187,7 +187,7 @@ inline void probe(Vehicle& v) {
             devs[D_IM920].st = ST_NOSIG;
             strcpy(devs[D_IM920].note, "無応答 (baud/配線/電源?)");
         }
-        while (Serial3.available()) Serial3.read();      // 応答の残りを main ループへ持ち越さない
+        while (BOARD_IM920_SERIAL.available()) BOARD_IM920_SERIAL.read();      // 応答の残りを main ループへ持ち越さない
     }
 }
 

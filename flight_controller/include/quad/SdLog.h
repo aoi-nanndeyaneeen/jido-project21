@@ -32,6 +32,29 @@
 // ============================================================
 #pragma once
 #include <Arduino.h>
+
+#ifdef ARDUINO_ARCH_RP2040
+// ============================================================
+//  XIAO RP2040 ビルド: SD は使わない (USE_SD=false。SD カード自体も故障済み)。
+//  32KB のリングと SdFat を持ち込まないよう、呼び出し側が触る API だけ
+//  空実装にする。drone_s5.cpp / S5Console.h / S5Status.h は無変更で通る。
+// ============================================================
+namespace SdLog {
+constexpr uint8_t FMT_VER = 1;
+inline bool begin(uint8_t, uint16_t, uint8_t, uint16_t) { return false; }
+inline bool ok()        { return false; }
+inline bool recording() { return false; }
+inline void startFile() {}
+inline void push(const void*, size_t) {}
+inline void service() {}
+inline void stopFile() {}
+inline void brief(Print& out)    { out.println("SD: 無し (RP2040 ビルド)"); }
+inline void selftest(Print& out) { out.println("SD: 無し (RP2040 ビルド)"); }
+inline void status()             { Serial.println("SD: 無し (RP2040 ビルド)"); }
+} // namespace SdLog
+
+#else  // Teensy (現行)
+
 #include <SPI.h>
 #include <SdFat.h>
 
@@ -305,3 +328,5 @@ inline void status() {
 }
 
 } // namespace SdLog
+
+#endif  // ARDUINO_ARCH_RP2040

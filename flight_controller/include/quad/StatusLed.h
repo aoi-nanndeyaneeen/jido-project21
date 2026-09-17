@@ -1,5 +1,5 @@
 // ============================================================
-//  StatusLed.h  -  モード表示LED (pin 5/6/9) と機体検出LED (pin 20/22/23)
+//  StatusLed.h  -  モード表示LED (StatusLed) と機体検出LED (BlinkLed)。ピンは quad/BoardPins.h
 // ============================================================
 //  配線は「コモンアノード」前提。
 //    3.3V ──┬── R アノード
@@ -23,13 +23,25 @@
 // ============================================================
 #pragma once
 #include <Arduino.h>
+#include "quad/BoardPins.h"
 
 namespace StatusLed {
 
-constexpr uint8_t PIN_R = 5;
-constexpr uint8_t PIN_G = 6;
-constexpr uint8_t PIN_B = 9;
+// 板ごとのピンは quad/BoardPins.h (Teensy 外付け 5/6/9 / XIAO RP2040 内蔵 17/16/25)。どちらも負論理。
+constexpr uint8_t PIN_R = BOARD_LED_R;
+constexpr uint8_t PIN_G = BOARD_LED_G;
+constexpr uint8_t PIN_B = BOARD_LED_B;
 
+#ifdef ARDUINO_ARCH_RP2040
+// XIAO RP2040: この板にはピンが無いので色を覚えるだけ。drone_s5.cpp の loop が
+// rgbBits() を LogLink::serviceLed() に渡し、ロガー (ESP32C3) 側の LED が光る。
+static uint8_t s_rgb = 0;
+inline void begin() {}
+inline void set(bool r, bool g, bool b) {
+    s_rgb = (uint8_t)((r ? 1u : 0u) | (g ? 2u : 0u) | (b ? 4u : 0u));
+}
+inline uint8_t rgbBits() { return s_rgb; }
+#else
 inline void begin() {
     pinMode(PIN_R, OUTPUT);
     pinMode(PIN_G, OUTPUT);
@@ -45,6 +57,8 @@ inline void set(bool r, bool g, bool b) {
     digitalWrite(PIN_G, g ? LOW : HIGH);
     digitalWrite(PIN_B, b ? LOW : HIGH);
 }
+inline uint8_t rgbBits() { return 0; }   // Teensy では未使用
+#endif
 
 inline void off()   { set(false, false, false); }
 inline void white() { set(true,  true,  true);  }
@@ -59,9 +73,10 @@ inline void magenta(){set(true,  false, true);  }
 
 namespace BlinkLed {
 
-constexpr uint8_t PIN_B = 17;
-constexpr uint8_t PIN_R = 22;
-constexpr uint8_t PIN_G = 23;
+// 板ごとのピンは quad/BoardPins.h。XIAO RP2040 では 3 色とも同じピン (ドライバ経由 1 本)。
+constexpr uint8_t PIN_R = BOARD_BLINK_R;
+constexpr uint8_t PIN_G = BOARD_BLINK_G;
+constexpr uint8_t PIN_B = BOARD_BLINK_B;
 
 inline void begin() {
     pinMode(PIN_R, OUTPUT);

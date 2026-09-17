@@ -54,6 +54,17 @@ constexpr GroundLink GROUND_LINK = GroundLink::BLE;
 constexpr bool USE_IM920    = (GROUND_LINK == GroundLink::IM920);  // Serial3 の IM920SL を使う
 constexpr bool USE_BLE_LINK = (GROUND_LINK == GroundLink::BLE);    // LogLink 経由で BLE へ
 constexpr bool USE_FLOW  = true;   // PMW3901 オプティカルフロー
+// PMW3901 をこの板の SPI ではなくロガー (ESP32C3) 側に載せ、生カウントを LogLink の
+// T_FLOW でもらう構成 (2026-09-17 Teensy 故障 → XIAO RP2040 移行。quad/LogLink.h 冒頭)。
+// RP2040 ビルドでは自動的に true。Teensy は従来どおり FC 直結 SPI。
+#ifdef ARDUINO_ARCH_RP2040
+constexpr bool FLOW_VIA_LINK = true;
+#else
+constexpr bool FLOW_VIA_LINK = false;
+#endif
+// モード表示 LED (StatusLed) をロガー側に付け、色を LogLink の T_LED で送る構成。
+// RP2040 はピンを使い切っているので true。Teensy は従来どおり FC 直結 (5/6/9)。
+constexpr bool STATUS_LED_VIA_LINK = FLOW_VIA_LINK;
 constexpr bool USE_RANGE = true;   // 測距 (QuadConfig の RANGE_BACKEND で ToF/SONAR)
 
 // ★ SD (HW-125) と PMW3901 は SPI0 を共有していて共存できない (HW-125 クローンの
@@ -67,6 +78,8 @@ static_assert(!(USE_FLOW && USE_SD),
 static_assert(!(USE_SD && USE_LOGLINK),
               "USE_SD と USE_LOGLINK は同時に true にできない "
               "(同じ Rec を2箇所に流すと、どちらが正のログか分からなくなる)。");
+static_assert(!FLOW_VIA_LINK || USE_LOGLINK,
+              "FLOW_VIA_LINK はロガー経由でフローをもらうので USE_LOGLINK が必要。");
 static_assert(!USE_BLE_LINK || USE_LOGLINK,
               "GROUND_LINK=BLE は log_recorder (USE_LOGLINK) を経由する。"
               "USE_LOGLINK=true にするか、GROUND_LINK を IM920 に戻すこと。");

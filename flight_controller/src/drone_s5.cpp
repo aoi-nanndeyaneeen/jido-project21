@@ -451,10 +451,13 @@ void setup() {
     Serial.println("!! SW_HOVER: down=ANGLE(手動) / cen=POSHOLD(完全自動) / up=GUIDED(地上局) !!");
     Serial.println("!! bail-out = SW_HOVER を下げる or THR_CUT。初回は広い床で指をスイッチに !!");
 
+#ifndef ARDUINO_ARCH_RP2040
     // ★ 共有 SPI0: 全 CS を「最初に」HIGH へ固定する。flow.begin() 中に SD の CS(9)
     //   がフロートで Low に落ちると SD も選択されて両方のバスが壊れる。
+    //   (RP2040 では FC に SPI デバイスが無い。PMW3901 は C3 側。quad/BoardPins.h)
     pinMode(10, OUTPUT); digitalWrite(10, HIGH);   // PMW3901 CS (Quad::FLOW_CS_PIN)
     if (S5::USE_SD) { pinMode(9, OUTPUT); digitalWrite(9, HIGH); }   // USE_LOGLINK 時は 9 = StatusLed B
+#endif
 
     // --- 姿勢ループのゲイン (S5Gains.h) ---
     v.roll_axis.rate .set_gains(Gain::RATE_ROLL [0], Gain::RATE_ROLL [1], Gain::RATE_ROLL [2]);
@@ -484,15 +487,23 @@ void setup() {
     }
     if (v.dry_run) Serial.println("!! DRY-RUN 有効: モーターは回りません ('m' で解除) !!");
 
-    if (S5::USE_SBUS)  { Serial.println("Init SBUS...");  v.sbus.begin(); }
+    if (S5::USE_SBUS)  {
+        Serial.println("Init SBUS (" BOARD_SBUS_DESC ")...");
+#ifdef ARDUINO_ARCH_RP2040
+        // bolderflight SBUS は RP2040 では反転しない。begin() より前に必ず (trainer.cpp と同じ)。
+        BOARD_SBUS_SERIAL.setInvertRX(true);
+#endif
+        v.sbus.begin();
+    }
     if (S5::USE_MPU)   { Serial.println("Init IMU...");   v.mpu.begin();  }
     if (S5::USE_IM920) { Serial.println("Init IM920..."); v.s5tx.begin(); }   // Serial3 19200 (受信 s5rx も同じポート)
-    if (S5::USE_FLOW) {
+    if (S5::USE_FLOW && !S5::FLOW_VIA_LINK) {
         Serial.println("Init OpticalFlow (PMW3901)...");
         v.flowobs.ok = v.flow.begin();
         Serial.println(v.flowobs.ok ? "  PMW3901 OK"
                                     : "  !! PMW3901 応答なし (CSピン/SPI配線/電源を確認) !!");
     }
+    // FLOW_VIA_LINK のときは LogLink::begin の後で評価する (下)。
     if (S5::USE_RANGE) {
         const bool sonar = (Q::RANGE_BACKEND == Q::RangeBackend::Sonar_EZ);
         Serial.printf("Init Rangefinder (%s)...\n", sonar ? "SONAR MaxBotix LV-MaxSonar-EZ" : "ToF VL53L1X");
@@ -523,13 +534,22 @@ void setup() {
                                        : "SD: 無効 (USE_FLOW=true のため。ログは RAM 'n'/'v' と USB 'l')");
     }
     if (S5::USE_LOGLINK) {
-        // Serial2 = RX7 / TX8, 2Mbaud。配線と移設の経緯は quad/LogLink.h。
-        Serial.println("Init LOGLINK (Serial2: TX=8 RX=7, 2Mbaud)...");
-        v.link_ok = LogLink::begin(Serial2, sizeof(FlightLog::Rec), FlightLog::REC_VER,
+        // ポートは板ごと (quad/BoardPins.h)。2Mbaud。配線と移設の経緯は quad/LogLink.h。
+        Serial.println("Init LOGLINK (" BOARD_LOGLINK_DESC ", 2Mbaud)...");
+        v.link_ok = LogLink::begin(BOARD_LOGLINK_SERIAL, sizeof(FlightLog::Rec), FlightLog::REC_VER,
                                    (uint16_t)FlightLog::LOG_HZ);
         delay(600);
         LogLink::service();      // 溜まっている状態フレームを取り込む
         LogLink::status();
+    }
+    if (S5::USE_FLOW && S5::FLOW_VIA_LINK) {
+        // PMW3901 はロガー側。ここでは SPI に触らず、T_STAT の FLOW_OK と T_FLOW の鮮度を見る。
+        Serial.println("Init OpticalFlow (PMW3901 @ ロガー, T_FLOW 経由)...");
+        v.flow.beginLinked();
+        v.flowobs.ok = LogLink::loggerFlowOk() && LogLink::flowFresh();
+        Serial.println(v.flowobs.ok ? "  T_FLOW 受信中 OK"
+                                    : "  !! T_FLOW 未受信 (ロガー側の PMW3901 / UART RX 配線 を確認。"
+                                      "飛行中に来れば自動で POSHOLD 可になる) !!");
     }
 
     // 起動時デバイスチェック (結果は画面に残り、'd' で再表示できる)
@@ -586,10 +606,21 @@ void loop() {
     if (S5::USE_SBUS) v.sbus.update();                  // 1000Hz  プロポ
     const uint32_t t2 = micros();
 
-    if (S5::USE_FLOW && v.flowobs.ok && flow_tick.ready()) {          // 100Hz  フロー読み
-        // de-rotation にはレートループと同じジャイロ値を渡して位相を揃える。
-        v.flow.update(flow_tick.dt_s(), v.att.roll_rate, v.att.pitch_rate);
-        if (v.flow.consumeFresh()) {                                  //  25Hz  窓が締まった回だけ
+    if (S5::USE_FLOW && flow_tick.ready()) {                          // 100Hz  フロー読み
+        if (S5::FLOW_VIA_LINK) {
+            // ロガー側 PMW3901。リンクの鮮度をそのまま flowobs.ok にする → 途切れれば
+            // flowAlive() が false になり POSHOLD → ALTHOLD へ縮退 (既存の経路)。
+            v.flowobs.ok = LogLink::loggerFlowOk() && LogLink::flowFresh();
+            if (v.flowobs.ok) {
+                int16_t dx, dy; uint8_t sq;
+                LogLink::pollFlow(dx, dy, sq);                       // 新着なしなら 0,0
+                v.flow.updateFrom(flow_tick.dt_s(), v.att.roll_rate, v.att.pitch_rate, dx, dy, sq);
+            }
+        } else if (v.flowobs.ok) {
+            // de-rotation にはレートループと同じジャイロ値を渡して位相を揃える。
+            v.flow.update(flow_tick.dt_s(), v.att.roll_rate, v.att.pitch_rate);
+        }
+        if (v.flowobs.ok && v.flow.consumeFresh()) {                  //  25Hz  窓が締まった回だけ
             v.flowobs.take(v.flow, v.flow.lastDt());
             updateFlowHold(v.flow.lastDt());
         }
@@ -638,6 +669,7 @@ void loop() {
     serviceLogFiles(armed_now);
     if (log_div.tick()) serviceFlightLog(armed_now, thr_now);        // 500Hz
     if (v.sd_ok)   SdLog::service();                                  // 毎ループ、有界の書き出し
+    if (v.link_ok && S5::STATUS_LED_VIA_LINK) LogLink::serviceLed(StatusLed::rgbBits());
     if (v.link_ok) LogLink::service();                                // 毎ループ、有界の UART 送信
     S5::Console::handleBleAction(v);                                  // BLE 経由のデバッグ指令 (あれば)
 
