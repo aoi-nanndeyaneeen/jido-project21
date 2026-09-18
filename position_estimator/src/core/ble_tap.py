@@ -245,8 +245,8 @@ class BleTap:
         ★ ここで運べるのは action + action_seq の 2byte だけ。速度・高度・
           離着陸要求のような操縦系は絶対に足さないこと。操縦指令は
           send_ctrl() (別の characteristic・別のフレーム型) だけが運ぶ。
-          デバッグ用の口と操縦の口を分けておくことで、ble_monitor.py の
-          ようなデバッグツールからは構造的に操縦が出ないままにしている。"""
+          デバッグ用の口と操縦の口を分けておく (ble_monitor.py の定型機動
+          指令も send_ctrl() 側を通る)。"""
         if self._loop is None or not self._connected:
             return False
         payload = bytes([int(action) & 0xFF, int(action_seq) & 0xFF])

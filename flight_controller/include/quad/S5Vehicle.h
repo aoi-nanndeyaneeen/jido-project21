@@ -38,8 +38,12 @@
 #include "quad/Guided.h"
 #include "quad/Scheduler.h"
 #include "quad/S5Features.h"
+#include "quad/SafeLog.h"
 
 namespace S5 {
+
+// フェイルセーフの状態 (quad/S5Failsafe.h)
+enum FsState : uint8_t { FS_NONE = 0, FS_LAND, FS_CUT };
 
 // ---- オプティカルフロー観測 (表示・ログ・キャリブ積算) --------------------
 //  制御に使う値は Q::PositionHold の中にある。ここは「センサが今何を返したか」。
@@ -128,10 +132,29 @@ struct Vehicle {
     Mode prev_mode  = MODE_ANGLE;
     bool prev_armed = false;
     bool arm_latched = false;    // アームの瞬間に SW_HOVER が ANGLE 側だったか (armGate)
+    bool seen_disarm = false;    // 起動後に THR_CUT が一度でもカット側になったか
+    bool wdt_rebooted = false;   // 今回の起動はループ停止のウォッチドッグによるリセット
+    // loop() の各回で isArmed() の結果を置く。コア1 の画面はこれを読む
+    // (isArmed() は状態を書き換えるのでコア0 以外から呼ばない)
+    bool armed_now = false;
+    // フェイルセーフ (quad/S5Failsafe.h)。書くのはコア0 だけ
+    uint8_t     fs = FS_NONE;
+    const char* fs_why = "";
+    uint32_t    fs_since_ms = 0, fs_touch_ms = 0, fs_fresh_ms = 0;
+    // アーム中に見た SBUS フレーム間隔の最大 [ms] (SBUS_LOST_MS を決める材料)。アームで 0 に戻す
+    uint32_t    sbus_gap_max_ms = 0, sbus_gap_last_ms = 0;
 
-    // 角度ループ (200Hz) の分周と、実測 dt 用の前回時刻
-    Quad::Divider angle_div{Quad::ANGLE_LOOP_DIV};
-    uint32_t      angle_prev_us = 0;
+    // フローの de-rotation 用に、メインループで積分した機体の回転角 [deg]。
+    //  readImu() が毎ループ足し、フロー読み (100Hz) の回に take() で取り出してゼロに戻す。
+    //  カウントが積まれた区間とジャイロの積分区間が一致する (sensor/OpticalFlow.h)。
+    struct FlowRot {
+        float roll_deg = 0.0f, pitch_deg = 0.0f;
+        void add(const Quad::Attitude& a, float dt_s) {
+            roll_deg  += a.roll_rate  * dt_s;
+            pitch_deg += a.pitch_rate * dt_s;
+        }
+        void take(float& r, float& p) { r = roll_deg; p = pitch_deg; roll_deg = pitch_deg = 0.0f; }
+    } flow_rot;
 
     FlowObs  flowobs;
     RangeObs range;
@@ -178,9 +201,26 @@ inline bool armGateOk(Vehicle& v) {
 
 inline bool isArmed(Vehicle& v) {
     if (!USE_SBUS) return false;
-    if (!v.sbus.isSafe()) return false;
+    // ★ 2026-09-17: sbus.isSafe() の「ループ 3000 回フレームなし」は使わない (RP2040 では
+    //   5〜6 秒かかる)。フレーム途絶は S5Failsafe.h が時間で判定し、FS_CUT にする。
+    //   受信機のフェイルセーフフラグ (プロポ OFF / 電波切れ) は従来どおり即ディスアーム。
+    if (v.sbus.failsafeFlag()) return false;
+    if (v.fs == FS_CUT) { v.arm_latched = false; return false; }
+    if (v.fs == FS_LAND) return true;   // 自動着陸中。スイッチは最後に届いた値なので見ない
     if (v.sbus.Ch_state(Ch::THR_CUT) != Quad::ARM_SWITCH_STATE) {
         v.arm_latched = false;
+        v.seen_disarm = true;
+        return false;
+    }
+    // ★ 2026-09-17: 起動した時点でスイッチがアーム側なら、一度カットに戻すまで回さない。
+    //   ウォッチドッグのリセット (飛行中のループ停止) から復帰した瞬間に、アーム側の
+    //   ままのスイッチで勝手に回り出さないため。通常の電源投入でも同じ規則にする。
+    if (!v.seen_disarm) {
+        static uint32_t last_warn_ms = 0;
+        if (millis() - last_warn_ms > 2000) {
+            last_warn_ms = millis();
+            Quad::SafeLog::logf("\n!! ARM 拒否: 起動時から THR_CUT がアーム側です。一度カットに戻してください。\n");
+        }
         return false;
     }
     // アーム操作の瞬間だけ SW_HOVER の位置を見る。
@@ -189,10 +229,10 @@ inline bool isArmed(Vehicle& v) {
             static uint32_t last_warn_ms = 0;
             if (millis() - last_warn_ms > 2000) {
                 last_warn_ms = millis();
-                Serial.println("\n!! ARM 拒否: SW_HOVER が POSHOLD 側です。");
-                Serial.println("   ANGLE 側 (bail-out 位置) に戻してからアームしてください。");
-                Serial.println("   ★スイッチの向きが思っているのと逆になっていないか確認を。");
-                Serial.println("   地上局の画面の MODE= 表示が ANGLE であることを見てください。");
+                Quad::SafeLog::logf("%s\n", "\n!! ARM 拒否: SW_HOVER が POSHOLD 側です。");
+                Quad::SafeLog::logf("%s\n", "   ANGLE 側 (bail-out 位置) に戻してからアームしてください。");
+                Quad::SafeLog::logf("%s\n", "   ★スイッチの向きが思っているのと逆になっていないか確認を。");
+                Quad::SafeLog::logf("%s\n", "   地上局の画面の MODE= 表示が ANGLE であることを見てください。");
             }
             return false;
         }
@@ -226,8 +266,6 @@ inline void resetControllers(Vehicle& v) {
     v.roll_axis.reset();
     v.pitch_axis.reset();
     v.yaw_axis.reset();
-    v.angle_div.reset();
-    v.angle_prev_us = micros();
 
     // ヘディングホールドも「今の向き」を基準に取り直す。
     v.heading.reset();
@@ -239,6 +277,7 @@ inline void resetControllers(Vehicle& v) {
 
     // フロー水平ホールドと高度ホールドも「今ここ」を基準に取り直す。
     v.poshold.reset();
+    v.rangefinder.resetStep();     // 段差オフセットも「今ここ」基準に戻す (Rangefinder.h)
     v.althold.reset(v.range.hOrZero());
     v.altest.reset(v.range.hOrZero());
 }

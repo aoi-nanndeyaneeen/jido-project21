@@ -17,12 +17,15 @@
 ### 1. 🛩️ Flight Controller (機体側制御システム)
 * **ディレクトリ**: `flight_controller/`
 * **概要**: Teensy等を用いたカスタムフライトコントローラー。PlatformIOベースで開発。
-* **主要ハードウェア**: Teensy 4.1 / 4.0, MPU6050 (6軸センサ), BMP280 (気圧センサ), SBUS受信機, IM920 (920MHz無線通信), PWMサーボ / ESC
+* **主要ハードウェア**: Teensy 4.1 / 4.0 (双発機・オートジャイロ等), Seeed XIAO RP2040 (クアッド `drone_s5_rp2040`), MPU6050 または AE-LSM6DSV16X (6軸センサ), BMP280 (気圧センサ), SBUS受信機, IM920 (920MHz無線通信), PWMサーボ / ESC
 * **機能**: 
   - 機体の姿勢（Roll, Pitch, Yaw）と加速度、高度の取得
   - テレメトリデータ（センサ値）の地上への送信
   - 地上からのRCコマンドを受信し、自律飛行やオートジャイロ機能などの実行。各種機体（ドローン、双発機、トレーナー、デルタ翼）用のファームウェア環境を切り替え可能。
-  - 現在のメイン開発ターゲットは `src/drone_s5.cpp` (+ `include/quad/*.h`)。`drone.cpp` は旧版
+  - 現在のメイン開発ターゲットは `src/drone_s5.cpp` (+ `include/quad/*.h`)。`drone.cpp` は旧版。
+  - ★ 2026-09-17: クアッドの Teensy 4.0 が故障したため、環境 `drone_s5` (Teensy) は
+    使っていない。同じ `drone_s5.cpp` を board 依存部分だけ `#ifdef ARDUINO_ARCH_RP2040`
+    で分岐し、環境 `drone_s5_rp2040` (Seeed XIAO RP2040) で飛ばしている。
 
 ### 2. 📡 Ground Receiver (地上局通信レシーバー)
 * **ディレクトリ**: `ground_receiver/`
@@ -49,9 +52,10 @@
 ## 🛠️ ハードウェアのセットアップ
 
 ### Flight Controller
-* **マイコン**: Teensy 4.1 または 4.0
-* **配線例 (MPU6050 & BMP280)**: I2C (SDA -> Pin 18, SCL -> Pin 19)
-* **IM920SL**: UART (Serial3 TX/RX など)
+* **マイコン**: Teensy 4.1 または 4.0 (双発機・オートジャイロ等)。クアッド (`drone_s5_rp2040`)
+  は Teensy 故障 (2026-09-17) により Seeed XIAO RP2040 へ移行済み
+* **配線例 (MPU6050 & BMP280、Teensy版)**: I2C (SDA -> Pin 18, SCL -> Pin 19)
+* **IM920SL**: UART (Serial3 TX/RX など、Teensy版)
 
 ### Ground Receiver
 * **マイコン**: RP2040
@@ -88,18 +92,18 @@ IM920 が担っていた役割をそのまま BLE へ移しただけで、送る
 
 ```
 [BLE (既定)]
-  機体 drone_s5 ──UART(Serial2)── log_recorder (XIAO ESP32C3) ──BLE── PC
+  機体 drone_s5_rp2040 ──UART(Serial1)── log_recorder (XIAO ESP32C3) ──BLE── PC
     上り: CmdFrame (22B) を BLE Write → log_recorder が T_CMD で機体へ中継
     下り: A,B (20Hz) + C/D (10Hz) + P を束ねた T_TELEM → BLE Notify
     機体125Hzログ (.BIN) も同じ BLE 接続に乗る
 
-[IM920 (旧経路)]
+[IM920 (旧経路。Teensy版 drone_s5 (Serial3) が前提。Teensy故障中は未使用)]
   機体 drone_s5 ──IM920── 地上局 XIAO (ground_receiver: xiao_s5_log) ──USB── PC
 ```
 
 | 場所 | BLE (今) | IM920 に戻すとき |
 |------|----------|------------------|
-| `flight_controller/include/quad/S5Features.h` | `GROUND_LINK = GroundLink::BLE` | `GroundLink::IM920` にして `drone_s5` を焼き直す |
+| `flight_controller/include/quad/S5Features.h` | `GROUND_LINK = GroundLink::BLE` | `GroundLink::IM920` にして `drone_s5_rp2040` を焼き直す (IM920 は現状 RP2040 の `BoardPins.h` に未配線) |
 | `position_estimator/src/utils/config.py` | `GROUND_LINK_BACKEND = "ble"` | `"im920"` (console.py は `--link im920` でも可) |
 | 地上局ハード | log_recorder に最新ファーム (`pio run -e xiao_logger_esp32c3 -t upload`) | 地上局 XIAO + IM920 を USB に挿す (`xiao_s5_log`) |
 

@@ -100,6 +100,65 @@ class StaticBrightMask:
         self.mask = None
 
 
+class FlickerMask:
+    """
+    「今、直近より明るくなった所」のマスク (detect_mode "flicker")。点滅 LED の点灯を拾う。
+
+    ★ 2026-09-17 09:36 Camera1 (α6400 が 1/15s・+0.3EV の自動露出に戻っていた) で、
+      bright 系は会場が明るいと成り立たなかった: しきい値 140 を床の反射や
+      照明が超え、静的輝点マスクが画面の 43% を覆い、残った雑音で候補枠
+      (max_candidates) が毎フレーム埋まって機体の LED が候補に入らなかった。
+      明るさの絶対値ではなく「点滅して明るさが変わる所」を拾えば露出に依らない。
+
+    画素ごとに2つの条件を両方満たす所を前景にする:
+      1) 今の輝度 − 直近 window_sec 秒の最小 > threshold
+         窓は LED の 1 周期 (167ms) より長く取り、消灯を必ず含める。
+         枚数ではなく時間で持つのは、Camera1 の実効 fps が露出で 10〜30 と変わるため。
+      2) 今の輝度 − ゆっくり追う背景 (指数移動平均, bg_alpha/フレーム) > bg_threshold
+         窓の最小だけだと、白飛びした窓の前を人や物が一瞬横切って戻った所も
+         「最小より明るい」になる。背景より明るいことも要求して、元から明るい所を落とす。
+
+    ★ 2026-09-17 10:08 (0.8m/s 以下で動き続ける機体): 最初は「窓内の最大 − 最小」で
+      拾っていたが、動く LED では 0.4 秒ぶんの軌跡が1つの細長い塊になり、重心が
+      LED より 20px 以上遅れて点滅判定の ROI が LED を外した (点滅確定 0.4%)。
+      「今」明るい所だけにすると塊が今の LED の位置に来る。消灯中のフレームでは
+      候補が出ないが、core/blink.py のトラックが速度で位置を予測してつなぐ。
+    止まっている照明・反射・OSD は変化が無いので出てこない。動く人・手も拾うが、
+    それは core/blink.py の点滅判定が落とす。
+    """
+
+    def __init__(self, window_sec: float, threshold: int, bg_alpha: float, bg_threshold: int):
+        self.window_sec = window_sec
+        self.threshold = threshold
+        self.bg_alpha = bg_alpha
+        self.bg_threshold = bg_threshold
+        self._frames = []      # (ts, gray)
+        self._bg = None        # float32 の指数移動平均
+
+    def apply(self, gray, ts):
+        """窓が埋まるまでは None。以降は点灯した画素を 255 にしたマスク。"""
+        self._frames.append((ts, gray))
+        while self._frames and ts - self._frames[0][0] > self.window_sec:
+            self._frames.pop(0)
+        if self._bg is None:
+            self._bg = gray.astype(np.float32)
+        above_bg = cv2.subtract(gray, cv2.convertScaleAbs(self._bg))
+        cv2.accumulateWeighted(gray, self._bg, self.bg_alpha)
+        if len(self._frames) < 3 or ts - self._frames[0][0] < 0.5 * self.window_sec:
+            return None
+
+        lo = self._frames[0][1].copy()
+        for _, g in self._frames[1:]:
+            cv2.min(lo, g, dst=lo)
+        _, mask = cv2.threshold(cv2.subtract(gray, lo), self.threshold, 255, cv2.THRESH_BINARY)
+        _, above = cv2.threshold(above_bg, self.bg_threshold, 255, cv2.THRESH_BINARY)
+        return cv2.bitwise_and(mask, above)
+
+    def reset(self):
+        self._frames = []
+        self._bg = None
+
+
 class CameraTracker:
     """
     検知パラメータは detection_params.json の共通値に、そのカメラ用の
@@ -168,10 +227,14 @@ class CameraTracker:
         if p["use_background_subtractor"]:
             self._bg = self._make_bg_subtractor()
 
+        uses_bright = p["detect_mode"] in ("bright", "bright_or_motion")
         self._static_bright = (StaticBrightMask(label, p["static_mask_learn_frames"],
                                                 p["static_mask_ratio"],
                                                 p["static_mask_dilate_px"])
-                               if p["static_bright_mask"] else None)
+                               if p["static_bright_mask"] and uses_bright else None)
+        self._flicker = (FlickerMask(p["flicker_window_sec"], p["flicker_threshold"],
+                                     p["flicker_bg_alpha"], p["flicker_bg_threshold"])
+                         if p["detect_mode"] == "flicker" else None)
 
         self.exposure_locked = False
         self.last_frame_time = 0.0
@@ -390,7 +453,7 @@ class CameraTracker:
             mask = self._static_bright.apply(mask)
         return mask
 
-    def detect(self, frame):
+    def detect(self, frame, ts=None):
         """
         1フレームから候補のリストを返す（面積の大きい順、最大 MAX_CANDIDATES 個）。
 
@@ -400,6 +463,9 @@ class CameraTracker:
           motion           背景差分。従来動作
           bright           輝度しきい値のみ。静止ホバリングでも消えない
           bright_or_motion 両方の論理和。点滅LEDの消灯フレームを motion 側が埋める
+          flicker          直近の輝度の振れ幅 (FlickerMask)。露出・会場の明るさに依らない
+
+        ts はフレームの取得時刻。flicker の窓に使う (None なら今の時刻)。
         """
         p = self.p
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -419,6 +485,9 @@ class CameraTracker:
             mask = bright if motion is None else cv2.bitwise_or(bright, motion)
             # 下限はLED側に合わせる (LEDは小さい)。上限は動体側の広いほうを使う。
             min_area = p["bright_min_area_px"]
+        elif mode == "flicker":
+            mask = self._flicker.apply(gray_blurred, time.time() if ts is None else ts)
+            min_area, max_area = p["bright_min_area_px"], p["bright_max_area_px"]
         else:
             mask = self._foreground_mask(gray_blurred)
         if mask is None:
@@ -511,7 +580,7 @@ class CameraTracker:
         if seq is not None and seq == self._last_detect_seq:
             candidates = self.last_candidates
         else:
-            candidates = self.detect(frame)
+            candidates = self.detect(frame, ts)
             self._last_detect_seq = seq
         process_ms = (time.perf_counter() - process_start) * 1000.0
         with self._latest_lock:
@@ -531,6 +600,8 @@ class CameraTracker:
             self._bg = self._make_bg_subtractor()
         if self._static_bright is not None:
             self._static_bright.reset()
+        if self._flicker is not None:
+            self._flicker.reset()
 
     def start_latest_reader(self):
         """Continuously capture frames so processing always uses the newest one."""

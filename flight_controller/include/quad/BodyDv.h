@@ -20,30 +20,24 @@
 // ============================================================
 #pragma once
 #include <Arduino.h>
+#include "quad/BodyFrame.h"
 
 namespace Quad {
 
 class BodyDvAccumulator {
 public:
-    // 毎制御ループ (1000Hz) 呼ぶ。roll_deg/pitch_deg は機体姿勢、
-    // ax/ay/az は g_att.acc_x/y/z (FRD, [g])。
-    void update(float dt_s, float roll_deg, float pitch_deg,
-                float ax, float ay, float az) {
+    // 毎制御ループ (実測 dt) 呼ぶ。att は BodyFrame.h の姿勢 (傾きの sin/cos 計算済み)。
+    void update(float dt_s, const Attitude& att) {
         if (dt_s <= 0.0f || dt_s > 0.1f) return;   // 異常な dt は捨てる (AltEstimator と同じ)
-
-        const float r = roll_deg  * DEG2RAD;
-        const float p = pitch_deg * DEG2RAD;
-        const float sr = sinf(r);
-        const float sp = sinf(p), cp = cosf(p);
 
         // 重力の機体座標成分 [g] (前, 右)。AltEstimator::predict() の
         // f_down 式 (-sin(p)*ax + cos(p)sin(r)*ay + cos(p)cos(r)*az) と
         // 同じ回転行列から出てくる、下方向以外の2成分。
-        const float g_front_g = -sp;
-        const float g_right_g =  cp * sr;
+        const float g_front_g = -att.sp;
+        const float g_right_g =  att.cp * att.sr;
 
-        const float true_ax_g = ax + g_front_g;
-        const float true_ay_g = ay + g_right_g;
+        const float true_ax_g = att.acc_x + g_front_g;
+        const float true_ay_g = att.acc_y + g_right_g;
 
         _dvx += true_ax_g * GRAVITY_MPS2 * dt_s;
         _dvy += true_ay_g * GRAVITY_MPS2 * dt_s;
@@ -59,7 +53,6 @@ public:
 
 private:
     static constexpr float GRAVITY_MPS2 = 9.80665f;
-    static constexpr float DEG2RAD = 3.14159265358979323846f / 180.0f;
     float _dvx = 0.0f, _dvy = 0.0f;
 };
 

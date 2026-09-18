@@ -31,10 +31,17 @@ namespace Quad {
 class HeadingHold {
 public:
     // アーム/モード切替で「今の向き」を基準に取り直す。相対値なので 0 でよい。
+    // 捨てた分は _since_arm_ofs に積むので sinceArm() は途切れない。
     void reset() {
+        _since_arm_ofs += _est;
         _est = _hold = 0.0f;
         _holding = false;
     }
+
+    // アームの瞬間 (reset() の後) に 1 回。ここを「置いた向き」= sinceArm() の 0 にする。
+    //  ANGLE で離陸して POSHOLD に上げると reset() で est() は 0 に戻るが、
+    //  sinceArm() は置いたときからの回転を持ち続ける (直進の向き。StraightTrack.h)。
+    void markArm() { _since_arm_ofs = 0.0f; }
 
     // 毎メインループ (1000Hz)。制御に使うジャイロ値で相対方位を積分する。
     void integrate(float yaw_rate_dps, float dt_s) { _est += yaw_rate_dps * dt_s; }
@@ -70,7 +77,8 @@ public:
         return constrain(_kp * err, -Gain::YAW_HOLD_RATE_LIM, +Gain::YAW_HOLD_RATE_LIM);
     }
 
-    float est()     const { return _est; }      // 相対方位 [deg] (アーム時 0)
+    float est()     const { return _est; }      // 相対方位 [deg] (アーム/モード切替時 0)
+    float sinceArm() const { return _since_arm_ofs + _est; }   // アーム時からの回転 [deg]
     float hold()    const { return _hold; }     // 保持したい方位 [deg]
     float error()   const { return _hold - _est; }
     bool  holding() const { return _holding; }
@@ -80,6 +88,7 @@ public:
 private:
     float _est  = 0.0f;
     float _hold = 0.0f;
+    float _since_arm_ofs = 0.0f;   // reset() で est から捨てた回転の合計
     bool  _holding = false;
     float _kp = Gain::YAW_HOLD_KP;   // シリアル 'p' メニューから変えられる
 };

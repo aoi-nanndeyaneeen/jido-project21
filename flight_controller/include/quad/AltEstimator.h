@@ -54,6 +54,7 @@
 #include <Arduino.h>
 #include <math.h>
 #include "quad/QuadConfig.h"
+#include "quad/BodyFrame.h"
 
 namespace Quad {
 
@@ -69,25 +70,19 @@ public:
     }
 
     // ------------------------------------------------------------
-    //  predict()  — メインループで毎回 (RATE_LOOP_HZ)
-    //    roll_deg / pitch_deg : 機体姿勢 [deg]
-    //    ax / ay / az         : 機体座標 FRD の加速度 [g] (g_att.acc_*)
+    //  predict()  — メインループで毎回 (実測 dt)
+    //    att : 機体姿勢 (BodyFrame.h)。傾きの sin/cos と FRD 加速度 [g] を使う
     //
-    //  FRD なので静止・水平で az ≈ -1.0 g。
+    //  FRD なので静止・水平で acc_z ≈ -1.0 g。
     //  地球座標の「下向き」比力は回転行列の3行目:
     //      f_down = -sin(p)*ax + cos(p)sin(r)*ay + cos(p)cos(r)*az
     //  重力ぶん (-1g) を引いて符号を返すと「上向き正の加速度」になる。
     // ------------------------------------------------------------
-    void predict(float dt_s, float roll_deg, float pitch_deg,
-                 float ax, float ay, float az) {
+    void predict(float dt_s, const Attitude& att) {
         if (dt_s <= 0.0f || dt_s > 0.1f) return;   // 異常な dt は捨てる
 
-        const float r = roll_deg  * DEG2RAD;
-        const float p = pitch_deg * DEG2RAD;
-        const float sr = sinf(r), cr = cosf(r);
-        const float sp = sinf(p), cp = cosf(p);
-
-        const float f_down = -sp * ax + cp * sr * ay + cp * cr * az;
+        const float f_down = -att.sp * att.acc_x + att.cp * att.sr * att.acc_y
+                           +  att.cp * att.cr * att.acc_z;
 
         //  静止時 f_down = -1g なので、+1 して重力を除去。
         //  ALT_ACC_Z_SIGN は IMU が上下逆マウントの場合に -1 にする。
@@ -138,7 +133,6 @@ public:
     float accUp()     const { return _acc_up; }   // 重力除去後の鉛直加速度 [m/s^2]
 
 private:
-    static constexpr float DEG2RAD     = 0.01745329252f;
     static constexpr float GRAVITY_MPS2 = 9.80665f;
 
     float _h      = 0.0f;

@@ -32,7 +32,7 @@ struct Dev {
 
 // 並びはバス順 (I2C → SPI → UART)
 static Dev devs[] = {
-    { "IMU MPU6050",  "I2C 0x68", ST_SKIP, "" },
+    { IMU::CHIP_NAME, IMU::I2C_DESC, ST_SKIP, "" },
     { "Rangefinder",  "I2C/PW",   ST_SKIP, "" },
     { "PMW3901 flow", S5::FLOW_VIA_LINK ? "ロガー経由 T_FLOW" : "SPI CS10", ST_SKIP, "" },
     { "SD HW-125",    "SPI CS9",  ST_SKIP, "" },
@@ -54,11 +54,11 @@ inline const char* tag(St s) {
 
 // 起動時に1回。ブロッキングで良い (まだ飛んでいない)。
 inline void probe(Vehicle& v) {
-    // --- IMU (I2C 0x68, WHO_AM_I) ---
+    // --- IMU (I2C, WHO_AM_I) ---
     if (USE_MPU) {
         devs[D_IMU].st = v.mpu.connected() ? ST_OK : ST_FAIL;
         if (devs[D_IMU].st == ST_FAIL)
-            strcpy(devs[D_IMU].note, "応答なし SDA18/SCL19");
+            strcpy(devs[D_IMU].note, "応答なし " BOARD_I2C_DESC);
     }
 
     // --- 測距 (VL53L1X I2C 0x29 / MaxBotix PW) ---

@@ -15,7 +15,7 @@
 namespace Gain {
 
 // ---- レート (内側ループ, 1000Hz) ----          kp       ki       kd
-//  I 項は 0。2026-09-09 に ki/ANG ki/D_ALPHA を同時に変えて roll が崩れた
+//  I 項は 0。2026-09-09 に ki/ANG ki/D フィルタを同時に変えて roll が崩れた
 //  (LOG0057) ため、飛んでいた LOG0054 の値に戻してある。積分の置き場所は
 //  M1/M4 の非対称を直した機体で 1 つずつ検証すること (TUNING_HISTORY §1)。
 constexpr float RATE_ROLL [3] = { 0.0015f, 0.0000f, 0.00004f };
@@ -23,8 +23,11 @@ constexpr float RATE_PITCH[3] = { 0.0015f, 0.0000f, 0.00004f };
 //  ヨーだけ I 項あり。モーター取付角/ペラ差の一定ヨートルクは P では消えない。
 constexpr float RATE_YAW  [3] = { 0.0015f, 0.0020f, 0.00004f };
 
-//  D 項 LPF。0.95 (遮断 ~8Hz) にするとクロスオーバー帯で D が加振に回った。
-constexpr float RATE_D_ALPHA = 0.80f;
+//  D 項 LPF の時定数 [s]。旧 RATE_D_ALPHA=0.80 @1000Hz と同じ τ=4ms (遮断 ~40Hz)。
+//  alpha 0.95 (遮断 ~8Hz) にするとクロスオーバー帯で D が加振に回った。
+//  ★ 2026-09-18: 固定 alpha → 時定数 (QuadPID.h)。RP2040 の実効 650Hz では
+//    alpha 0.80 が τ=6.9ms になっていた。時定数なら板の周期に依らない。
+constexpr float RATE_D_TAU_S = 0.004f;
 constexpr float RATE_I_LIMIT = 0.15f;      // 出力の 15% で頭打ち (windup 防止)
 
 // ---- ヘディングホールド (ヨー) ----
@@ -35,12 +38,15 @@ constexpr float YAW_HOLD_RATE_LIM = 60.0f;  // 保持が出してよい角速度
 constexpr float YAW_HOLD_ERR_LIM  = 20.0f;  // これ以上の方位誤差は追わない [deg]
 constexpr float YAW_STICK_DEAD    = 0.03f;  // ラダー不感帯。超えたら「操作中」
 
-// ---- 角度 (外側ループ, 200Hz) ----              kp     ki    kd
+// ---- 角度 (外側ループ。メインループごと) ----      kp     ki    kd
 //  出力は [deg/s]。kp=30 なら「10deg 傾いていたら 300deg/s で戻す」。
 //  ki は本来 0 が筋 (レート側 I と干渉する) だが、飛んでいた値 (LOG0054) を保つ。
+//  ★ 2026-09-18: ÷5 の分周 (200Hz) をやめてメインループごとに回す。P だけの
+//    ループなので周期を上げても同じ値が出るだけ (階段が消えて遅れが減る)。
+//    分周は 1000Hz 前提で、RP2040 では 130Hz になっていた。
 constexpr float ANG_ROLL [3] = { 30.0f, 0.04f, 0.0f };
 constexpr float ANG_PITCH[3] = { 30.0f, 0.04f, 0.0f };
-constexpr float ANG_D_ALPHA  = 0.70f;
+constexpr float ANG_D_TAU_S  = 0.012f;     // 旧 ANG_D_ALPHA=0.70 @200Hz 相当 (kd=0 なので今は無関係)
 constexpr float ANG_I_LIMIT  = 30.0f;      // 角度ループ積分項の上限 [deg/s]
 
 // ---- 姿勢基準トリム [deg] ----

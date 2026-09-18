@@ -10,7 +10,13 @@
 //      down → ANGLE   完全手動 (スロットルも手動)。これが bail-out
 //      cen  → POSHOLD 完全自動 (水平位置 + 高度 + ヘディング)。
 //                     フロー喪失時は ALTHOLD へ自動フォールバック
-//      up   → GUIDED  地上局ガイド飛行。資格が無い間は cen と同じ POSHOLD
+//      up   → GUIDED  機体単独の周回 (2026-09-17〜。地上局ミッションはコメントアウト中)。
+//                     飛行中に cen → up へ上げた瞬間、今いる点を円の左端・機首方向を
+//                     接線として半径 1m の右旋回を 1 周し、POSHOLD に戻る (quad/Guided.h)。
+//                     GUIDED_PATTERN=Figure8 なら直径 1m の右旋回 → 起点で左旋回の 8 の字。
+//                     GUIDED_PATTERN=ClimbTurn なら半径 0.75m で低 2 周 → 上昇 1 周 → 高 2 周
+//                     → その場で開始高度へ降下 (QuadConfig.h CLIMB_*)。
+//                     資格が無い間 / 終わった後は cen と同じ POSHOLD
 //    アームは必ず ANGLE 側で (S5Vehicle.h の armGateOk)。
 //    ★ 初回は広い床で、指をモードスイッチに。符号ミス = 即壁/天井行き。
 //    ★ 地上確認はドライラン ('m') で。フロー制御は「アーム && POSHOLD &&
@@ -22,23 +28,29 @@
 //    地上局 (setpoint のみ) ─┐
 //    スティック ─────────────┴→ PosHold  目標速度 → 速度PID → 目標リーン角   25Hz
 //                               AltHold  目標高度 → 位置/速度PID → スロットル   100Hz (測距の回だけ PID)
-//                               角度PID  目標リーン角 → 目標角速度              200Hz
-//                               レートPID 目標角速度 → トルク → ミキサー → ESC  1000Hz
+//                               角度PID  目標リーン角 → 目標角速度              毎ループ
+//                               レートPID 目標角速度 → トルク → ミキサー → ESC  毎ループ (目標 1000Hz)
 //    ヨー: ジャイロ積分の相対方位を保持 (HeadingHold)。定型機動中は一定レート。
+//
+//  ★ 2026-09-18 (RP2040 移行後の見直し): メインループは 1000Hz を目標にしているが
+//    RP2040 (FPU なし) では実効 630〜700Hz。すべての PID・積分・姿勢推定 (Madgwick) は
+//    実測 dt で計算し、回数分周 (÷5 / ÷10) は使わない。周期は Ticker (時間基準) だけ。
+//    姿勢推定は固定 1ms で積分していて角度が 0.6〜0.7 倍に縮んでいた (sensor/IMU.h)。
 //
 //  ------------------------------------------------------------
 //  【ファイル構成】 このファイルは「配線」だけ。中身は include/quad/ の各ヘッダ。
 //    S5Features.h   搭載デバイスと周期の一覧 (★ loop() の周期表はここ)
 //    S5Gains.h      姿勢ループゲイン / トリム (経緯は TUNING_HISTORY.md)
 //    S5Vehicle.h    機体まるごと (デバイス + 制御器 + 共有状態) と arm/reset/motor
-//    Scheduler.h    Ticker / Divider
+//    Scheduler.h    Ticker
 //    Guided.h       地上局要求 → 目標速度/高度 の翻訳 (状態機械)
 //    HeadingHold.h  ヨーの相対方位とホールド
 //    PosHold.h / AltHold.h / AltEstimator.h / Maneuver.h   制御器の中身
 //    S5Telemetry.h  下りテレメトリの枠割り (A,B,A,B,C,A,B,D)
 //    S5LogFill.h    125Hz ログ 1 行の作成
 //    S5Console.h    シリアルキー / ゲインメニュー / BLE メンテナンス指令
-//    S5Status.h     デバッグ画面
+//    S5Status.h     デバッグ画面 (RP2040 ではコア1。§ 9 と quad/UsbOwner.h)
+//    FcWatchdog.h / LoopProfile.h / SafeLog.h   ループ停止対策 / 区間計測 / 待たない出力
 //    SelfTest.h / StallLog.h   起動時デバイスチェック / 停止調査
 //    protocol/S5Cmd.h, S5Telem.h   無線パケット (地上局・PC と共有)
 // ============================================================
@@ -58,9 +70,15 @@
 #include "quad/SdLog.h"
 #include "quad/LogLink.h"
 #include "quad/StatusLed.h"
+#include "quad/FcWatchdog.h"
+#include "quad/SafeLog.h"
+#include "quad/LoopProfile.h"
+#include "quad/UsbOwner.h"
+#include "quad/S5Failsafe.h"
 
 namespace Q = Quad;
 using S5::Vehicle;
+namespace WDT = S5::FcWatchdog;
 
 static_assert(sizeof(S5C::CmdFrame) == LogLinkProto::CMD_PAYLOAD,
               "quad/LogLinkProto.h の CMD_PAYLOAD を protocol/S5Cmd.h の CmdFrame に合わせること");
@@ -71,16 +89,16 @@ static_assert(sizeof(S5C::CmdFrame) == LogLinkProto::CMD_PAYLOAD,
 static Vehicle          v;        // 機体まるごと (S5Vehicle.h)
 static S5::TelemetryTx  telem;    // 下りテレメトリの枠割り
 
-// 周期 (一覧は S5Features.h)。時間基準は Ticker、メインループの分周は Divider。
-static Q::Ticker  main_tick    (S5::MAIN_HZ);        // 1000Hz
+// 周期 (一覧は S5Features.h)。すべて時間基準の Ticker (回数分周はしない。Scheduler.h)。
+static Q::Ticker  main_tick    (S5::MAIN_HZ);        // 1000Hz (目標。RP2040 は実効 630〜700Hz)
 static Q::Ticker  flow_tick    (Q::FLOW_LOOP_HZ);    //  100Hz  フロー読み (制御は FLOW_CTRL_HZ)
 static Q::Ticker  range_tick   (Q::RANGE_LOOP_HZ);   //  100Hz  測距ポーリング
 static Q::Ticker  telem_rx_tick(S5::TELEM_RX_HZ);    //  200Hz  上りコマンド受信
 static Q::Ticker  telem_tick   (S5::USE_BLE_LINK ? S5::BLE_TELEM_HZ   //   20Hz  下りテレメトリ (BLE)
                                                   : S5::TELEM_TX_HZ);   //    8Hz  下りテレメトリ (IM920)
 static Q::Ticker  debug_tick   (S5::DEBUG_HZ);       //   10Hz  画面
-static Q::Divider guided_div   (S5::GUIDED_DIV);     //  100Hz  地上局要求の翻訳
-static Q::Divider log_div      (FlightLog::DIV);     //  500Hz  ログ 1 行
+static Q::Ticker  guided_tick  (S5::GUIDED_HZ);      //  100Hz  地上局要求の翻訳 / 周回の目標
+static Q::Ticker  log_tick     (FlightLog::LOG_HZ);  //  125Hz  ログ 1 行 (RP2040。Teensy 500Hz)
 
 // ============================================================
 //  § 2  ホールド用スロットルゲート
@@ -156,14 +174,24 @@ static S5::Mode selectMode() {
 //  § 4  センサ読み → 各ホールド制御器  (loop() から周期ごとに呼ぶ)
 // ============================================================
 
-// --- 1000Hz: IMU → 姿勢、高度推定の predict ---------------------------
+// --- 毎ループ: IMU → 姿勢、高度推定の predict ---------------------------
 static void readImu(float dt_s) {
     if (!S5::USE_MPU) return;
-    v.mpu.update();
+    v.mpu.update(dt_s);   // 実測 dt で Madgwick を積分する (固定 1ms だと RP2040 で角度が縮む)
+    // I2C バスを復旧したら、同じバスの測距センサも入れ直す (sensor/IMU.h recoverBus)
+    if (v.mpu.consumeBusRecovered()) {
+        if (S5::USE_RANGE) v.rangefinder.busRecovered();
+        Q::SafeLog::logf("\n!! I2C バス復旧 %u 回目: IMU %s (読み失敗 %lu 回)\n",
+                         (unsigned)v.mpu.recoverCount(),
+                         v.mpu.recoverOk() ? "復帰OK (リセット+設定し直し)" : "まだ無応答",
+                         (unsigned long)v.mpu.ioFailTotal());
+    }
     v.att = Q::readAttitude(v.mpu);
-    // 加速度は 1000Hz・遅れほぼゼロなので、測距 (遅れ大) より先に積分を進める。
+    // フローの de-rotation 用に機体の回転角を積む (フロー読みの回に取り出す)
+    v.flow_rot.add(v.att, dt_s);
+    // 加速度は毎ループ・遅れほぼゼロなので、測距 (遅れ大) より先に積分を進める。
     // ALT_USE_ACC_FUSION=false の間は結果をログに出すだけ。
-    v.altest.predict(dt_s, v.att.roll, v.att.pitch, v.att.acc_x, v.att.acc_y, v.att.acc_z);
+    v.altest.predict(dt_s, v.att);
 }
 
 // --- 25Hz (FLOW_CTRL_HZ): フロー水平ホールド --------------------------------
@@ -182,12 +210,16 @@ static void updateFlowHold(float dt_s) {
                      && (thr > Q::FLOW_ENABLE_THR) && airborne
                      && S5::USE_FLOW && v.flowobs.ok;
 
-    // GUIDED 中は目標速度を地上局から [m/s] で直接もらう。スティックは渡さない
-    // (Guided がスティック操作を検出したら GUIDED 自体を降りるので混ぜる必要がない)。
+    // GUIDED (周回) 中は円の目標点・接線速度・向心加速度を PosHold に渡す。スティックは
+    // 渡さない (Guided がスティック操作を検出したら GUIDED 自体を降りるので混ぜる必要がない)。
+    //  地上局ミッション (コメントアウト中) では v.poshold.setVelCommand(v.guided.vx(), v.guided.vy())。
     float sx = 0.0f, sy = 0.0f;
-    if (v.mode == S5::MODE_GUIDED) {
-        v.poshold.setVelCommand(v.guided.vx(), v.guided.vy());
+    if (v.mode == S5::MODE_GUIDED && v.guided.tracking()) {
+        const Q::Guided::Trajectory tr = v.guided.trajectory();   // 周回 / 直進
+        v.poshold.clearVelCommand();
+        v.poshold.setTrajectory(tr.ref_n, tr.ref_e, tr.vel_n, tr.vel_e, tr.acc_n, tr.acc_e);
     } else {
+        v.poshold.clearTrajectory();
         v.poshold.clearVelCommand();
         sx = Q::STICK_SIGN_PITCH * v.sbus.des[Ch::PITCH];   // 機体座標のまま (機首基準)
         sy = Q::STICK_SIGN_ROLL  * v.sbus.des[Ch::ROLL];
@@ -214,8 +246,10 @@ static void updateAltHold(float dt_s) {
     // GUIDED 中は目標高度も地上局から。自動離陸・着陸はこの目標をスルーレート付きで
     // 動かしているだけで、専用の制御経路は無い。
     const bool guided_alt = (v.mode == S5::MODE_GUIDED && v.guided.altM() > 0.0f);
-    if (guided_alt) v.althold.commandTarget(v.guided.altM(), v.guided.slew());
-    else            v.althold.clearCommandedTarget();
+    if (v.fs == S5::FS_LAND)   // SBUS 途絶の自動着陸 (S5Failsafe.h)
+        v.althold.commandTarget(Q::GUIDED_LAND_FLOOR_M, Q::GUIDED_LAND_SLEW_MPS);
+    else if (guided_alt) v.althold.commandTarget(v.guided.altM(), v.guided.slew());
+    else                 v.althold.clearCommandedTarget();
 
     v.althold.update(dt_s,
                      v.alt_hold_enable && S5::USE_RANGE,
@@ -228,26 +262,33 @@ static void updateAltHold(float dt_s) {
                      guided_alt && v.rangefinder.tooClose());
 }
 
-// --- 100Hz (GUIDED_HZ): 地上局要求 → 目標速度/高度 ---------------------------
-static void updateGuided() {
+// --- 100Hz (GUIDED_HZ): 周回の目標を進める ------------------------------------
+static void updateGuided(float dt_s) {
     Q::Guided::Inputs in;
     in.now_ms      = millis();
+    in.dt_s        = dt_s;
     in.armed       = S5::isArmed(v);
-    in.sbus_ok     = S5::USE_SBUS;
+    in.sbus_ok     = S5::USE_SBUS && v.fs == S5::FS_NONE;   // フェイルセーフ中は GUIDED を降りる
     in.sw_hover_up = S5::USE_SBUS && (v.sbus.Ch_state(Ch::SW_HOVER) == up);
     in.flow_alive  = v.flowAlive();
     in.range_ok    = S5::USE_RANGE && v.range.ok;
     in.range_valid = v.range.valid;
     in.range_h_m   = v.range.h_m;
+    in.airborne    = v.althold.airborne();
+    in.hold_ready  = v.holdMode() && v.althold.active() && (v.thrStick() > Q::FLOW_ENABLE_THR);
+    in.pos_n       = v.poshold.posN();
+    in.pos_e       = v.poshold.posE();
     in.stick_roll  = v.sbus.des[Ch::ROLL];
     in.stick_pitch = v.sbus.des[Ch::PITCH];
     in.stick_yaw   = v.sbus.des[Ch::YAW];
     in.yaw_est_deg = v.heading.est();
-    v.guided.update(in, v.s5rx, v.poshold, v.heading);
+    in.yaw_since_arm_deg = v.heading.sinceArm();
+    v.guided.update(in);
+    // 地上局ミッション (コメントアウト中): v.guided.update(in, v.s5rx, v.poshold, v.heading);
 }
 
 // ============================================================
-//  § 5  姿勢制御  (1000Hz)
+//  § 5  姿勢制御  (毎ループ。目標 1000Hz)
 // ============================================================
 static void updateControl(float dt_s) {
     v.mode = selectMode();
@@ -256,27 +297,47 @@ static void updateControl(float dt_s) {
     // --- アーム状態やモードが変わったらクリア ---
     if (armed != v.prev_armed) {
         S5::resetControllers(v);
+        if (armed) v.heading.markArm();   // 置いた向き = 直進の基準 (HeadingHold::sinceArm)
+        // 姿勢推定の加速度補正: 地上は強く (水平へ素早く収束)、飛行中は弱く
+        // (横移動の加速度に引かれない。sensor/IMU.h setFusionBeta のコメント)
+        v.mpu.setFusionBeta(armed ? Q::IMU_FUSION_BETA_FLIGHT : Q::IMU_FUSION_BETA_GROUND);
         v.prev_armed = armed;
-        Serial.println(armed ? "\n>>> ARMED" : "\n>>> DISARMED");
+        Q::SafeLog::logf("%s", armed ? "\n>>> ARMED\n" : "\n>>> DISARMED\n");
+        // ループ停止のウォッチドッグはアーム中だけ (quad/FcWatchdog.h)
+        if (armed) WDT::arm();
+        else       WDT::disarm();
+        S5::LoopProfile::armEdge(armed);   // ディスアームで「この飛行」の区間計測を出す
+        if (armed) {
+            v.sbus_gap_max_ms = 0;
+        } else {
+            v.sbus_gap_last_ms = v.sbus_gap_max_ms;
+            Q::SafeLog::logf("[SBUS この飛行] フレーム間隔の最大 %lu ms (途絶判定 %lu ms)\n",
+                             (unsigned long)v.sbus_gap_last_ms, (unsigned long)Q::SBUS_LOST_MS);
+        }
         // アームの瞬間にスティック中央を取り直す (ディスアーム中に trackCenter() で
         // 溜めた直近フレーム。棄却規則は起動時と同じ)。
         if (armed && S5::USE_SBUS && Q::STICK_CENTER_ENABLE) {
             const Sbus::CenterCal cc = v.sbus.applyTrackedCenter(
                 Q::STICK_CENTER_MAX_OFS, Q::STICK_CENTER_MAX_MOVE);
             if (cc.st == Sbus::CC_OK)
-                Serial.printf("    スティック中央 再取込: R%+.3f P%+.3f Y%+.3f (%d frames)\n",
+                Q::SafeLog::logf("    スティック中央 再取込: R%+.3f P%+.3f Y%+.3f (%d frames)\n",
                               cc.roll, cc.pitch, cc.yaw, cc.n);
             else
-                Serial.printf("    !! スティック中央 再取込 棄却 (%s) — 前の値のまま !!\n",
+                Q::SafeLog::logf("    !! スティック中央 再取込 棄却 (%s) — 前の値のまま !!\n",
                               cc.st == Sbus::CC_MOVING ? "動いていた" :
                               cc.st == Sbus::CC_TOOFAR ? "ずれ過大" : "フレーム不足");
         }
     }
     if (!armed && S5::USE_SBUS) v.sbus.trackCenter();
     if (v.mode != v.prev_mode) {
-        S5::resetControllers(v);
+        // POSHOLD ⇔ GUIDED は同じ制御経路で目標の出所が変わるだけなので、何もリセット
+        // しない。リセットすると飛行中に高度ホールドが engage し直し (I 項・離陸検知が
+        // 消える)、フロー位置の原点も飛ぶので、周回の起点が取れなくなる。
+        const bool hold_to_hold = v.holdMode() &&
+            (v.prev_mode == S5::MODE_POSHOLD || v.prev_mode == S5::MODE_GUIDED);
+        if (!hold_to_hold) S5::resetControllers(v);
         v.prev_mode = v.mode;
-        Serial.printf("\n>>> MODE = %s\n", S5::modeLabel(v.mode));
+        Q::SafeLog::logf("\n>>> MODE = %s\n", S5::modeLabel(v.mode));
     }
 
     // --- 測定値はアーム前から入れておく (飛行前にジャイロの符号を画面で確認できる) ---
@@ -290,7 +351,7 @@ static void updateControl(float dt_s) {
     v.pitch_axis.ang_meas  = v.att.pitch - Gain::PITCH_TRIM_DEG;
 
     // 地上局ヨー推定用の機体Δv (D フレームで送る)。アーム前から積んでよい。
-    v.body_dv.update(dt_s, v.att.roll, v.att.pitch, v.att.acc_x, v.att.acc_y, v.att.acc_z);
+    v.body_dv.update(dt_s, v.att);
 
     if (!armed) { S5::stopAllMotors(v); return; }
 
@@ -316,7 +377,7 @@ static void updateControl(float dt_s) {
     v.pitch_axis.stick = Q::STICK_SIGN_PITCH * v.sbus.des[Ch::PITCH];
     v.yaw_axis.stick   = Q::STICK_SIGN_YAW   * v.sbus.des[Ch::YAW];
 
-    // --- 外側ループ: 角度 → 目標角速度 (200Hz) ---
+    // --- 外側ループ: 角度 → 目標角速度 (毎ループ。実測 dt) ---
     if (v.mode != S5::MODE_RATE) {
         if (v.holdMode()) {
             // 目標角は updateFlowHold() が計算済み (クランプ済み)
@@ -328,20 +389,14 @@ static void updateControl(float dt_s) {
             v.pitch_axis.ang_tar = Q::stickExpo(v.pitch_axis.stick, Q::STICK_EXPO_ANGLE) * Q::MAX_ANGLE_PITCH;
         }
 
-        if (v.angle_div.tick()) {
-            // 実測の経過時間を渡す (旧コードは 1ms 固定で I/D 項が 5 倍ずれていた)
-            const uint32_t now = micros();
-            const float ang_dt_s = (float)(now - v.angle_prev_us) * 1e-6f;
-            v.angle_prev_us = now;
-
-            v.roll_axis.rate_tar = constrain(
-                v.roll_axis.angle.update(v.roll_axis.ang_tar, v.roll_axis.ang_meas, ang_dt_s, integrate),
-                -S5::ANGLE_OUT_LIMIT, S5::ANGLE_OUT_LIMIT);
-            v.pitch_axis.rate_tar = constrain(
-                v.pitch_axis.angle.update(v.pitch_axis.ang_tar, v.pitch_axis.ang_meas, ang_dt_s, integrate),
-                -S5::ANGLE_OUT_LIMIT, S5::ANGLE_OUT_LIMIT);
-        }
-        // 間引かれたループでは、前回の rate_tar をそのまま使う
+        // 2026-09-18: ÷5 の分周をやめて毎ループ回す (S5Gains.h ANG_*)。P 主体なので
+        // 値は同じで、目標角速度の 5ms 階段が消えるだけ。dt はレートループと同じ実測値。
+        v.roll_axis.rate_tar = constrain(
+            v.roll_axis.angle.update(v.roll_axis.ang_tar, v.roll_axis.ang_meas, dt_s, integrate),
+            -S5::ANGLE_OUT_LIMIT, S5::ANGLE_OUT_LIMIT);
+        v.pitch_axis.rate_tar = constrain(
+            v.pitch_axis.angle.update(v.pitch_axis.ang_tar, v.pitch_axis.ang_meas, dt_s, integrate),
+            -S5::ANGLE_OUT_LIMIT, S5::ANGLE_OUT_LIMIT);
     } else {
         // RATE モード (封印): スティックが直接、目標角速度になる
         v.roll_axis.ang_tar  = 0.0f;
@@ -352,13 +407,14 @@ static void updateControl(float dt_s) {
 
     // --- ヨー: ヘディングホールド (HeadingHold.h) ---
     v.heading.integrate(v.yaw_axis.rate_meas, dt_s);
-    const float maneuver_rate = v.guided.inManeuver() ? v.guided.maneuver().yawRate() : NAN;
+    //  周回中は接線方向へ向けるレート (CircleTrack::yawRateCmd)、それ以外は NAN
+    const float maneuver_rate = v.guided.yawRate();
     v.yaw_axis.rate_tar = v.heading.update(v.yaw_axis.stick, integrate, maneuver_rate, Q::MAX_RATE_YAW);
     // 表示用 (ヨーには角度PIDを通していないが、保持誤差をここに入れておく)
     v.yaw_axis.ang_tar  = v.heading.hold();
     v.yaw_axis.ang_meas = v.heading.est();
 
-    // --- 内側ループ: 角速度 → トルク指令 (1000Hz) ---
+    // --- 内側ループ: 角速度 → トルク指令 (毎ループ) ---
     v.roll_axis.cmd  = v.roll_axis.rate .update(v.roll_axis.rate_tar,  v.roll_axis.rate_meas,  dt_s, integrate);
     v.pitch_axis.cmd = v.pitch_axis.rate.update(v.pitch_axis.rate_tar, v.pitch_axis.rate_meas, dt_s, integrate);
     v.yaw_axis.cmd   = v.yaw_axis.rate  .update(v.yaw_axis.rate_tar,   v.yaw_axis.rate_meas,   dt_s, integrate);
@@ -374,7 +430,7 @@ static void updateControl(float dt_s) {
 //  § 6  ログ / LED / ファイル開閉  (loop() 後半のサービス群)
 // ============================================================
 
-// 500Hz: ログ 1 行を作って USB / RAM / SD / LogLink の 4 シンクへ配る
+// LOG_HZ: ログ 1 行を作って USB / RAM / SD / LogLink の 4 シンクへ配る
 static void serviceFlightLog(bool armed_now, float thr_now) {
     // RAM トリガの追加ゲート。フロー試験時は SW_HOVER=up からの 8 秒を録る
     // (地上待機や上昇でバッファを食い潰さない)。SD 運用では thr>0.20 だけ。
@@ -392,6 +448,9 @@ static void serviceFlightLog(bool armed_now, float thr_now) {
     }
 }
 
+// 再起動の報告ログを閉じる時刻 (0 = 報告中でない)。setup() で開始する
+static uint32_t boot_report_until_ms = 0;
+
 // アーム/ディスアームのエッジでログファイルを開閉する
 static void serviceLogFiles(bool armed_now) {
     if (v.sd_ok) {
@@ -406,9 +465,14 @@ static void serviceLogFiles(bool armed_now) {
     if (v.link_ok) {
         // SD 版と違い open/preAllocate をこちら側でやらないのでブロックしない
         static bool was_armed = false;
-        if (armed_now && !was_armed) LogLink::startFile();
+        if (armed_now && !was_armed) { boot_report_until_ms = 0; LogLink::startFile(); }
         if (!armed_now && was_armed) LogLink::stopFile();
         was_armed = armed_now;
+        // 再起動時の報告ログ (setup で開始) をアームせずに閉じる
+        if (boot_report_until_ms != 0 && !armed_now && millis() >= boot_report_until_ms) {
+            boot_report_until_ms = 0;
+            LogLink::stopFile();
+        }
     }
 }
 
@@ -447,7 +511,14 @@ void setup() {
     const uint32_t start_ms = millis();
     while (!Serial && (millis() - start_ms < 2000)) { }
 
+    WDT::begin();   // 前回が「ループ停止によるリセット」なら、どの区間で止まったかを読む
+    if (WDT::rebooted()) v.wdt_rebooted = true;
+
     Serial.println("\n\n=== Stage 5d : 1スイッチ完全自動ホバリング ===");
+    if (v.wdt_rebooted)
+        Serial.printf("\n!!!!! 前回はループ停止でウォッチドッグがリセットしました: 区間「%s」 "
+                      "(起動 %lu ms 後) !!!!!\n!!!!! THR_CUT を一度切るまでアームしません !!!!!\n",
+                      WDT::sectionName(WDT::lastSection()), (unsigned long)WDT::lastMs());
     Serial.println("!! SW_HOVER: down=ANGLE(手動) / cen=POSHOLD(完全自動) / up=GUIDED(地上局) !!");
     Serial.println("!! bail-out = SW_HOVER を下げる or THR_CUT。初回は広い床で指をスイッチに !!");
 
@@ -466,9 +537,9 @@ void setup() {
     v.roll_axis.angle .set_gains(Gain::ANG_ROLL [0], Gain::ANG_ROLL [1], Gain::ANG_ROLL [2]);
     v.pitch_axis.angle.set_gains(Gain::ANG_PITCH[0], Gain::ANG_PITCH[1], Gain::ANG_PITCH[2]);
     for (Q::Axis* ax : { &v.roll_axis, &v.pitch_axis, &v.yaw_axis }) {
-        ax->rate.set_d_alpha(Gain::RATE_D_ALPHA);
+        ax->rate.set_d_tau(Gain::RATE_D_TAU_S);
         ax->rate.set_i_limit(Gain::RATE_I_LIMIT);
-        ax->angle.set_d_alpha(Gain::ANG_D_ALPHA);
+        ax->angle.set_d_tau(Gain::ANG_D_TAU_S);
         ax->angle.set_i_limit(Gain::ANG_I_LIMIT);
     }
 
@@ -495,7 +566,8 @@ void setup() {
 #endif
         v.sbus.begin();
     }
-    if (S5::USE_MPU)   { Serial.println("Init IMU...");   v.mpu.begin();  }
+    if (S5::USE_MPU)   { Serial.println("Init IMU...");   v.mpu.begin();
+                         v.mpu.setFusionBeta(Q::IMU_FUSION_BETA_GROUND); }   // 飛行中は arm で切替
     if (S5::USE_IM920) { Serial.println("Init IM920..."); v.s5tx.begin(); }   // Serial3 19200 (受信 s5rx も同じポート)
     if (S5::USE_FLOW && !S5::FLOW_VIA_LINK) {
         Serial.println("Init OpticalFlow (PMW3901)...");
@@ -541,6 +613,17 @@ void setup() {
         delay(600);
         LogLink::service();      // 溜まっている状態フレームを取り込む
         LogLink::status();
+        // ログヘッダ後半にリセット原因と「前回ループが止まった区間」を載せる (全ファイル)。
+        // バッテリー接続中は USB が使えないので、異常な再起動なら BLE で 1 本送る。
+        uint8_t extra[16];
+        WDT::fillHeaderExtra(extra);
+        LogLink::setHeaderExtra(extra, sizeof(extra));
+        if (v.link_ok && WDT::bootReportWanted()) {
+            LogLink::startFile();
+            boot_report_until_ms = millis() + Q::BOOT_REPORT_MS;
+            Serial.printf(">>> 再起動の報告ログを BLE へ送ります (%lu 秒。リセット原因 %u)\n",
+                          (unsigned long)(Q::BOOT_REPORT_MS / 1000), (unsigned)WDT::resetReason());
+        }
     }
     if (S5::USE_FLOW && S5::FLOW_VIA_LINK) {
         // PMW3901 はロガー側。ここでは SPI に触らず、T_STAT の FLOW_OK と T_FLOW の鮮度を見る。
@@ -560,7 +643,11 @@ void setup() {
 
     // ---- 電源投入 5秒後: 自動で 'k'+'r'+'z' (水平キャリブ → PIDリセット → フロー積算ゼロ) ----
     //  機体を水平に置いたまま待つだけで済むようにする。待機中にアームされたら中止。
-    {
+    //  ★ ウォッチドッグのリセット直後は飛行中/墜落直後で水平とは限らないのでやらない
+    //    (EEPROM の値のまま)。
+    if (v.wdt_rebooted) {
+        Serial.println(">>> ウォッチドッグリセット後のため自動キャリブレーションは省略します");
+    } else {
         Serial.println("\n>>> 5秒後に自動キャリブレーション (k -> r -> z) を実行します。"
                        "機体を水平に置いて動かさないでください (アームすると中止)");
         const uint32_t wait_start = millis();
@@ -586,27 +673,43 @@ void setup() {
     }
 
     // 全 Ticker の基準時刻をそろえる (初回 dt が「起動からの経過」にならないように)
-    for (Q::Ticker* t : { &main_tick, &flow_tick, &range_tick, &telem_rx_tick, &telem_tick, &debug_tick })
+    for (Q::Ticker* t : { &main_tick, &flow_tick, &range_tick, &telem_rx_tick, &telem_tick, &debug_tick,
+                          &guided_tick, &log_tick })
         t->prime();
 
     Serial.println("--- Setup complete ---");
+    if (S5::UsbOwner::DUAL)
+        Serial.println("--- USB シリアル (画面/キー) はコア1 に移ります ---");
+    S5::UsbOwner::setupDone();
 }
 
 // ============================================================
 //  § 8  loop  — 周期の骨組み (一覧は S5Features.h)
 // ============================================================
 void loop() {
-    if (!main_tick.ready()) return;                     // 1000Hz
+    if (!main_tick.ready()) return;                     // 1000Hz 目標 (dt は実測)
     const uint32_t t0 = micros();
     const float dt_s = main_tick.dt_s();
+    // ループ停止のウォッチドッグ (アーム中だけ有効)。WDT::mark() は「今どの区間か」を
+    // リセットで消えないレジスタに残す。止まってリセットされたら起動時に表示する。
+    WDT::feed();
 
     // --- センサ ---
-    readImu(dt_s);                                      // 1000Hz  姿勢 / 高度推定 predict
+    WDT::mark(WDT::SEC_IMU);
+    readImu(dt_s);                                      // 毎ループ 姿勢 / 高度推定 predict
     const uint32_t t1 = micros();
-    if (S5::USE_SBUS) v.sbus.update();                  // 1000Hz  プロポ
+    WDT::mark(WDT::SEC_SBUS);
+    if (S5::USE_SBUS) v.sbus.update();                  // 毎ループ プロポ (換算は新フレームの回だけ)
+    WDT::mark(WDT::SEC_FAILSAFE);
+    S5::Failsafe::update(v);                            // SBUS 途絶 / IMU 固まり (S5Failsafe.h)
     const uint32_t t2 = micros();
 
+    WDT::mark(WDT::SEC_FLOW);
     if (S5::USE_FLOW && flow_tick.ready()) {                          // 100Hz  フロー読み
+        // de-rotation には「前回のフロー読みからメインループで積分した回転角」を渡す
+        // (レートループと同じジャイロ値の積分。区間がカウントと一致する。OpticalFlow.h)
+        float d_roll_deg, d_pitch_deg;
+        v.flow_rot.take(d_roll_deg, d_pitch_deg);
         if (S5::FLOW_VIA_LINK) {
             // ロガー側 PMW3901。リンクの鮮度をそのまま flowobs.ok にする → 途切れれば
             // flowAlive() が false になり POSHOLD → ALTHOLD へ縮退 (既存の経路)。
@@ -614,19 +717,20 @@ void loop() {
             if (v.flowobs.ok) {
                 int16_t dx, dy; uint8_t sq;
                 LogLink::pollFlow(dx, dy, sq);                       // 新着なしなら 0,0
-                v.flow.updateFrom(flow_tick.dt_s(), v.att.roll_rate, v.att.pitch_rate, dx, dy, sq);
+                v.flow.updateFrom(flow_tick.dt_s(), d_roll_deg, d_pitch_deg, dx, dy, sq);
             }
         } else if (v.flowobs.ok) {
-            // de-rotation にはレートループと同じジャイロ値を渡して位相を揃える。
-            v.flow.update(flow_tick.dt_s(), v.att.roll_rate, v.att.pitch_rate);
+            v.flow.update(flow_tick.dt_s(), d_roll_deg, d_pitch_deg);
         }
         if (v.flowobs.ok && v.flow.consumeFresh()) {                  //  25Hz  窓が締まった回だけ
             v.flowobs.take(v.flow, v.flow.lastDt());
+            WDT::mark(WDT::SEC_FLOWHOLD);
             updateFlowHold(v.flow.lastDt());
         }
     }
     const uint32_t t3 = micros();
 
+    WDT::mark(WDT::SEC_RANGE);
     if (S5::USE_RANGE && v.range.ok && range_tick.ready()) {          // 100Hz  測距
         v.range.take(v.rangefinder, v.rangefinder.update(v.att.roll, v.att.pitch));
         // 失探しても flow の height は「最後に有効だった値」を保持する (急に 1.0m へ飛ぶより安全)
@@ -639,44 +743,127 @@ void loop() {
             est_last_us = now_us;
             v.altest.correct(v.range.h_m, est_dt);
         }
+        WDT::mark(WDT::SEC_ALTHOLD);
         updateAltHold(range_tick.dt_s());
     }
     const uint32_t t4 = micros();
 
     // --- 地上局 ---
-    if (S5::USE_IM920 && telem_rx_tick.ready()) v.s5rx.poll();       // 200Hz  上りコマンド受信 (IM920)
+    WDT::mark(WDT::SEC_GROUND);
+    if (S5::USE_IM920 && telem_rx_tick.ready() && v.s5rx.poll())     // 200Hz  上りコマンド受信 (IM920)
+        v.guided.onCommand(v.s5rx.last());
     if (S5::USE_BLE_LINK && v.link_ok) {                              // 毎ループ 上りコマンド (BLE)
         // log_recorder が中継してきた T_CMD (前のループの LogLink::service() が
         // mailbox に置いたもの) を IM920 と同じ s5rx へ。統計・鮮度も共通。
         uint8_t cmd[LogLinkProto::CMD_PAYLOAD];
-        if (LogLink::pollCmd(cmd)) v.s5rx.acceptRaw(cmd, sizeof(cmd));
+        // 新しい seq なら Guided へ (パターン選択 / 開始 / 中止。quad/Guided.h onCommand)
+        if (LogLink::pollCmd(cmd) && v.s5rx.acceptRaw(cmd, sizeof(cmd))) v.guided.onCommand(v.s5rx.last());
     }
-    if (guided_div.tick()) updateGuided();                            // 100Hz  要求 → 目標 (制御はしない)
+    WDT::mark(WDT::SEC_GUIDED);
+    if (guided_tick.ready()) updateGuided(guided_tick.dt_s());       // 100Hz  要求 → 目標 (制御はしない)
     const uint32_t t5 = micros();
 
     // --- 姿勢制御 → ESC ---
-    updateControl(dt_s);                                              // 1000Hz
+    WDT::mark(WDT::SEC_CONTROL);
+    updateControl(dt_s);                                              // 毎ループ (実測 dt)
     const uint32_t t6 = micros();
 
-    S5::Console::handleSerial(v);                                     // USB キー (あれば)
+    WDT::mark(WDT::SEC_CONSOLE);
+    if (S5::UsbOwner::DUAL) {
+        // RP2040: キーはコア1 が読んで置いていく。ここで処理する (その間コア1 は USB から退いている)
+        char key;
+        if (S5::UsbOwner::keyPending(key)) {
+            S5::Console::handleKey(v, key);
+            S5::UsbOwner::keyDone();
+        }
+    } else {
+        S5::Console::handleSerial(v);                                 // USB キー (あれば)
+    }
     const uint32_t t7 = micros();
-    S5::StallLog::maybeLog(t7 - t0, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t6 - t5);
 
     // --- サービス (ログ / LED / 無線送信) ---
+    WDT::mark(WDT::SEC_ARMCHECK);
     const bool  armed_now = S5::isArmed(v);
+    v.armed_now = armed_now;                                          // コア1 の画面はこれを読む
+    WDT::markState((uint8_t)v.mode, (uint8_t)v.guided.phase(), v.fs, armed_now);
     const float thr_now   = S5::USE_SBUS ? v.sbus.des[Ch::THR] : 0.0f;
+    WDT::mark(WDT::SEC_LEDS);
     serviceLeds(armed_now);
+    WDT::mark(WDT::SEC_LOGFILES);
     serviceLogFiles(armed_now);
-    if (log_div.tick()) serviceFlightLog(armed_now, thr_now);        // 500Hz
+    WDT::mark(WDT::SEC_FLIGHTLOG);
+    if (log_tick.ready()) serviceFlightLog(armed_now, thr_now);      // LOG_HZ (125Hz)
+    WDT::mark(WDT::SEC_SERVICE);
     if (v.sd_ok)   SdLog::service();                                  // 毎ループ、有界の書き出し
+    WDT::mark(WDT::SEC_LOGLINK);
     if (v.link_ok && S5::STATUS_LED_VIA_LINK) LogLink::serviceLed(StatusLed::rgbBits());
     if (v.link_ok) LogLink::service();                                // 毎ループ、有界の UART 送信
+    WDT::mark(WDT::SEC_BLEACT);
     S5::Console::handleBleAction(v);                                  // BLE 経由のデバッグ指令 (あれば)
 
+    const uint32_t t8 = micros();
+    WDT::mark(WDT::SEC_TELEM);
     if (S5::USE_IM920 && telem_tick.ready()) telem.tick(v);           //   8Hz  下りテレメトリ (積むだけ)
     if (S5::USE_BLE_LINK && v.link_ok && telem_tick.ready()) telem.tickBle(v);   // 20Hz  同 (BLE。束ねて LogLink へ)
     if (S5::USE_IM920) v.s5tx.service();                              // 送りかけを毎ループ吐き出す (非ブロッキング)
 
-    // ログ中は画面表示を止める (同じ USB を奪い合うとログが落ちる)
-    if (!FlightLog::Usb::active && debug_tick.ready()) S5::printStatus(v, main_tick.dt_us);   // 10Hz
+    const uint32_t t9 = micros();
+
+    // デバッグ画面。RP2040 はコア1 (§ 9) が出すのでここでは何もしない。
+    // Teensy: ログ中は止める (同じ USB を奪い合うとログが落ちる)。アーム中も出さない
+    //  (1 回 2〜3KB の書式化で 10ms 級のループ抜けが 10Hz で出る / PC が読まないと
+    //  USB の書き込みが最大 1 秒待つ。quad/SafeLog.h)。
+    WDT::mark(WDT::SEC_STATUS);
+    if (!S5::UsbOwner::DUAL && !armed_now && !FlightLog::Usb::active && debug_tick.ready())
+        S5::printStatus(v, main_tick.dt_us);                          // 10Hz (地上のみ)
+    WDT::mark(WDT::SEC_NONE);
+    const uint32_t t10 = micros();
+
+    // 区間ごとの所要時間 (quad/LoopProfile.h)。並びは LoopProfile::Sec
+    const uint32_t sec[S5::LoopProfile::N] = {
+        t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t6 - t5, t7 - t6, t8 - t7, t9 - t8, t10 - t9 };
+    S5::LoopProfile::add(sec, t10 - t0, main_tick.dt_us, armed_now);
+
+// 記録はアーム中だけ (地上の画面表示で 32 件が埋まるのを防ぐ)
+    if (armed_now) S5::StallLog::maybeLog(t10 - t0, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t6 - t5,
+                           t7 - t6, t8 - t7, t9 - t8);
 }
+
+// ============================================================
+//  § 9  コア1 (RP2040 のみ) — USB シリアルの持ち主: 画面 / キー / SafeLog
+// ============================================================
+//  ★ 2026-09-17: USB の書き込みは PC が読まないと最大 1 秒待ち、しかも 2 コアで
+//    ロックを共有しているので、コア0 から USB に触ると制御ループが止まる。
+//    USB を触るのはここだけにし、コア0 とは quad/UsbOwner.h のフラグで受け渡す。
+//    ここが何秒止まっても制御 (コア0) には影響しない。
+//
+//  コア1 は setup() より前に起動する。setup() が終わる (UsbOwner::setupDone) まで
+//  USB には触らない (起動メッセージはコア0 が出す)。
+#if defined(ARDUINO_ARCH_RP2040) && !defined(S5_SINGLE_CORE)
+// コア1 のスタックを 8KB に (既定は 2KB。printStatus の浮動小数 printf が深い)
+bool core1_separate_stack = true;
+
+static Q::Ticker core1_status_tick(S5::DEBUG_HZ);
+
+void setup1() {
+    // setup() 側の初期化を待つ (USB に触らない)
+    while (!S5::UsbOwner::setupIsDone()) delay(10);
+    core1_status_tick.prime();
+}
+
+void loop1() {
+    if (!S5::UsbOwner::core1MayUse()) { delay(1); return; }   // コア0 が USB を使っている
+
+    // キー: 読んだらコア0 に渡して、処理が終わるまで USB から退く
+    if (Serial.available()) {
+        S5::UsbOwner::core1PostKey((char)Serial.read());
+        return;
+    }
+    // USB 直結ログ ('l') の間は、コア0 が USB に書いている。画面と SafeLog は止める
+    if (FlightLog::Usb::active) { delay(1); return; }
+
+    Q::SafeLog::drainTo(Serial);                             // コア0 の飛行中メッセージ
+    if (core1_status_tick.ready()) S5::printStatus(v, main_tick.dt_us);
+    else                           delay(1);
+}
+#endif

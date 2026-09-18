@@ -16,6 +16,9 @@
 //    3. 機体の傾き (roll/pitch) で cos 補正し「鉛直方向の対地高度」に直す
 //    4. 高度を LPF、その微分から上昇速度 [m/s] も出す
 //
+//  ★ 2026-09-18: 飛びゲート (stepGate) は「捨てる」だけ。オフセットで高度を貼り付ける
+//    方式は天井張り付きを起こしたのでやめた (QuadConfig.h の RANGE_STEP_*)。
+//
 //  ★ この高度を毎ループ OpticalFlow::setHeight() に渡すことで、
 //    s5b までの FLOW_ASSUMED_HEIGHT_M 固定を実測値に置き換える。
 //
@@ -154,6 +157,9 @@ public:
         float h = slant_m * cr * cp + Quad::RANGE_OFFSET_M;
         h = constrain(h, _min_m, _max_m);
 
+        // --- 段差ゲート (QuadConfig RANGE_STEP_*) ---
+        if (_have_h && !stepGate(h, now)) return false;
+
         // --- 高度 LPF ---
         if (!_have_h) {
             _height_m = h;
@@ -176,6 +182,7 @@ public:
                 _vz_mps += Quad::RANGE_VZ_ALPHA * (vz_raw - _vz_mps);
             }
         }
+        _h_acc     = h;
         _bad_ms    = 0;
         _last_h_ms = now;
         _last_ms   = now;
@@ -183,8 +190,31 @@ public:
         return true;
     }
 
+    // 飛びゲートの状態を捨てる (アーム / モード切替の resetControllers から)
+    void resetStep() { _step_suspect = false; }
+
+    // I2C バスを復旧した直後に呼ぶ (IMU::recoverBus から drone_s5.cpp 経由)。
+    //  同じバスなので、電源が落ちていれば VL53L1X も初期状態に戻っている。
+    //  連続測距を設定し直し、高度は失探扱いにして次の有効サンプルで取り直す。
+    void busRecovered() {
+        _have_h = false;
+        _step_suspect = false;
+        if (Quad::RANGE_BACKEND == Quad::RangeBackend::Sonar_EZ) return;
+        _sensor.setBus(&Wire);
+        _sensor.setTimeout(50);
+        if (_sensor.init()) {
+            _sensor.setDistanceMode(VL53L1X::Medium);
+            _sensor.setMeasurementTimingBudget(Quad::RANGE_TIMING_BUDGET_US);
+            _sensor.startContinuous(Quad::RANGE_CONTINUOUS_MS);
+        }
+        _last_new_ms = millis();   // すぐ stale 判定にしない
+    }
+
     // 直近の結果 -------------------------------------------------
-    bool  valid()    const { return _ok_init && _have_h; }  // 高度が信用できるか
+    //  高度が信用できるか。段差を疑ってサンプルを捨てている間も false。
+    bool  valid()    const { return _ok_init && _have_h && !_step_suspect; }
+    bool  stepRejecting() const { return _step_suspect; }      // 飛びゲートで捨て中
+    uint16_t stepCount()  const { return _step_count; }        // 捨て続けて同期し直した回数
     // 直近サンプルが「センサは応答しているが RANGE_MIN_M 未満」= 地面に置いてある。
     // AltHold の地上からの自動離陸 (ground_start) に使う。失探とは区別できる。
     bool  tooClose() const { return _ok_init && _too_close; }
@@ -195,6 +225,41 @@ public:
 
 private:
     static constexpr float DEG2RAD = 0.01745329252f;
+
+    // 飛びゲート本体。h は新しいサンプル (レンジ内に丸めたもの)。
+    //  戻り値 true = このサンプルを採用してよい。
+    //  ★ 捨てるだけ。オフセットで「貼り付ける」ことはしない (LOG0064 の天井張り付き。
+    //    QuadConfig.h の RANGE_STEP_* のコメント参照)。捨て続けたら失探にして、
+    //    次の有効サンプルでセンサの値に取り直す。
+    bool stepGate(float& h, uint32_t now) {
+        if (Quad::RANGE_STEP_M <= 0.0f) return true;
+        const float dt   = constrain((now - _last_h_ms) * 0.001f, 0.0f, 0.2f);
+        // 地面より下へは外挿しない (着地の瞬間は降下速度が残っていて、LOG0037 の
+        //  リプレイで予測 -0.12m → 接地の 0.03m を飛びと誤認した)
+        const float pred = constrain(_h_acc + _vz_mps * dt, _min_m, _max_m);
+        // 上下に速く動いているほど予測は外れる。その分だけしきい値を広げる
+        const float thr = Quad::RANGE_STEP_M
+                        + fabsf(_vz_mps) * Quad::RANGE_STEP_VZ_ALLOW_S;
+        if (fabsf(h - pred) <= thr) {
+            _step_suspect = false;
+            return true;
+        }
+        if (!_step_suspect) {
+            _step_suspect  = true;
+            _step_first_ms = now;
+        }
+        _bad_ms  = 0;             // センサ自体は応答している
+        _last_ms = now;
+
+        if (now - _step_first_ms >= Quad::RANGE_STEP_GIVEUP_MS) {
+            // 戻ってこない = 本当にその高さになった (or センサが変わった)。
+            // 失探にして、次の有効サンプルでそのまま取り直す (オフセットは持たない)。
+            _have_h = false;
+            _step_suspect = false;
+            _step_count++;
+        }
+        return false;
+    }
 
     // バックエンドから「新しい斜め距離サンプル」を1個取り出す。
     //  戻り値 true = slant_m / status_ok をセットした (レンジ判定は呼び出し側)
@@ -233,4 +298,10 @@ private:
     uint32_t _last_new_ms  = 0;   // 直近「新サンプル到着」の時刻 (stale 判定用)
     uint32_t _bad_ms       = 0;
     uint32_t _sonar_seq    = 0;
+
+    // 飛びゲート
+    float    _h_acc        = 0.0f;   // 直近に採用した高度 (LPF 前)
+    bool     _step_suspect = false;
+    uint32_t _step_first_ms = 0;     // 捨て始めた時刻
+    uint16_t _step_count   = 0;      // 捨て続けて同期し直した回数
 };

@@ -11,6 +11,7 @@ camera_server.py  [RPi上で単独実行]
 
 import base64
 import json
+import os
 import socket
 import time
 from pathlib import Path
@@ -331,6 +332,12 @@ def draw_overlay(frame):
 
 # ── ローカルディスプレイ初期化 ────────────────────────────────
 def init_local_display(cap):
+    # ★ 2026-09-17: DISPLAY が無い (SSH接続など) 状態で cv2.namedWindow を呼ぶと
+    #   Qt の xcb プラグイン初期化が失敗し、Python例外ではなくプロセスごと
+    #   中止 (Abort) される。try/except では防げないので事前にチェックする。
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        print("[RPi] ディスプレイ無効: DISPLAY が設定されていません (SSH接続?)")
+        return False
     try:
         cv2.namedWindow("RPi Camera", cv2.WINDOW_NORMAL)
         ret, frame = cap.read()
@@ -454,12 +461,14 @@ def handle_stream(conn, cap, use_display):
             "rejected": detector.vibration_rejected,
         }
         if SEND_PREVIEW:
+            # ★ 2026-09-17: ここで候補の丸 (面積最大=緑) を描き込んでいたのをやめた。
+            #   ・PC 側 core/blink.py はこのプレビューの ROI 輝度で点滅を判定するので、
+            #     丸が出たり消えたりすると LED の輝度変化に混ざる (機体の丸が消えた
+            #     フレームでスコアが 0.9 -> 0.6 に落ちていた)。
+            #   ・PC の窓では「面積最大の候補」が機体より目立ち、手を振った人に
+            #     緑丸が付いて誤検知に見えた (PC 側の点滅判定は人を確定していない)。
+            #   候補の表示は PC 側 (RemoteCamera.draw_candidates) が点滅確認後に描く。
             small = cv2.resize(frame, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE)
-            for i, c in enumerate(cands):
-                cv2.circle(small,
-                           (int(c[0] * PREVIEW_SCALE), int(c[1] * PREVIEW_SCALE)),
-                           8, (0, 255, 0) if i == 0 else (110, 110, 110),
-                           2 if i == 0 else 1)
             _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 60])
             payload["frame"] = base64.b64encode(buf).decode()
 
@@ -472,7 +481,17 @@ def handle_stream(conn, cap, use_display):
 
 # ── メイン ───────────────────────────────────────────────────
 def main():
-    cap = cv2.VideoCapture(CAMERA_ID)
+    # ★ 2026-09-17: 素の cv2.VideoCapture(CAMERA_ID) だと GStreamer バックエンドが
+    #   選ばれ、そちらは CAP_PROP_FOURCC の set() が「unhandled property」で
+    #   無視される。結果、生の YUY2 のまま 1280x720@60fps を要求して USB 帯域が
+    #   足りず v4l2src が "Internal data stream error" で起動失敗する
+    #   (PC側 core/camera.py の MJPG 指定と同じ理由)。
+    #   CAP_V4L2 を明示すれば FOURCC の set() が効く。WIDTH/HEIGHT/FPS より先に。
+    #   ただし CAP_V4L2 は整数インデックス指定だと "can't open camera by index"
+    #   で失敗することがある (カメラ自体は繋がっていても発生する既知の挙動)。
+    #   /dev/videoN のパス文字列で開けば index 経由の enumerate を通らず安定する。
+    cap = cv2.VideoCapture(f"/dev/video{CAMERA_ID}", cv2.CAP_V4L2)
+    cap.set(cv2.CAP_PROP_FOURCC,       cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  TARGET_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, TARGET_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS,          TARGET_FPS)

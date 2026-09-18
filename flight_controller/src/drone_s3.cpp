@@ -62,8 +62,8 @@ constexpr float ROLL [3] = { 0.0030f, 0.0f, 0.00004f };
 constexpr float PITCH[3] = { 0.0030f, 0.0f, 0.00004f };
 constexpr float YAW  [3] = { 0.0000f, 0.0f, 0.0f     };
 
-// D項のローパス (0 = フィルタなし、1 に近いほど強い)
-constexpr float D_ALPHA = 0.80f;
+// D項のローパス時定数 [s] (0 = フィルタなし)
+constexpr float D_TAU_S = 0.004f;   // D 項 LPF 時定数 [s] (旧 alpha 0.80 @1000Hz。QuadPID.h)
 // 積分項の上限 (トルク指令と同じ単位。0.3 なら最大出力の30%まで)
 constexpr float I_LIMIT = 0.15f;
 
@@ -356,7 +356,7 @@ void setup() {
     yaw_axis.rate  .set_gains(Gain::YAW  [0], Gain::YAW  [1], Gain::YAW  [2]);
 
     for (Q::Axis* ax : { &roll_axis, &pitch_axis, &yaw_axis }) {
-        ax->rate.set_d_alpha(Gain::D_ALPHA);
+        ax->rate.set_d_tau(Gain::D_TAU_S);
         ax->rate.set_i_limit(Gain::I_LIMIT);
     }
 

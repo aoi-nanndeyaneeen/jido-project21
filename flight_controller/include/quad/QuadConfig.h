@@ -131,19 +131,36 @@ constexpr bool ATTITUDE_PRIORITY = true;
 //    ・機体を右に傾ける          → roll  の表示が +
 //    ・機首を持ち上げる          → pitch の表示が +
 //    ・機首を右へ回す            → yaw   レートの表示が +
-//  合わないものは、下の SIGN を -1 にしてください。
 //  軸そのものが入れ替わっている場合 (前後に傾けたのにロールが動く等) は
 //  SWAP_XY を true にします。
+//
+//  ★ 2026-09-17: ここの SIGN は Madgwick の「後」にかかるので、融合の中で
+//    加速度とジャイロが食い違っている問題はここでは直せない (静止中も角度が流れる)。
+//    IMU の取付け向きは IMU.h の IMU_MOUNT_X/Y/Z (platformio.ini) で直し、
+//    ここは純粋な FLU→FRD 変換 (roll +1 / pitch -1 / yaw -1) にする。
+//    GYRO と ANG は必ず同じ符号にすること (角度と角速度の向きが揃わなくなる)。
 
 constexpr bool  SWAP_XY    = false;  // IMU が機体に対して90度回って付いている場合 true
 
-constexpr float GYRO_SIGN_ROLL  = -1.0f;  // X軸まわり
-constexpr float GYRO_SIGN_PITCH = -1.0f;  // Y軸まわり (FLU の左 → FRD の右で反転)
-constexpr float GYRO_SIGN_YAW   = +1.0f;  // Z軸まわり (FLU の上 → FRD の下で反転)
+#if defined(IMU_MOUNT_X)
+// IMU.h が正しい FLU を返す前提の FLU→FRD
+constexpr float GYRO_SIGN_ROLL  = +1.0f;  // 前軸まわり: FLU も FRD も右バンクが +
+constexpr float GYRO_SIGN_PITCH = -1.0f;  // FLU の左軸まわり + は機首下げ → FRD では -
+constexpr float GYRO_SIGN_YAW   = -1.0f;  // FLU の上軸まわり + は左旋回 → FRD では -
 
-constexpr float ANG_SIGN_ROLL   = -1.0f;  // Madgwick の出力 [deg]
+constexpr float ANG_SIGN_ROLL   = +1.0f;  // Madgwick の出力 [deg]
+constexpr float ANG_SIGN_PITCH  = -1.0f;
+constexpr float ANG_SIGN_YAW    = -1.0f;
+#else
+// 旧来 (Teensy 時代の取付け)
+constexpr float GYRO_SIGN_ROLL  = -1.0f;
+constexpr float GYRO_SIGN_PITCH = -1.0f;
+constexpr float GYRO_SIGN_YAW   = +1.0f;
+
+constexpr float ANG_SIGN_ROLL   = -1.0f;
 constexpr float ANG_SIGN_PITCH  = -1.0f;
 constexpr float ANG_SIGN_YAW    = +1.0f;
+#endif
 
 // ============================================================
 //  § 4  スティック → 目標値 のスケール
@@ -219,13 +236,46 @@ constexpr Sw ARM_SWITCH_STATE = down;   // このスイッチ位置のときだ�
 // ============================================================
 //  § 6  制御ループ
 // ============================================================
-constexpr int RATE_LOOP_HZ  = 1000;  // レートPID (= メインループ)
-constexpr int ANGLE_LOOP_HZ = 200;   // 角度PID (レートループを間引いて実行)
+constexpr int RATE_LOOP_HZ  = 1000;  // レートPID (= メインループ) の目標周期。角度PID も同じループで回す
 constexpr int DEBUG_HZ      = 10;    // シリアル表示
+//  ★ RATE_LOOP_HZ は「目標」。RP2040 (133MHz, FPU なし) では実効 630〜700Hz で、
+//    ループごとの dt は揺れる。制御・推定は全部「実測 dt」で計算すること
+//    (QuadPID / Madgwick / 各積分)。回数で分周する Divider はこの理由で廃止した
+//    (2026-09-18。Scheduler.h)。周期が要るものは Ticker (時間基準) を使う。
 
-static_assert(RATE_LOOP_HZ % ANGLE_LOOP_HZ == 0,
-              "ANGLE_LOOP_HZ は RATE_LOOP_HZ の約数にしてください");
-constexpr int ANGLE_LOOP_DIV = RATE_LOOP_HZ / ANGLE_LOOP_HZ;
+// ---- 姿勢推定 (Madgwick) の加速度補正の強さ ----
+//  中身と実測は sensor/IMU.h の setFusionBeta() のコメント。
+//    地上 (アーム前): 0.10 = 11.5deg/s で加速度の向きへ寄せる。電源投入・'k' の後に
+//                     数秒で水平へ収束させるため。
+//    飛行中 (アーム中): 0.03 = 3.4deg/s。横移動の加速度で嘘をつく加速度計に
+//                     引っ張られにくくし、傾きはジャイロ積分主体にする。
+//                     ジャイロの温度ドリフト (<1deg/s) は吸える。
+//  ★ 2026-09-18 LOG0064 の再計算: 0.10 では位置ループの揺れ帯 (0.3〜0.7Hz) で
+//    推定角が真値の 0.57 倍・位相 +46deg。0.03 で 0.92 倍・+17deg。
+//    次便でまだ 0.3〜0.45Hz が残るなら 0.02 → 0.01 と下げる (ヘディングと同じく
+//    ジャイロだけで数分は持つ)。
+constexpr float IMU_FUSION_BETA_GROUND = 0.10f;
+constexpr float IMU_FUSION_BETA_FLIGHT = 0.03f;
+
+// ループ停止のウォッチドッグ [ms] (quad/FcWatchdog.h。RP2040 のみ、アーム中だけ有効)。
+//  アーム中にこれだけループが回らなければチップをリセットしてモーター PWM を消す。
+//  正常時のループは最大 14ms (LOG0042〜0045)。I2C が詰まったときの Wire の
+//  タイムアウト (25ms/回) が IMU と測距で数回重なっても 200ms 程度なので余裕を見て 500。
+//  0 で無効。
+constexpr uint32_t WDT_TIMEOUT_MS = 500;
+//  ウォッチドッグ等で再起動したとき、アームしなくても BLE ログを 1 本送る時間 [ms]。
+//  ヘッダに「前回止まった区間」が載る (USB がバッテリー接続中は使えないため)。
+constexpr uint32_t BOOT_REPORT_MS = 30000;
+
+// 入力が死んだときのフェイルセーフ (quad/S5Failsafe.h。アーム中だけ)
+//  SBUS のフレームがこの時間来なければ途絶。フレームは 9〜22ms ごとなので 15〜30 フレーム分。
+constexpr uint32_t SBUS_LOST_MS    = 300;
+//  自動着陸中に SBUS がこの時間続けて戻ったら操縦に返す
+constexpr uint32_t SBUS_RECOVER_MS = 1000;
+//  IMU の生データ 6 軸が完全に同じまま続いたら固まったとみなす (DLPF 42Hz / 内部 1kHz)。
+//  ★ 2026-09-18: 100 -> 300。I2C が死んだときは sensor/IMU.h が自動でバス復旧を試みる
+//    (30〜60ms)。その猶予を与えてから、それでも動かなければモーターを止める。
+constexpr uint32_t IMU_FROZEN_MS   = 300;
 
 // ============================================================
 //  § 7  オプティカルフロー (PMW3901)   ※ Stage 5 (drone_s5) で使用
@@ -334,10 +384,7 @@ constexpr float FLOW_ASSUMED_HEIGHT_M = 1.0f;
 //   ★ 戻すなら FLOW_USE_BURST=false + FLOW_LOOP_HZ=20 + FLOW_CTRL_HZ=20。
 // バースト読み出しを使うか (false = 旧 readMotionCount、1 回 ~1ms ブロック)。
 constexpr bool FLOW_USE_BURST = true;
-constexpr int FLOW_LOOP_HZ = 100;           // センサ読み + de-rotation サンプルのレート
-static_assert(RATE_LOOP_HZ % FLOW_LOOP_HZ == 0,
-              "FLOW_LOOP_HZ は RATE_LOOP_HZ の約数にしてください");
-constexpr int FLOW_LOOP_DIV = RATE_LOOP_HZ / FLOW_LOOP_HZ;
+constexpr int FLOW_LOOP_HZ = 100;           // センサ読み + de-rotation サンプルのレート (時間基準の Ticker)
 
 // PosHold (速度/位置ループ) を回すレート [Hz]。FLOW_LOOP_HZ を割り切ること。
 // FLOW_LOOP_HZ と同じ値にすると「読み出し=制御」= 旧挙動 (積算なし)。
@@ -397,7 +444,7 @@ constexpr float FLOW_VEL_KP      = 4.0f;
 constexpr float FLOW_VEL_KI      = 2.0f;    // 定常風・機体の取り付け傾きを吸収
 constexpr float FLOW_VEL_KD      = 0.0f;
 constexpr float FLOW_VEL_I_LIMIT = 4.0f;    // I項の上限 [deg]
-constexpr float FLOW_VEL_D_ALPHA = 0.6f;
+constexpr float FLOW_VEL_D_TAU_S = 0.06f;   // D 項 LPF 時定数 [s] (旧 alpha 0.6 @25Hz 相当。KD=0 なので今は無関係)
 
 // 位置ループ(外側): 位置誤差[m] → 目標速度[m/s]
 //   kp=1.0 なら「1m ずれていたら 1 m/s で戻る」。0 にすると純粋な速度ホールド。
@@ -507,9 +554,9 @@ constexpr bool  FLOW_REQUIRE_AIRBORNE = true;
 // ============================================================
 //  バックエンドを2種類から選べる (RANGE_BACKEND):
 //
-//   A) ToF_VL53L1X : I2C(Wire) ToF。IMU(MPU6050 @0x68) と同じバス共有。
+//   A) ToF_VL53L1X : I2C(Wire) ToF。IMU (LSM6DSV16X @0x6A/6B / MPU6050 @0x68) と同じバス共有。
 //        Teensy 4.0 の Wire ピン SDA=18 / SCL=19。アドレス 0x29 固定で
-//        MPU6050 と重ならないので XSHUT 不要。配線 4本:
+//        IMU と重ならないので XSHUT 不要。配線 4本:
 //          VIN→3V3   GND→GND   SDA→18   SCL→19
 //        (Teensy 4.0 は 5V 非対応。ブレークアウトのレギュレータ経由で 3V3)
 //
@@ -615,6 +662,31 @@ constexpr float RANGE_VZ_ALPHA = 0.45f;
 //  (setHeight() が範囲外を弾くだけで、FLOW_ASSUMED_HEIGHT_M へ戻す処理は無い)。
 //  FLOW_ASSUMED_HEIGHT_M は begin() 時の初期値としてしか使われない。
 constexpr uint32_t RANGE_FAULT_MS = 1000;
+
+// --- 段差ゲート (sensor/Rangefinder.h) -------------------------------------
+//  ★ 2026-09-17 LOG0042: 周回の終盤、高度 0.49m のまま測距だけが 50ms で
+//    0.485 → 0.155m に縮んだ (機体の真下に何か入った)。高度ホールドはそれを
+//    「落ちた」と信じてスロットル 1.0 を出し、機体は実際には上昇 (accz -2.3g)、
+//    パイロットが ANGLE + スロットル 0 で止めて転倒した。LOG0029 116.26s にも
+//    同じ 0.31m の飛びがある。
+//    普段の ToF の 1 サンプル間の変化は最大 0.036m (LOG0002〜0042 の空中区間)。
+//
+//  ★ 2026-09-18 LOG0064 で天井に張り付いた。最初の実装は「段差の上に出た」とみなして
+//    差をオフセットに取り込み、高度を前の値に貼り付けていた。ところが貼り付けた高度は
+//    動かないので次のサンプルもまた段差に見え、補正が 61 回積み上がって
+//    制御が見る高度が -16.8m (生値 2.25m) になった → 「低すぎる」と信じて上昇し続けた。
+//    オフセットで吸収する方式はやめる。飛びは一定時間捨てるだけにし、戻らなければ
+//    素直にセンサの値へ同期し直す (高度の見え方は一段ずれるが、暴走しない)。
+//
+//  前回採用した高度 + 上昇速度×経過 から しきい値以上ずれたサンプルは捨てる。
+//  捨てている間は valid()=false → 高度ホールドは RangeLost (基準スロットル保持)。
+//  RANGE_STEP_GIVEUP_MS 捨て続けたら失探にし、次の有効サンプルで取り直す。
+constexpr float    RANGE_STEP_M          = 0.15f;   // 0 で無効
+//  しきい値に足す「上下に動いている分」[s]。上昇速度は LPF で遅れるので、速く上下する
+//  ほど予測が外れる。LOG0064 は見かけ 2.7m/s の降下中に誤判定して始まった。
+//  0.15 なら 2.7m/s のとき +0.40m 広がる。
+constexpr float    RANGE_STEP_VZ_ALLOW_S = 0.15f;
+constexpr uint32_t RANGE_STEP_GIVEUP_MS  = 500;
 
 // ============================================================
 //  § 7-4  s5c : 高度ホールド (スロットルPID)
@@ -766,10 +838,11 @@ constexpr float ALT_MIX_STEAL_DEAD = 0.02f;
 //   回らないので climb は 20ms 周期の階段状で、生の d/dt はジャンプのたびに
 //   跳ねる。alpha=0.10 だとその9割がほぼそのまま thr_corr に乗り、
 //   KD=0.05 と合わせて 0.1 前後のスロットル揺れを生んでいた。
-//   他の D フィルタ (RATE_D_ALPHA=0.80 / ANG_D_ALPHA=0.70 /
-//   FLOW_VEL_D_ALPHA=0.60) と同じ水準まで戻す。位相遅れは増えるが、
-//   今はノイズによるチャタリングの方が実害が大きい。
-constexpr float ALT_RATE_D_ALPHA = 0.6f;
+//   他の D フィルタ (RATE / ANG / FLOW_VEL) と同じ水準まで戻す。位相遅れは
+//   増えるが、今はノイズによるチャタリングの方が実害が大きい。
+// ★ 2026-09-18: 固定 alpha 0.6 → 時定数 [s]。測距は ~30ms ごとなので
+//   alpha 0.6 @30ms = τ 45ms。dt が揺れても同じ遮断になる (QuadPID.h)。
+constexpr float ALT_RATE_D_TAU_S = 0.045f;
 
 // PID がホバースロットルから動かしてよい最大量 [割合]。
 //  ブリングアップ中は余裕を持って 0.30。挙動が信用できたら 0.20 に絞る。
@@ -1020,6 +1093,121 @@ constexpr uint32_t GUIDED_LAND_TIMEOUT_MS = 20000;
 //  例: v=0.3m/s, rate=30deg/s なら r≈0.57m, 1周≈12秒。
 //  ★ 小さく始めること。速すぎるレートは1周検出前に大きくフラつく。
 constexpr float MANEUVER_MAX_YAW_RATE_DPS = 60.0f;
+
+// ---- 機体単独の周回 (SW_HOVER cen→up。quad/CircleTrack.h) ------------
+//  2026-09-17: 地上局ミッションを止め、GUIDED = 「今いる点を円の左端として
+//  機首方向へ半径 CIRCLE_RADIUS_M の右旋回を 1 周」にした。地上局は不要。
+//  ログ (BLE の REC) の読み方と調整の順番は scripts/analyze_circle.py 冒頭。
+//
+//  何を飛ぶか
+//    Circle  : CIRCLE_DIR 向きに半径 CIRCLE_RADIUS_M を 1 周
+//    Figure8 : CIRCLE_DIR 向きに半径 FIG8_RADIUS_M を 1 周 → 起点に戻ったら逆向きに 1 周。
+//              2 つの円は起点で接するので 8 の字になる。起点では一度止まってから
+//              逆回りを始める (ヨーレートを +→- へ瞬時には切り替えられないため)。
+//    ClimbTurn: CIRCLE_DIR 向きに半径 CLIMB_RADIUS_M を止まらずに連続で回る。
+//              開始高度で CLIMB_LOW_LAPS 周 → 回りながら CLIMB_ALT_M まで 1 周で上昇
+//              → CLIMB_ALT_M で CLIMB_HIGH_LAPS 周 → その場で開始高度まで降りて POSHOLD。
+//    Straight : 置いた向き (アーム時の機首) へ STRAIGHT_DIST_M まっすぐ進んで止まり POSHOLD。
+//              quad/StraightTrack.h。本番の着陸点 (22m 先、幅 ±3m) の直進性試験用。
+//  ★ 2026-09-17: 周回 (半径 1m, 0.4m/s) が LOG0042/0044 で 2 回続けて取れたので 8 の字へ。
+//    8 の字 (LOG0045) もうまく飛べたので上昇旋回へ。
+//  ★ 2026-09-18: 直進性試験のため Straight へ (上昇旋回に戻すなら ClimbTurn)。
+enum class GuidedPattern : uint8_t { Circle, Figure8, ClimbTurn, Straight };
+//  ★ 2026-09-18: これは「起動直後の既定」。BLE の CmdFrame (REQ_CIRCLE / REQ_FIGURE8 /
+//    REQ_CLIMB_TURN。position_estimator の ble_monitor.py) が届くと、パターン・半径・
+//    速度をそちらに差し替える (再起動まで保持)。SW_HOVER=up で待っている間に届けば
+//    その場で開始、cen/down なら次に up へ上げたときに飛ぶ。REQ_ABORT/HOLD で中止。
+//    半径は vx_mmps / yaw_rate_cdps から r = v / ω で求める (プロトコルは変えていない)。
+constexpr GuidedPattern GUIDED_PATTERN = GuidedPattern::Straight;
+//  地上局から受け付ける半径・速度の範囲 (外れたらクランプ)
+constexpr float GUIDED_CMD_RADIUS_MIN_M  = 0.30f;
+constexpr float GUIDED_CMD_RADIUS_MAX_M  = 2.00f;
+constexpr float GUIDED_CMD_SPEED_MIN_MPS = 0.10f;
+constexpr float GUIDED_CMD_SPEED_MAX_MPS = 0.60f;
+
+//  幾何と速さ
+constexpr float CIRCLE_RADIUS_M    = 1.0f;
+constexpr int   CIRCLE_DIR         = +1;      // +1 右旋回 / -1 左旋回 (8 の字では最初の円)
+//  周回速度 [m/s]。0.4 で 1 周 ≈ 16 s、ヨー 23 deg/s、向心 0.16 m/s^2 (リーン 0.9 度)。
+//  ★ 追従が取れてから上げること。GUIDED_MAX_VEL と FLOW_STICK_VEL が上限。
+constexpr float CIRCLE_SPEED_MPS   = 0.40f;
+//  8 の字の円 (直径 1m)。半径が半分なので、同じ 0.4m/s だとヨー 46 deg/s・向心加速度 2 倍・
+//  位置誤差 ±0.1m が半径の 20% になる。初回はヨーレートが周回 (23) と 34 deg/s の間に
+//  収まる 0.3m/s で始める (1 円 ≈ 12 s、全体 ≈ 24 s)。
+constexpr float FIG8_RADIUS_M      = 0.50f;
+constexpr float FIG8_SPEED_MPS     = 0.30f;
+//  上昇旋回。ルール (2026): 低高度で 2 周 → ポール以上へ上昇 → ポール以上で 2 周。
+//  0.4m/s・半径 0.75m でヨー 31 deg/s、1 周 ≈ 12 s、全体 ≈ 61 s + 降下。
+//  ★ 到達高度は初回試験なので 1.2m。本番 (position_estimator COMP_CLIMB_ALT_M) は 2.2m。
+//    上げる前に VL53L1X (Medium, 実用 ~2.9m) と PMW3901 がその高さで読めるかを確認すること。
+//  高度の目標は機体の実測の周回数で動かす (目標点の周回数ではない)。機体が遅れて
+//  いるのに高度だけ先に上がらないように。
+constexpr float CLIMB_RADIUS_M     = 0.75f;
+constexpr float CLIMB_SPEED_MPS    = 0.40f;
+constexpr int   CLIMB_LOW_LAPS     = 2;
+constexpr int   CLIMB_RISE_LAPS    = 1;
+constexpr int   CLIMB_HIGH_LAPS    = 2;
+constexpr float CLIMB_ALT_M        = 1.20f;   // 到達高度 [m]
+//  開始高度がこれ以上 CLIMB_ALT_M に近ければ始めない (上昇にならない)
+constexpr float CLIMB_MIN_RISE_M   = 0.30f;
+//  終わった後の降下: 開始高度へこの速さで目標を下げ、±TOL に DESCEND_SETTLE_MS 入ったら POSHOLD
+constexpr float    CLIMB_DESCEND_SLEW_MPS = 0.20f;
+constexpr float    CLIMB_DESCEND_TOL_M    = 0.08f;
+constexpr uint32_t CLIMB_DESCEND_SETTLE_MS = 1000;
+constexpr uint32_t CLIMB_DESCEND_TIMEOUT_MS = 15000;
+//  目標速度の立ち上げ/終点での減速 [m/s^2]。0.2 なら 2 秒で巡航速度。
+constexpr float CIRCLE_ACCEL_MPS2  = 0.20f;
+//
+//  水平の追従 (PosHold の軌道追従: 目標速度 = 接線速度FF + KP×位置誤差)
+//  ★ 静止ホバーの FLOW_POS_KP とは別。旋回中の遅れ/膨らみはまずここ。
+constexpr float CIRCLE_POS_KP      = 0.8f;    // 位置誤差 1 m → 補正速度 0.8 m/s
+constexpr float CIRCLE_POS_VEL_LIM = 0.30f;   // 位置補正ぶんの速度上限 [m/s]
+//  向心加速度をリーン角として先に足す割合 (0 で無効、1 で理論値)。
+//  ログで常に外側へ膨らむ (半径誤差が +) なら上げる。
+constexpr float CIRCLE_ACC_FF      = 1.0f;
+//
+//  ヨーの追従 (目標機首 = 円の接線方向)。角速度 FF + P。
+constexpr float CIRCLE_YAW_KP          = 2.0f;    // 1 deg ずれ → 2 deg/s
+constexpr float CIRCLE_YAW_ERR_LIM_DEG = 30.0f;
+//
+//  進行と完了
+//  目標点が機体の実測進行 (中心から見た方位角) より先へ行ってよい角度 [deg]。
+constexpr float CIRCLE_LEAD_MAX_DEG  = 30.0f;
+//  実測進行が 360 - これ に届いたら 1 周とみなす [deg]。
+constexpr float CIRCLE_CLOSE_TOL_DEG = 10.0f;
+//  想定時間 (2πR/v + v/a) のこの倍率を超えたら打ち切って POSHOLD へ。
+constexpr float CIRCLE_TIME_CAP      = 2.0f;
+
+// ---- 機体単独の直進 (GUIDED_PATTERN=Straight。quad/StraightTrack.h) ------------
+//  本番: 離陸点から 22m 先のフィールド (幅 6m) に入る = 横ずれ ±3m = 方位誤差 ±7.8 deg。
+//  方位は機体のジャイロ積分だけ。解析と試験手順は scripts/analyze_straight.py。
+//
+//  ★ 試験場所の直線距離に合わせて必ず確認すること (止まるのはこの距離)。
+constexpr float STRAIGHT_DIST_M     = 22.0f;
+//  速さ [m/s]。ジャイロのバイアスによる横ずれは飛行時間の 2 乗で増えるので、
+//  追従が取れる範囲で速い方が有利。0.8 は本番想定だが実機は 0.4 までしか飛んでいない。
+constexpr float STRAIGHT_SPEED_MPS  = 0.50f;
+constexpr float STRAIGHT_ACCEL_MPS2 = 0.20f;
+//  どの向きへ進むか
+//    true : アーム時の機首 (= 人が置いた向き)。離陸中に機首が回っても、まずその向きへ
+//           戻してから進む。本番と同じ。
+//    false: GUIDED に入った瞬間の機首。置き方・離陸を切り離して「飛行中の直進性」だけを見る。
+constexpr bool  STRAIGHT_USE_ARM_HEADING = true;
+//  進む前の向き合わせ: 誤差がこれ以内に STRAIGHT_ALIGN_SETTLE_MS 続いたら出発
+constexpr float    STRAIGHT_ALIGN_TOL_DEG    = 1.5f;
+constexpr uint32_t STRAIGHT_ALIGN_SETTLE_MS  = 1000;
+constexpr uint32_t STRAIGHT_ALIGN_TIMEOUT_MS = 10000;   // 合わなければ出発せず POSHOLD
+//  これ以上ずれていたら向き合わせせずに拒否 (置き直しか、離陸中に大きく回った)
+constexpr float    STRAIGHT_ALIGN_MAX_DEG    = 45.0f;
+//  ヨー: 目標機首への P は CIRCLE_YAW_KP、その出力の上限 [deg/s]
+constexpr float STRAIGHT_YAW_RATE_LIM_DPS = 20.0f;
+//  目標点が機体 (フロー実測) より先へ行ってよい距離 [m]
+constexpr float STRAIGHT_LEAD_MAX_M = 0.6f;
+//  実測で L - これ に届いたら到着
+constexpr float STRAIGHT_END_TOL_M  = 0.15f;
+//  想定時間 (L/v + v/a) のこの倍率で打ち切り
+constexpr float STRAIGHT_TIME_CAP   = 1.8f;
+//  横の追従は旋回と共通の CIRCLE_POS_KP / CIRCLE_POS_VEL_LIM (PosHold の軌道追従)
 
 // ---- 機体側フェンス (PosHold.h) ----------------------------------
 //  ★ 2026-09-16: console.py の手動速度指令でフィールド (1.8m x 2.6m) の外へ

@@ -32,6 +32,11 @@ struct Attitude {
     float acc_x = 0.0f;   // 前
     float acc_y = 0.0f;   // 右
     float acc_z = 0.0f;   // 下
+    // 傾きの三角関数 (readAttitude で 1 回だけ計算。1000Hz で使う側が sinf/cosf を
+    // 呼び直さないため。RP2040 は FPU が無く sinf 1 回が数百サイクル)。
+    //   AltEstimator::predict / BodyDvAccumulator::update が同じ回転行列の係数を使う。
+    float sr = 0.0f, cr = 1.0f;   // sin/cos(roll)
+    float sp = 0.0f, cp = 1.0f;   // sin/cos(pitch)
 };
 
 inline Attitude readAttitude(IMU& imu) {
@@ -67,6 +72,9 @@ inline Attitude readAttitude(IMU& imu) {
     a.acc_y = -ay;   // FLU の左 → FRD の右
     a.acc_z = -az;   // FLU の上 → FRD の下
 
+    constexpr float DEG2RAD = 0.01745329252f;
+    a.sr = sinf(a.roll  * DEG2RAD);  a.cr = cosf(a.roll  * DEG2RAD);
+    a.sp = sinf(a.pitch * DEG2RAD);  a.cp = cosf(a.pitch * DEG2RAD);
     return a;
 }
 

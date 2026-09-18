@@ -1,7 +1,12 @@
 # log_recorder — XIAO ESP32C3 を BLE ログ中継機にする
 
-FC (Teensy 4.0 / `drone_s5`) から **UART でレコードを受け取り、BLE Notify で
-PC (または他の受信機) へ常時送信する**専用ファーム。
+FC (Seeed XIAO RP2040 / `drone_s5_rp2040`) から **UART でレコードを受け取り、
+BLE Notify で PC (または他の受信機) へ常時送信する**専用ファーム。
+
+★ 2026-09-17: FC は元々 Teensy 4.0 (`drone_s5`) だったが、Teensy が故障したため
+XIAO RP2040 (`drone_s5_rp2040`) へ移行した。制御コード (`drone_s5.cpp`) は同じ
+ファイルを board 依存部分だけ `#ifdef ARDUINO_ARCH_RP2040` で分岐して使っている。
+`drone_s5` (Teensy版) は現在使っていない。
 
 ## なぜこうなったか
 
@@ -30,11 +35,14 @@ T_REC を間引いて送信している (既定: 実質 125Hz ≒ 15 kB/s)。`T_
 
 ## 配線 (Seeed XIAO ESP32C3)
 
-| XIAO | GPIO | 相手 |
+| XIAO (log_recorder) | GPIO | 相手 (FC: XIAO RP2040) |
 |---|---|---|
-| D7 | GPIO20 | RX ← Teensy **TX 17** (Serial4) |
-| D6 | GPIO21 | TX → Teensy **RX 16** ※状態返信用。省略しても記録は動く |
-| GND | — | Teensy GND **(必須)** |
+| D7 | GPIO20 | RX ← FC **D6/GP0** (Serial1 TX) |
+| D6 | GPIO21 | TX → FC **D7/GP1** (Serial1 RX) ※状態返信用。省略しても記録は動く |
+| GND | — | FC GND **(必須)** |
+
+FC 側のピン配置・Serial の詳細は `flight_controller/include/quad/BoardPins.h` 参照
+(`BOARD_LOGLINK_SERIAL` = `Serial1`)。
 
 - **XIAO の電源は FC と分ける。** GND だけ共通にすること。
 - UART の線は短く (10cm 程度まで)。2Mbaud なので、長いと `crc_err` が増える。
@@ -55,7 +63,7 @@ pio device monitor -e xiao_logger_esp32c3     # 's' で状態、'r' で統計リ
 
 # FC 側: drone_s5.cpp の S5::USE_LOGLINK を true にする
 cd flight_controller
-pio run -e drone_s5 -t upload
+pio run -e drone_s5_rp2040 -t upload
 
 # PC 側: BLE で受信して .BIN に保存
 cd log_recorder/scripts
@@ -82,7 +90,7 @@ FC 側のシリアルで `s` を押すとリンクとロガーの状態が出る
    FC が無くても、USB シリアルで `t` を送るとダミーの START/REC×200/STOP を
    直接リングへ注入できる (UART 受信をバイパス)。`ble_receiver.py` 側に
    `[OPEN]` → `[CLOSE]` が出て `LOGnnnn.BIN` ができれば BLE 経路は正常。
-2. **リンク単体**: Teensy と TX/RX/GND を繋ぐ。FC 側で `s` →
+2. **リンク単体**: FC (XIAO RP2040) と TX/RX/GND を繋ぐ。FC 側で `s` →
    ロガー応答が出れば双方向 OK。「応答なし」なら RX 配線かボーレート。
 3. **地上でアーム→ディスアーム** (プロペラを外す)。`ble_receiver.py` に
    `[OPEN]` → `[CLOSE]` が出て `LOGnnnn.BIN` ができることを確認。

@@ -20,11 +20,11 @@
 //    Rec        … 1 行を量子化して詰めた構造体。これが唯一の「行の定義」
 //    HEADER     … 列名。唯一の一覧
 //    formatRow  … Rec -> CSV 1 行。唯一のフォーマッタ
-//    Usb::      … 'l' で USB へ 500Hz ストリーム (scripts/logger.py が受ける)
-//    Ram::      … スロットル投入をトリガに本体RAMへ 500Hz 記録、着陸後 'v' でダンプ
+//    Usb::      … 'l' で USB へ LOG_HZ ストリーム (scripts/logger.py が受ける)
+//    Ram::      … スロットル投入をトリガに本体RAMへ LOG_HZ で記録、着陸後 'v' でダンプ
 //    (SD への書き出しは quad/SdLog.h。Rec をそのまま byte 列として流す)
 //
-//  呼び出し側 (drone_s5.cpp) は 500Hz で Rec を 1 個だけ作り、
+//  呼び出し側 (drone_s5.cpp) は LOG_HZ で Rec を 1 個だけ作り、
 //  それを Usb / Ram / SdLog の 3 つへ配る。以前は RAM 用と SD 用で
 //  fillRec() を 2 回呼んでいたので、そのぶんも減っている。
 //
@@ -47,10 +47,19 @@
 namespace FlightLog {
 
 // ---- レート ---------------------------------------------------------------
-constexpr int LOG_HZ = 500;                        // 記録レート [Hz]
-constexpr int DIV    = Quad::RATE_LOOP_HZ / LOG_HZ; // メインループ何回に1回
-static_assert(Quad::RATE_LOOP_HZ % LOG_HZ == 0,
-              "LOG_HZ は RATE_LOOP_HZ の約数にしてください");
+//  ★ 2026-09-17: RP2040 は 500 -> 125。ログの行はロガー (log_recorder) が BLE の
+//    帯域に合わせて 125Hz に間引いていて、機体は 3/4 を捨てられるために作っていた。
+//    ループ計測 (quad/LoopProfile.h) で svc 区間 = 576us/ループの大半がこれ。
+//    ロガーは T_START ヘッダの rate_hz を見て間引き率を決める (125Hz なら間引かない)。
+//    USB 'l' と RAM ログ ('n'/'v') も 125Hz になる。レートループを 500Hz で解析
+//    したいときは Teensy (500 のまま) を使うか、ここを一時的に戻す。
+//  呼び出しは drone_s5.cpp の log_tick (時間基準の Ticker)。ループが名目より遅くても
+//  この Hz で出る。
+#ifdef ARDUINO_ARCH_RP2040
+constexpr int LOG_HZ = 125;                        // 記録レート [Hz]
+#else
+constexpr int LOG_HZ = 500;
+#endif
 
 // ---- flags のビット (S5Telem.h の Flag と揃えてある。無線とは無関係、内部専用) --
 enum RFlag : uint16_t {

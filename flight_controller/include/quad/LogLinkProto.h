@@ -150,6 +150,12 @@ constexpr size_t  MAX_FRAME   = OVERHEAD + MAX_PAYLOAD;
 
 constexpr size_t  BIN_HDR_LEN = 32;   // SdLog.h と同じ 32B ヘッダ
 constexpr size_t  BIN_HDR_T0_OFS = 12;  // ヘッダ内の t0_ms の位置 (ファイル識別に使う)
+constexpr size_t  BIN_HDR_RATE_OFS = 10; // ヘッダ内の rate_hz (u16) の位置 (ロガーの間引き率)
+// ヘッダの後半 16B は FC が自由に使う (ロガーも PC もそのまま運ぶだけ)。
+//  2026-09-18: 今回の起動のリセット原因と、前回ループが止まった区間を入れる
+//  (quad/FcWatchdog.h fillHeaderExtra / scripts/boot_report.py)。
+constexpr size_t  BIN_HDR_EXTRA_OFS = 16;
+constexpr size_t  BIN_HDR_EXTRA_LEN = 16;
 
 // ロガーが 2Hz で返す状態。Teensy 側は 's' と printStatus() で出す。
 struct __attribute__((packed)) Stat {

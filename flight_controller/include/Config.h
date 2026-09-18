@@ -92,7 +92,8 @@ namespace Config {
     // ============================================================
     namespace sensor {
 
-        // MPU6050のスケール (±8g, ±250dps)
+        // 換算スケール (LSB/g, LSB/dps) はチップのレンジ設定と対にして
+        // sensor/IMU.h の ImuChip に置いた (2026-09-18 LSM6DSV16X 対応でここから移動)。
         //  ★ 2026-09-09: 加速度 ±2g -> ±8g。この機体は IMU が上下逆マウントで、
         //    recalibrate() が az=+1g 前提で s_az_bias ≈ -2.0 を焼くため、
         //    getAccZ() の実効測定窓が 2g ぶんずれて「上向き加速の余裕が 1g しか
@@ -100,9 +101,7 @@ namespace Config {
         //    AltEstimator の est_bias が下限 -3.0 に張り付いていた原因)。
         //    ±8g にすると上向き 7g の余裕ができる。Madgwick は加速度ベクトルを
         //    正規化するので姿勢推定の挙動は不変。分解能 4096LSB/g (0.24mg) は
-        //    ノイズ (~12mg rms) より十分細かい。IMU.h の 0x1C 書き込みと対。
-        constexpr float ACCEL_SCALE = 4096.0f;
-        constexpr float GYRO_SCALE  = 131.0f;
+        //    ノイズ (~12mg rms) より十分細かい。
 
         // ---- ソフトウェア・キャリブレーション補正値 ----
         // monitor.py と同じ仕組み:
@@ -112,6 +111,17 @@ namespace Config {
         // ※ monitor.py の Rキーキャリブレーションで得られた値を入力する
         // ※ デフォルトは0。機体ごとに調整すること
         // ※ ハードウェアオフセット(レジスタ書き込み)は不具合の原因になるため使用しない
+        // ※ 下の値は MPU6050 (GY-521) 個体の実測。LSM6DSV16X ではチップが違うので
+        //    0 にしておき、'k' で取った EEPROM の値を使う (IMU.h の CAL_MAGIC が
+        //    チップごとに違うので、載せ替え直後は必ず「EEPROM に有効な値なし」になる)。
+#if defined(IMU_CHIP_LSM6DSV16X)
+        inline float s_ax_bias = 0.0f;
+        inline float s_ay_bias = 0.0f;
+        inline float s_az_bias = 0.0f;
+        inline float s_gx_bias = 0.0f;
+        inline float s_gy_bias = 0.0f;
+        inline float s_gz_bias = 0.0f;
+#else
         inline float s_ax_bias = 0.0498f;
         inline float s_ay_bias = 0.0273f;
         inline float s_az_bias = 0.0360f;
@@ -119,6 +129,7 @@ namespace Config {
         inline float s_gy_bias = 3.8146f;
         inline float s_gz_bias = -2.9902f;
         //INFO: New Biases: ax=0.0498 ay=0.0273 az=0.0360 gx=-11.3956 gy=3.8146 gz=-2.9902
+#endif
         constexpr int16_t ACCEL_X_OFFSET = 0;
         constexpr int16_t ACCEL_Y_OFFSET = 0;
         constexpr int16_t ACCEL_Z_OFFSET = 0;

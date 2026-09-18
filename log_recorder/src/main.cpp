@@ -19,7 +19,7 @@
 //    実測できる Notify のスループットはコネクション間隔次第で
 //    だいたい 20〜80KB/s が上限 (理論値はもっと出るが安定運用の目安として)。
 //    一方 FC からの T_REC は 500Hz × 122B/rec ≒ 61KB/s あり、フルレートを
-//    そのまま Notify すると確実に破綻する。そのため BLE_REC_DECIM で
+//    そのまま Notify すると確実に破綻する。そのため FC の rate から決めた間引き率 (s_rec_decim) で
 //    REC を間引いて送る (既定は 1/4 = 実質 125Hz ≒ 15KB/s。値は要調整)。
 //    T_START/T_STOP は間引かずそのまま転送する (頻度が低いので問題ない)。
 //    間引き後も溜まる分はリングが吸収する。BLE が未接続/輻輳中はフレームを
@@ -96,9 +96,12 @@ static_assert((RING_BYTES & RING_MASK) == 0, "RING_BYTES は 2 の冪にする�
 
 constexpr uint32_t STAT_MS = 500;   // FC への状態返信 (2Hz)
 
-// T_REC をこの分の1だけ BLE へ転送する (帯域対策。3で割り切れなくてよい)。
-// 1 なら間引きなし (非推奨: 500Hz フルレートは BLE の帯域を確実に超える)。
-constexpr uint8_t BLE_REC_DECIM = 4;   // 500Hz -> 実質 125Hz ≒ 15kB/s
+// T_REC を BLE へ転送するレートの上限 [Hz] (帯域対策)。125Hz ≒ 15kB/s。
+// ★ 2026-09-17: 固定の 1/4 間引きをやめ、FC が T_START ヘッダに書いてくる rate_hz から
+//   間引き率を決める (rate / この値、切り上げ)。FC (RP2040) は 125Hz で作るようにした
+//   ので間引かない = FC が捨てられる行を作らずに済む。Teensy 版 FC (500Hz) なら 1/4。
+constexpr uint16_t BLE_REC_MAX_HZ   = 125;
+constexpr uint8_t  BLE_REC_DECIM_DEFAULT = 4;   // T_START を受ける前 / rate 不明のとき
 
 // BLE 輻輳対策の下限送信間隔。これより速く notify() を連打すると
 // コントローラ側の送信キューが溢れて notify が無言で落ちることがある。
@@ -638,6 +641,7 @@ static uint32_t s_bytes     = 0;
 static uint32_t s_last_rec_ms = 0;
 static uint32_t s_last_tx_ms  = 0;
 static uint8_t  s_rec_decim_ctr = 0;
+static uint8_t  s_rec_decim     = BLE_REC_DECIM_DEFAULT;   // T_START の rate_hz から決める
 // 「tail の REC は間引き判定の結果すでに送信対象と確定していて、あとは
 // BLE の送信間隔 (gate) が空くのを待っているだけ」を覚えておくフラグ。
 // ★ これが無いと、gate 待ちで drainRing() が return して次回また同じ
@@ -765,6 +769,15 @@ static void drainRing() {
                 s_t0        = t0;
                 s_recording = true;
                 g_st.recording = true;
+                {
+                    uint16_t rate = 0;
+                    memcpy(&rate, pay + P::BIN_HDR_RATE_OFS, 2);
+                    s_rec_decim = (rate == 0) ? BLE_REC_DECIM_DEFAULT
+                                : (uint8_t)constrain((rate + BLE_REC_MAX_HZ - 1) / BLE_REC_MAX_HZ, 1, 16);
+                    s_rec_decim_ctr = 0;
+                    Serial.printf("[BLE] FC rate=%u Hz -> 間引き 1/%u\n", (unsigned)rate,
+                                  (unsigned)s_rec_decim);
+                }
                 Serial.printf("[BLE] START (t0=%lu)\n", (unsigned long)s_t0);
                 sendFrame(f, flen);
                 break;
@@ -779,9 +792,9 @@ static void drainRing() {
                 //   (pending==true) では判定をやり直さない (カウンタを二重に
                 //   進めてしまうため)。
                 if (!s_rec_pending) {
-                    if (BLE_REC_DECIM > 1) {
+                    if (s_rec_decim > 1) {
                         s_rec_decim_ctr++;
-                        if (s_rec_decim_ctr < BLE_REC_DECIM) { discard(); break; }
+                        if (s_rec_decim_ctr < s_rec_decim) { discard(); break; }
                         s_rec_decim_ctr = 0;
                     }
                     s_rec_pending = true;
@@ -870,7 +883,7 @@ static void printStatus() {
     Serial.println("---- log_recorder (BLE) ----");
     Serial.printf("  BLE       : %s   (decim=1/%u)\n",
                   g_st.ble_ok ? "接続中" : "未接続 (advertising中)",
-                  (unsigned)BLE_REC_DECIM);
+                  (unsigned)Ble::s_rec_decim);
     Serial.printf("  記録      : %s   送信済み %lu bytes\n",
                   g_st.recording ? "REC" : "idle", (unsigned long)g_st.bytes);
     Serial.printf("  リング    : %lu / %lu B (peak %lu = %lu%%)\n",
@@ -909,7 +922,7 @@ static void printStatus() {
                        "受信側アプリを接続すること");
     if (g_st.peak_ring > RING_BYTES / 2)
         Serial.println("  ★ リングが半分を超えた = BLE が遅い/輻輳している。"
-                       "BLE_REC_DECIM を上げる / 受信側との距離を詰める");
+                       "BLE_REC_MAX_HZ を下げる / 受信側との距離を詰める");
 }
 
 // ============================================================

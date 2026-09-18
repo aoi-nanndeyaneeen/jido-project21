@@ -42,7 +42,7 @@ public:
     void begin() {
         setVelGains(FLOW_VEL_KP, FLOW_VEL_KI, FLOW_VEL_KD);
         for (Pid* p : { &_vx_pid, &_vy_pid }) {
-            p->set_d_alpha(FLOW_VEL_D_ALPHA);
+            p->set_d_tau(FLOW_VEL_D_TAU_S);
             p->set_i_limit(FLOW_VEL_I_LIMIT);
         }
         _pos_kp = FLOW_POS_KP;
@@ -72,6 +72,30 @@ public:
         _ext_vx = _ext_vy = 0.0f;
     }
     bool velCommanded() const { return _ext_on; }
+
+    // ------------------------------------------------------------
+    //  軌道追従 (機体単独の周回。quad/CircleTrack.h が目標を作る)
+    // ------------------------------------------------------------
+    //  地面固定フレームの「目標点・目標速度・目標加速度」をもらい、
+    //      目標速度 = vel_ff + CIRCLE_POS_KP × (ref - pos)   (補正は CIRCLE_POS_VEL_LIM)
+    //      リーン角 += CIRCLE_ACC_FF × atan(acc_ff / g)
+    //  で追う。保持基準 hold_n/e には目標点をそのまま入れるので、ログ/テレメトリの
+    //  fh_holdn/fh_holde が「円の目標点」、fh_posn/fh_pose が「機体」になる。
+    //  ★ setVelCommand() / スティックより優先する。
+    void setTrajectory(float ref_n, float ref_e, float vel_n, float vel_e,
+                       float acc_n, float acc_e) {
+        _traj_on = true;
+        _tr_n = ref_n;  _tr_e = ref_e;
+        _tv_n = vel_n;  _tv_e = vel_e;
+        _ta_n = acc_n;  _ta_e = acc_e;
+    }
+    //  軌道追従をやめる。保持基準を今の位置に置き直すので、その場ホールドへ移る
+    //  (最後の目標点へ引き戻されない)。
+    void clearTrajectory() {
+        if (_traj_on) { _hold_n = _pos_n; _hold_e = _pos_e; }
+        _traj_on = false;
+    }
+    bool trajectoryOn() const { return _traj_on; }
 
     // ------------------------------------------------------------
     //  地上局からの絶対位置補正 (地上局ガイド飛行、数秒に1回)
@@ -126,6 +150,7 @@ public:
         _vx_pid.reset();
         _vy_pid.reset();
         clearVelCommand();
+        _traj_on = false;
     }
 
     // ------------------------------------------------------------
@@ -195,8 +220,30 @@ public:
         //   区別なく効く。リンクが切れていても機体単独で効く。
         const bool fence = fenceOn();
         _fence_push = false;
+        float ff_x = 0.0f, ff_y = 0.0f;   // 軌道追従のリーン角 FF [deg] (機体座標)
 
-        if (stick_active) {
+        if (_traj_on) {
+            // 軌道追従: 地面固定フレームで 接線速度FF + 位置P を作って機体座標へ戻す
+            float vn_tar = _tv_n + constrain(CIRCLE_POS_KP * (_tr_n - _pos_n),
+                                             -CIRCLE_POS_VEL_LIM, CIRCLE_POS_VEL_LIM);
+            float ve_tar = _tv_e + constrain(CIRCLE_POS_KP * (_tr_e - _pos_e),
+                                             -CIRCLE_POS_VEL_LIM, CIRCLE_POS_VEL_LIM);
+            if (fence) {
+                vn_tar = fenceAxis(vn_tar, _pos_n, FENCE_N_LIM);
+                ve_tar = fenceAxis(ve_tar, _pos_e, FENCE_E_LIM);
+            }
+            _vx_tar = constrain( vn_tar * c + ve_tar * s, -FLOW_STICK_VEL, FLOW_STICK_VEL);
+            _vy_tar = constrain(-vn_tar * s + ve_tar * c, -FLOW_STICK_VEL, FLOW_STICK_VEL);
+            _hold_n = _tr_n;
+            _hold_e = _tr_e;
+            _holding = false;
+
+            constexpr float G = 9.80665f;
+            const float ax =  _ta_n * c + _ta_e * s;
+            const float ay = -_ta_n * s + _ta_e * c;
+            ff_x = CIRCLE_ACC_FF * atanf(ax / G) * RAD2DEG;
+            ff_y = CIRCLE_ACC_FF * atanf(ay / G) * RAD2DEG;
+        } else if (stick_active) {
             if (fence) {
                 float vn =  tar_x * c - tar_y * s;
                 float ve =  tar_x * s + tar_y * c;
@@ -237,9 +284,9 @@ public:
             _holding = true;
         }
 
-        // --- 内側: 速度PID → 目標リーン角 [deg] ---
-        const float px = _vx_pid.update(_vx_tar, _vx_ctl, dt_s, true);
-        const float py = _vy_pid.update(_vy_tar, _vy_ctl, dt_s, true);
+        // --- 内側: 速度PID → 目標リーン角 [deg] (+ 軌道追従の加速度 FF) ---
+        const float px = _vx_pid.update(_vx_tar, _vx_ctl, dt_s, true) + ff_x;
+        const float py = _vy_pid.update(_vy_tar, _vy_ctl, dt_s, true) + ff_y;
         _lean_pitch = constrain(FLOW_LEAN_SIGN_PITCH * px, -FLOW_MAX_LEAN, FLOW_MAX_LEAN);
         _lean_roll  = constrain(FLOW_LEAN_SIGN_ROLL  * py, -FLOW_MAX_LEAN, FLOW_MAX_LEAN);
     }
@@ -273,6 +320,7 @@ public:
 
 private:
     static constexpr float DEG2RAD = 0.01745329252f;
+    static constexpr float RAD2DEG = 57.2957795131f;
 
     // active を外れている間の出力クリア。積分もゼロに戻す。
     void reset_outputs() {
@@ -311,6 +359,12 @@ private:
     // 地上局からの目標速度指令 (setVelCommand)。_ext_on=false なら従来動作。
     bool  _ext_on = false;
     float _ext_vx = 0.0f, _ext_vy = 0.0f;
+
+    // 軌道追従 (setTrajectory)。地面固定フレーム
+    bool  _traj_on = false;
+    float _tr_n = 0.0f, _tr_e = 0.0f;   // 目標点 [m]
+    float _tv_n = 0.0f, _tv_e = 0.0f;   // 目標速度 [m/s]
+    float _ta_n = 0.0f, _ta_e = 0.0f;   // 目標加速度 [m/s^2]
 
     Pid   _vx_pid, _vy_pid;      // 速度ループ (機体座標 x=前 / y=右)
     float _pos_kp     = FLOW_POS_KP;

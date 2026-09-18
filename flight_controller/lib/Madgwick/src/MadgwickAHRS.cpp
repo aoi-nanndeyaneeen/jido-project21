@@ -150,7 +150,7 @@ void Madgwick::update(float gx, float gy, float gz, float ax, float ay, float az
 //-------------------------------------------------------------------------------------------
 // IMU algorithm update
 
-void Madgwick::updateIMU(float gx, float gy, float gz, float ax, float ay, float az) {
+void Madgwick::updateIMU(float gx, float gy, float gz, float ax, float ay, float az, float dt_s) {
 	float recipNorm;
 	float s0, s1, s2, s3;
 	float qDot1, qDot2, qDot3, qDot4;
@@ -209,11 +209,11 @@ void Madgwick::updateIMU(float gx, float gy, float gz, float ax, float ay, float
 		qDot4 -= beta * s3;
 	}
 
-	// Integrate rate of change of quaternion to yield quaternion
-	q0 += qDot1 * invSampleFreq;
-	q1 += qDot2 * invSampleFreq;
-	q2 += qDot3 * invSampleFreq;
-	q3 += qDot4 * invSampleFreq;
+	// Integrate rate of change of quaternion to yield quaternion (dt は呼び出し側の実測)
+	q0 += qDot1 * dt_s;
+	q1 += qDot2 * dt_s;
+	q2 += qDot3 * dt_s;
+	q3 += qDot4 * dt_s;
 
 	// Normalise quaternion
 	recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);

@@ -1,17 +1,16 @@
 // ============================================================
-//  Scheduler.h  -  周期実行のヘルパ (Ticker / Divider / blink)
+//  Scheduler.h  -  周期実行のヘルパ (Ticker / blink)
 // ============================================================
-//  drone_s5 の loop() は 1000Hz のメインループを起点に、複数の周期を
-//  重ねて回す。以前は Ticker・手書きの分周カウンタ・millis()/125 の 3 種類が
-//  混在していたので、ここに 2 種類だけ用意して全部そろえる。
+//  drone_s5 の loop() は 1000Hz を目標にしたメインループを起点に、複数の周期を
+//  重ねて回す。周期はすべて時間基準の Ticker で作る。
 //
 //    Ticker  : 時間基準。micros() で周期を測り、実測 dt も返す。
-//              センサ読み出しやテレメトリのように「壁時計で何 Hz」が要るもの。
-//    Divider : 回数基準。親ループ N 回に 1 回。角度ループ・ログ・GUIDED 翻訳の
-//              ように「メインループに同期して間引く」もの。ジッタが出ない。
 //
-//  ★ 使い分けの目安: dt が要る/親と同期しなくてよい → Ticker、
-//                    親ループのサブ周期 → Divider。
+//  ★ 2026-09-18: 回数基準の Divider (親ループ N 回に 1 回) は廃止した。
+//    「1000Hz の 1/5 = 200Hz」は Teensy でしか成り立たず、RP2040 の実効
+//    630〜700Hz では角度ループが 130Hz、GUIDED 翻訳が 65Hz になっていた。
+//    メインループの周期が板で変わっても各サブ周期が変わらないよう、
+//    周期が要るものは Ticker、要らないもの (角度 PID) は毎ループ回す。
 // ============================================================
 #pragma once
 #include <Arduino.h>
@@ -40,21 +39,6 @@ struct Ticker {
     }
 
     float dt_s() const { return (float)dt_us * 1e-6f; }
-};
-
-// 親ループ n 回に 1 回だけ true を返す。
-struct Divider {
-    int n;
-    int count = 0;
-
-    explicit Divider(int div) : n(div) {}
-
-    bool tick() {
-        if (++count < n) return false;
-        count = 0;
-        return true;
-    }
-    void reset() { count = 0; }
 };
 
 // LED 点滅の位相。half_period_ms ごとに ON/OFF が反転する矩形波。

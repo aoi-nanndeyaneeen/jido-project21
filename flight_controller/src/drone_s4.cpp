@@ -75,7 +75,8 @@ constexpr float RATE_PITCH[3] = { 0.0020f, 0.0f, 0.00004f };
 //   戻りが遅ければ 0.005 まで上げてよい (上げすぎると 1Hz 前後で揺れる)。
 constexpr float RATE_YAW  [3] = { 0.0020f, 0.0000f, 0.00004f     };
 
-constexpr float RATE_D_ALPHA = 0.80f;
+// D 項 LPF の時定数 [s] (旧 alpha 0.80 @1000Hz = 4ms。QuadPID.h が 2026-09-18 に時定数化)
+constexpr float RATE_D_TAU_S = 0.004f;
 constexpr float RATE_I_LIMIT = 0.15f;
 
 // ---- ヘディングホールド (ヨー) ----
@@ -107,7 +108,7 @@ constexpr float YAW_STICK_DEAD    = 0.03f;
 constexpr float ANG_ROLL [3] = { 4.0f, 0.0f, 0.0f };
 constexpr float ANG_PITCH[3] = { 4.0f, 0.0f, 0.0f };
 
-constexpr float ANG_D_ALPHA = 0.70f;
+constexpr float ANG_D_TAU_S = 0.012f;   // 旧 alpha 0.70 @200Hz 相当
 // 角度ループの積分項の上限 [deg/s]
 constexpr float ANG_I_LIMIT = 30.0f;
 
@@ -173,7 +174,8 @@ S4::Mode g_mode      = S4::MODE_RATE;
 S4::Mode g_prev_mode = S4::MODE_RATE;
 bool     g_prev_armed = false;
 
-// 角度ループの間引きカウンタと、実際の経過時間
+// 角度ループの間引きカウンタと、実際の経過時間 (s4 は 1000Hz の Teensy 専用なので回数分周のまま)
+constexpr int ANGLE_LOOP_DIV = 5;   // 1000Hz / 200Hz
 int      g_angle_div_count = 0;
 uint32_t g_angle_prev_us   = 0;
 
@@ -429,7 +431,7 @@ static void updateControl(float dt_s) {
         roll_axis.ang_tar  = roll_axis.stick  * Q::MAX_ANGLE_ROLL;
         pitch_axis.ang_tar = pitch_axis.stick * Q::MAX_ANGLE_PITCH;
 
-        if (++g_angle_div_count >= Q::ANGLE_LOOP_DIV) {
+        if (++g_angle_div_count >= ANGLE_LOOP_DIV) {
             g_angle_div_count = 0;
 
             // ★ 実測の経過時間を渡す。
@@ -712,9 +714,9 @@ void setup() {
     pitch_axis.angle.set_gains(Gain::ANG_PITCH[0], Gain::ANG_PITCH[1], Gain::ANG_PITCH[2]);
 
     for (Q::Axis* ax : { &roll_axis, &pitch_axis, &yaw_axis }) {
-        ax->rate.set_d_alpha(Gain::RATE_D_ALPHA);
+        ax->rate.set_d_tau(Gain::RATE_D_TAU_S);
         ax->rate.set_i_limit(Gain::RATE_I_LIMIT);
-        ax->angle.set_d_alpha(Gain::ANG_D_ALPHA);
+        ax->angle.set_d_tau(Gain::ANG_D_TAU_S);
         ax->angle.set_i_limit(Gain::ANG_I_LIMIT);
     }
 

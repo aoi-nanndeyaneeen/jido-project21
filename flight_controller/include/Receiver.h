@@ -15,6 +15,9 @@ private:
     int i;
 
     int connection_fail;
+    // 最後にフレームを受けた時刻。connection_fail (ループ回数) はループの速さで
+    // 意味が変わるので、時間で判定したいとき (drone_s5 の S5Failsafe.h) はこちら。
+    uint32_t _last_frame_ms = 0;
 
     // ★ 起動時に取り込むスティック中央 (ROLL/PITCH/YAW のみ使う)。
     //   0 のままなら従来と完全に同じ挙動。
@@ -61,6 +64,7 @@ public:
 
     void begin() {
         _sbus->Begin();
+        scaleChannels();   // フレームが来るまでの des[] は「ch=0 のフレーム」を写した値 (従来と同じ)
     }
 
     void update() {
@@ -68,9 +72,19 @@ public:
       if (_sbus->Read()) {
         _data = _sbus->data();
         connection_fail = 0;
+        _last_frame_ms = millis();
+        // ★ 2026-09-18: 換算は新しいフレームが来た回だけ。以前は毎ループ (1000Hz) 16ch を
+        //   浮動小数で換算し直していた。フレームは 7〜14ms ごとにしか来ないので中身は
+        //   同じ。FPU の無い RP2040 では 1 ループの数 % を捨てていた。
+        //   フレームが無い間 des[] は前回のまま (S5Failsafe.h が中立に上書きした値も残る)。
+        scaleChannels();
       }
       else connection_fail++;//通信途絶検知用
+    }
 
+private:
+    // _data.ch[] (SBUS 生値) → des[] (-1..+1 / THR は 0..1)。中央オフセットとスナップ込み。
+    void scaleChannels() {
       // SBUSの172-1811を0.0-1.0にマッピング
       for(i=0;i<16;i++){
         //if(i == 1)Serial.println(_data.ch[i]);
@@ -96,6 +110,7 @@ public:
       }
     }
 
+public:
     // ---- スティック中央の起動時キャリブ ----------------------------------
     //  ROLL/PITCH/YAW の静止値を ms ミリ秒ぶん実測し、以後 des[] から引く。
     //  ★ THR とスイッチ ch は触らない (THR の中央は下端、スイッチは
@@ -156,6 +171,7 @@ public:
         _center[CH[0]] = m0;
         _center[CH[1]] = m1;
         _center[CH[2]] = m2;
+        scaleChannels();   // 新しい中央を次のフレームを待たずに des[] へ
         return r;
     }
 
@@ -195,6 +211,7 @@ public:
             r.st = CC_TOOFAR; return r;
         }
         _center[Ch::ROLL] = mean[0]; _center[Ch::PITCH] = mean[1]; _center[Ch::YAW] = mean[2];
+        scaleChannels();   // 新しい中央を次のフレームを待たずに des[] へ
         return r;
     }
 
@@ -223,4 +240,8 @@ public:
     // 直近 update() でフレームを取れなかった連続回数。0 = 今まさに受信できている。
     // 起動時に「受信機がつながっているか」を判定するのに使う。
     int failCount() const { return connection_fail; }
+    // 最後のフレームからの経過 [ms]。一度も受けていなければ非常に大きい値。
+    uint32_t msSinceFrame() const {
+        return (_last_frame_ms == 0) ? 0xFFFFFFFFu : (millis() - _last_frame_ms);
+    }
 };

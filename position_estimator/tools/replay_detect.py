@@ -6,6 +6,19 @@ tools/replay_detect.py
     python tools/replay_detect.py "tests/画面録画 2026-09-16 164847.mp4"
     python tools/replay_detect.py <video> --truth 527,384 --label Camera1 --out annotated.mp4
 
+tests/ の録画ごとの引数 (窓の大きさが違うので --crop も変わる):
+    2026-09-16 164847  Camera1  (既定値のまま)
+    2026-09-17 093651  Camera1  --crop 15,55,1454,917 --truth 1127,544
+        α6400 が 1/15s の自動露出。機体は床に静置、右下。
+    2026-09-17 100801  Camera1  --crop 15,55,1454,917 --truth-px 25
+                                 --truth "tests/画面録画 2026-09-17 100801_truth.csv"
+        同じ露出で 0.8m/s 以下で 30 秒動き続ける。正解はフレームごとの CSV。
+        「床の反射」(機体の真下に映る LED) は誤検知とは別に数える。
+    2026-09-17 093721  Camera2  --label Camera2 --crop 1,55,1422,917 --truth 203,497
+                                 --ignore "0,0,520,140;0,540,900,720"
+        RPi のプレビュー (640x360 を拡大) で、左の人が手を振る。窓に RPi が描いた
+        緑丸・当時のスコア文字が写り込んでいるので、誤検知の目安にしかならない。
+
 入力は 2 種類:
   ・cv2.imshow("Camera 1") の窓を画面録画したもの (既定)。
     窓のクライアント領域は DISP_W x DISP_H の画像を窓サイズに引き伸ばした
@@ -58,6 +71,8 @@ DEFAULT_CROP = "15,55,1455,917"     # x0,y0,x1,y1  (2026-09-16 16:48 の録画)
 DEFAULT_IGNORE = "0,0,300,80;0,600,460,720"
 # 前フレームとの差が 20 階調を超える画素がこれ未満なら「同じ表示」とみなして飛ばす
 DEFAULT_DUP_PX = 50
+REFLECTION_DU_PX = 35
+REFLECTION_DV_PX = 130
 
 
 def _parse_crop(text):
@@ -80,6 +95,41 @@ def _parse_xy(text):
     return u, v
 
 
+def load_truth_csv(path):
+    """動く機体の正解。行 "frame,u,v" (録画のフレーム番号) を、次の行のフレームまで有効として返す。"""
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("frame"):
+                continue
+            fr, u, v = line.split(",")
+            rows.append((int(fr), float(u), float(v)))
+    return rows
+
+
+def _truth_fn(truth):
+    """truth (None / (u, v) / CSV パス / load_truth_csv の結果) を「フレーム番号 -> (u, v) か None」に。
+    CSV の最終行より後のフレームは正解無し (集計しない)。"""
+    if truth is None:
+        return None
+    if isinstance(truth, (str, Path)):
+        truth = load_truth_csv(truth)
+    if isinstance(truth, tuple):
+        return lambda i: truth
+    rows = sorted(truth)
+    frames = [r[0] for r in rows]
+    last = frames[-1] + (frames[-1] - frames[-2] if len(frames) > 1 else 0)
+
+    def at(i):
+        import bisect
+        k = bisect.bisect_right(frames, i) - 1
+        if k < 0 or i > last:
+            return None
+        return rows[k][1], rows[k][2]
+    return at
+
+
 def replay(video, label="Camera1", crop=DEFAULT_CROP, truth=None, truth_px=12.0,
            fps=None, out=None, verbose=False, start_after_learn=True,
            ignore=DEFAULT_IGNORE, dup_px=DEFAULT_DUP_PX):
@@ -89,16 +139,19 @@ def replay(video, label="Camera1", crop=DEFAULT_CROP, truth=None, truth_px=12.0,
     src_fps = fps or cap.get(cv2.CAP_PROP_FPS) or 30.0
     crop = _parse_crop(crop) if isinstance(crop, str) else crop
     ignore = _parse_rects(ignore) if isinstance(ignore, str) else (ignore or [])
+    truth_at = _truth_fn(truth)
 
     cam = CameraTracker(None, width=CAMERA_W, height=CAMERA_H, label=label)
     blink = BlinkTracker(label, LED_BLINK_HZ, **blink_params_for(label))
-    learn_frames = cam.p["static_mask_learn_frames"] if cam.p["static_bright_mask"] else 0
+    # flicker モードには静的輝点マスクが無く、学習待ちも無い
+    learn_frames = cam.p["static_mask_learn_frames"] if cam._static_bright is not None else 0
 
     writer = None
     idx = 0
     stats = {"frames": 0, "scored": 0, "raw_hit": 0, "blink_hit": 0,
              "raw_cands": 0, "blink_cands": 0, "false_confirmed": 0,
              "rejected": 0, "duplicates": 0,
+             "reflection_confirmed": 0,  # 正解の真下に写る床の反射 (本物の LED 像)。誤検知とは別に数える
              "false_best_score": 0.0}   # 正解以外のトラックが出した最高スコア (余裕の目安)
     first_hit = None
     per_frame = []
@@ -128,17 +181,26 @@ def replay(video, label="Camera1", crop=DEFAULT_CROP, truth=None, truth_px=12.0,
                 continue
         prev_gray = gray
 
-        cands = cam.detect(frame)
+        cands = cam.detect(frame, ts)
         n_detect += 1
         confirmed = blink.filter(frame, cands, ts, cam.width)
+        truth = truth_at(idx - 1) if truth_at is not None else None
+
+        def is_truth(c):
+            return abs(c.u - truth[0]) <= truth_px and abs(c.v - truth[1]) <= truth_px
+
+        def is_reflection(c):
+            # 体育館の床に LED が映る。機体の真下 10〜130px (距離で変わる) に同じ点滅が出る。
+            # 2 カメラの三角測量で床下になるので PairSelector が落とす。
+            return abs(c.u - truth[0]) <= REFLECTION_DU_PX and 10 < c.v - truth[1] <= REFLECTION_DV_PX
 
         def near(cs):
             if truth is None:
                 return bool(cs)
-            return any(abs(c.u - truth[0]) <= truth_px and abs(c.v - truth[1]) <= truth_px
-                       for c in cs)
+            return any(is_truth(c) for c in cs)
 
-        scored = n_detect > learn_frames or not start_after_learn
+        scored = ((n_detect > learn_frames or not start_after_learn)
+                  and (truth_at is None or truth is not None))
         stats["frames"] += 1
         if scored:
             stats["scored"] += 1
@@ -149,12 +211,12 @@ def replay(video, label="Camera1", crop=DEFAULT_CROP, truth=None, truth_px=12.0,
             stats["raw_hit"] += rh
             stats["blink_hit"] += bh
             if truth is not None:
+                stats["reflection_confirmed"] += sum(
+                    1 for c in confirmed if not is_truth(c) and is_reflection(c))
                 stats["false_confirmed"] += sum(
-                    1 for c in confirmed
-                    if not (abs(c.u - truth[0]) <= truth_px and abs(c.v - truth[1]) <= truth_px))
+                    1 for c in confirmed if not is_truth(c) and not is_reflection(c))
                 for t in blink._tracks:
-                    if not (abs(t.cand.u - truth[0]) <= truth_px
-                            and abs(t.cand.v - truth[1]) <= truth_px):
+                    if not is_truth(t.cand):
                         stats["false_best_score"] = max(stats["false_best_score"], t.score)
             if bh and first_hit is None:
                 first_hit = idx
@@ -187,12 +249,15 @@ def replay(video, label="Camera1", crop=DEFAULT_CROP, truth=None, truth_px=12.0,
           f"同一表示の重複 {stats['duplicates']} は飛ばした)  fps={src_fps:.1f}")
     print(f"  振動棄却: {stats['rejected']}  候補/フレーム: raw {stats['raw_cands'] / n:.2f}"
           f"  点滅確認 {stats['blink_cands'] / n:.2f}")
-    if truth is not None:
-        print(f"  正解 ({truth[0]:.0f},{truth[1]:.0f}) ±{truth_px:.0f}px:"
+    if truth_at is not None:
+        where = (f"({truth[0]:.0f},{truth[1]:.0f})" if isinstance(truth, tuple) and truth
+                 else "(CSV)")
+        print(f"  正解 {where} ±{truth_px:.0f}px:"
               f"  raw 候補あり {stats['raw_hit'] / n * 100:.1f}%"
               f"  点滅確認済み {stats['blink_hit'] / n * 100:.1f}%"
               f"  (初回確認 frame {first_hit})"
               f"  正解以外の確認済み候補 {stats['false_confirmed']} 個"
+              f" (床の反射 {stats['reflection_confirmed']} 個は別)"
               f" (正解以外の最高スコア {stats['false_best_score']:.2f})")
     else:
         print(f"  候補あり {stats['raw_hit'] / n * 100:.1f}%  点滅確認済みあり "
@@ -212,14 +277,16 @@ def main():
     ap.add_argument("--dup-px", type=int, default=DEFAULT_DUP_PX,
                     help="前フレームと同一とみなす変化画素数の上限。-1 で無効")
     ap.add_argument("--truth", default="527,384",
-                    help="機体 LED の正解位置 u,v (1280x720 基準)。空なら集計しない")
+                    help="機体 LED の正解位置 u,v (1280x720 基準)、または動く機体用の CSV "
+                         "(frame,u,v)。空なら集計しない")
     ap.add_argument("--truth-px", type=float, default=12.0)
     ap.add_argument("--fps", type=float, default=None, help="録画の fps を上書き")
     ap.add_argument("--out", default=None, help="候補を描いた動画の出力先")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     t0 = time.perf_counter()
-    replay(a.video, a.label, a.crop, _parse_xy(a.truth), a.truth_px, a.fps, a.out, a.verbose,
+    truth = a.truth if a.truth.lower().endswith(".csv") else _parse_xy(a.truth)
+    replay(a.video, a.label, a.crop, truth, a.truth_px, a.fps, a.out, a.verbose,
            ignore=a.ignore, dup_px=None if a.dup_px < 0 else a.dup_px)
     print(f"  処理時間 {time.perf_counter() - t0:.1f}s")
 

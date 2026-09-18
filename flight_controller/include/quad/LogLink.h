@@ -83,6 +83,12 @@
 //       フロー 100Hz は間引き済み) で、うち IMU の I2C 約 360us はバス律速。
 //       概算では 600〜700us/1000us に収まるが未検証。dt_us と StallLog で測る。
 //       ダメなら 500Hz へ落とすが、それは PID 再調整を意味する。
+//       ★ 結果 (2026-09-17〜18 の実飛行 LOG0056〜0064): 回らない。実効 630〜700Hz
+//         (dt 平均 1.3〜1.6ms, p99 3.4ms)。PID は実測 dt だったので無事だったが、
+//         Madgwick が固定 1ms 積分で角度が 0.6〜0.7 倍に縮んでいた (sensor/IMU.h)。
+//         対処は「周期を上げる」ではなく「全部を実測 dt にする」(2026-09-18。
+//         QuadPID / Scheduler / drone_s5.cpp)。周期を上げたければ platformio.ini の
+//         f_cpu / -O2 のメモ。
 //    2. RamLog を 8 秒 -> 2 秒へ (FlightLog.h の SECONDS)。
 //       RP2040 の SRAM は 264KB。実測で RamLog と SdLog リングを除いた
 //       下限は約 55KB。2 秒 (116KB) で実ビルド RAM 140KB (53%)。
@@ -135,6 +141,7 @@ static uint16_t s_rate_hz   = 0;
 static size_t   s_head = 0, s_tail = 0, s_count = 0;
 static uint8_t  s_seq  = 0;
 static uint8_t  s_bin_hdr[P::BIN_HDR_LEN];     // 再送用に保持
+static uint8_t  s_hdr_extra[P::BIN_HDR_EXTRA_LEN] = {};   // ヘッダ後半 (setHeaderExtra)
 static uint32_t s_hdr_sent_ms = 0;
 
 static uint32_t s_sent_rec  = 0;   // 送ったレコード数
@@ -395,6 +402,12 @@ inline bool recording() { return s_recording; }
 //    ★ SdLog::startFile() と違い open も preAllocate もしないので
 //      ブロックしない (アーム直後の数十ms スパイクが消える)。
 // ============================================================
+// ヘッダ後半 16B に載せる内容 (次の startFile() から。リセット原因など)
+inline void setHeaderExtra(const uint8_t* b, size_t n) {
+    memset(s_hdr_extra, 0, sizeof(s_hdr_extra));
+    memcpy(s_hdr_extra, b, (n < sizeof(s_hdr_extra)) ? n : sizeof(s_hdr_extra));
+}
+
 inline void startFile() {
     if (!s_ok) return;
 
@@ -409,6 +422,7 @@ inline void startFile() {
     s_bin_hdr[11] = (uint8_t)(s_rate_hz >> 8);
     const uint32_t t0 = millis();               // ロガー側のファイル識別子も兼ねる
     memcpy(s_bin_hdr + P::BIN_HDR_T0_OFS, &t0, 4);
+    memcpy(s_bin_hdr + P::BIN_HDR_EXTRA_OFS, s_hdr_extra, sizeof(s_hdr_extra));
 
     resetRing();
     s_dropped   = 0;

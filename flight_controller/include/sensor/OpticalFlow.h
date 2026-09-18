@@ -55,40 +55,44 @@ public:
 
     // ------------------------------------------------------------
     //  update()  — FLOW_LOOP_HZ (読み出しレート) で毎回呼ぶ
-    //    dt_s                : 前回 update() からの経過 [s]
-    //    gyro_roll_rate_dps  : 機体 X軸まわり角速度 [deg/s]  (FRD: 右バンク +)
-    //    gyro_pitch_rate_dps : 機体 Y軸まわり角速度 [deg/s]  (FRD: 機首上げ +)
+    //    dt_s          : 前回 update() からの経過 [s]
+    //    d_roll_deg    : その間に機体が X軸まわりに回った角度 [deg] (FRD: 右バンク +)
+    //    d_pitch_deg   : 同 Y軸まわり [deg] (FRD: 機首上げ +)
     //
     //  ★ 2026-09-11: 読み出しと制御を分離。毎回センサを読んで
     //    「de-rotate 済み変位」を _acc_* に積算し、FLOW_CTRL_DIV 読みごとに
     //    1 回だけ窓を締めて vx/vy を作る (そのとき _fresh=true)。
     //    呼び出し側は consumeFresh() が true の回だけ PosHold を回す。
     //    FLOW_CTRL_DIV==1 なら毎回窓が締まる = 旧挙動。
-    //  ジャイロは BodyFrame.h の Attitude.roll_rate / pitch_rate をそのまま渡す。
+    //  ★ 2026-09-18: de-rotation の入力を「角速度 × dt」から「区間の回転角」に変えた。
+    //    以前は 100Hz のこの呼び出し時点のジャイロ 1 サンプルに dt を掛けていたので、
+    //    区間内の 10 サンプルぶんの回転 (姿勢ループの 10Hz 級の揺れ) を 1 点で代表して
+    //    いた。メインループで積分した角度 (S5Vehicle::FlowRot) を渡せば、カウントが
+    //    積まれた区間とジャイロの積分区間が一致する。ロガー経由 (T_FLOW) でカウントが
+    //    数 ms 遅れて届く構成では、この整合のほうが効く。
     // ------------------------------------------------------------
-    void update(float dt_s, float gyro_roll_rate_dps, float gyro_pitch_rate_dps) {
+    void update(float dt_s, float d_roll_deg, float d_pitch_deg) {
         if (!_ok_init || dt_s <= 0.0f) return;
 
         int16_t dx = 0, dy = 0;
         if (Quad::FLOW_USE_BURST) { readMotionBurst(_cs, &dx, &dy, &_squal); }
         else                      { _sensor.readMotionCount(&dx, &dy); _squal = 255; }
-        process(dt_s, gyro_roll_rate_dps, gyro_pitch_rate_dps, dx, dy);
+        process(dt_s, d_roll_deg, d_pitch_deg, dx, dy);
     }
 
     // 生カウントを外 (LogLink 経由の T_FLOW) からもらう版。update() と同じ数学。
     //  dx/dy は「前回呼び出しからの累積」。新着が無かった回は 0,0 を渡す。
     //  squal は最新値 (SQUAL ゲートに使う)。
-    void updateFrom(float dt_s, float gyro_roll_rate_dps, float gyro_pitch_rate_dps,
+    void updateFrom(float dt_s, float d_roll_deg, float d_pitch_deg,
                     int16_t dx, int16_t dy, uint8_t squal) {
         if (!_ok_init || dt_s <= 0.0f) return;
         _squal = squal;
-        process(dt_s, gyro_roll_rate_dps, gyro_pitch_rate_dps, dx, dy);
+        process(dt_s, d_roll_deg, d_pitch_deg, dx, dy);
     }
 
 private:
     // update()/updateFrom() 共通の本体。ここから先はセンサの読み方に依存しない。
-    void process(float dt_s, float gyro_roll_rate_dps, float gyro_pitch_rate_dps,
-                 int16_t dx, int16_t dy) {
+    void process(float dt_s, float d_roll_deg, float d_pitch_deg, int16_t dx, int16_t dy) {
         // 生カウント → 機体座標 (FRD)
         float fx = (float)dx, fy = (float)dy;
         if (Quad::FLOW_SWAP_XY) { const float t = fx; fx = fy; fy = t; }
@@ -104,13 +108,11 @@ private:
             _acc_raw_x += fx;
             _acc_raw_y += fy;
             // de-rotation はサンプルごとに引いてから積算する。
-            //  見かけ流量 [px] = PX_PER_RAD * 角速度[rad/s] * dt。窓内で姿勢が
-            //  変わっても各サンプルの dt/ジャイロで正しく打ち消せる。
+            //  見かけ流量 [px] = PX_PER_RAD * 区間の回転角[rad]。窓内で姿勢が
+            //  変わっても各区間の回転角で正しく打ち消せる。
             if (Quad::FLOW_DEROTATE) {
-                const float gr = gyro_roll_rate_dps  * DEG2RAD;
-                const float gp = gyro_pitch_rate_dps * DEG2RAD;
-                _acc_gyro_x += Quad::FLOW_DEROT_SIGN_X * Quad::FLOW_PX_PER_RAD * gp * dt_s;
-                _acc_gyro_y += Quad::FLOW_DEROT_SIGN_Y * Quad::FLOW_PX_PER_RAD * gr * dt_s;
+                _acc_gyro_x += Quad::FLOW_DEROT_SIGN_X * Quad::FLOW_PX_PER_RAD * (d_pitch_deg * DEG2RAD);
+                _acc_gyro_y += Quad::FLOW_DEROT_SIGN_Y * Quad::FLOW_PX_PER_RAD * (d_roll_deg  * DEG2RAD);
             }
             _acc_dt += dt_s;
         }

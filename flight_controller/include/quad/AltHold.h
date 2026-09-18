@@ -41,7 +41,7 @@ public:
     // 起動時に1回。
     void begin() {
         _rate_pid.set_gains(ALT_RATE_KP, ALT_RATE_KI, ALT_RATE_KD);
-        _rate_pid.set_d_alpha(ALT_RATE_D_ALPHA);
+        _rate_pid.set_d_tau(ALT_RATE_D_TAU_S);
         _rate_pid.set_i_limit(ALT_RATE_I_LIMIT);
         _pos_kp = ALT_POS_KP;
         reset(0.0f);

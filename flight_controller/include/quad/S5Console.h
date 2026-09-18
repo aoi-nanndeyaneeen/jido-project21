@@ -8,6 +8,12 @@
 //
 //  ★ tuningMenu() はブロッキング (キー入力待ち)。アーム中は入れない
 //    (stopAllMotors した直後に制御ループが止まって落下する。実測 5.86 秒)。
+//
+//  ★ 2026-09-17: RP2040 (2 コア) ではキーを読むのはコア1、処理するのはコア0
+//    (quad/UsbOwner.h)。handleKey() がキー 1 文字の処理本体で、コア1 が読んだキーを
+//    コア0 が実行する。Teensy は従来どおり handleSerial() が読んで handleKey() へ。
+//    BLE の地上メンテ指令は、アーム中の出力を SafeLog にし、ディスアーム中は
+//    UsbOwner::acquire() でコア1 を退かせてから USB に書く。
 // ============================================================
 #pragma once
 #include <Arduino.h>
@@ -19,14 +25,17 @@
 #include "quad/LogLinkProto.h"
 #include "quad/SelfTest.h"
 #include "quad/StallLog.h"
+#include "quad/LoopProfile.h"
+#include "quad/SafeLog.h"
+#include "quad/UsbOwner.h"
 
 namespace S5 {
 namespace Console {
 
 // ------------------------------------------------------------
 //  I2C バススキャン。0x08..0x77 を叩いて ACK を返したアドレスを列挙する。
-//   期待値:  0x29 = VL53L1X (距離)   0x68 = MPU6050 (IMU)
-//   0x68 だけ見えて 0x29 が見えない → VL53L1X が配線に乗れていない
+//   期待値:  0x29 = VL53L1X (距離)   IMU は IMU::I2C_DESC (LSM6DSV16X 0x6A/0x6B, MPU6050 0x68)
+//   IMU だけ見えて 0x29 が見えない → VL53L1X が配線に乗れていない
 //   両方見えない → バスが Low に張り付いている (モジュール故障 or 電源ショート)
 //  戻り値: 見つかったデバイス数 (BLE の ActAck に載せる)
 // ------------------------------------------------------------
@@ -37,9 +46,9 @@ inline int i2cScan() {
         Wire.beginTransmission(addr);
         const uint8_t err = Wire.endTransmission();
         if (err == 0) {
-            const char *tag = (addr == 0x29) ? "  <- VL53L1X (距離)"
-                            : (addr == 0x68) ? "  <- MPU6050 (IMU)"
-                                             : "";
+            const char *tag = (addr == 0x29)         ? "  <- VL53L1X (距離)"
+                            : IMU::isChipAddr(addr)  ? "  <- IMU"
+                                                     : "";
             Serial.printf("  0x%02X  ACK%s\n", addr, tag);
             ++found;
         }
@@ -189,14 +198,14 @@ inline ActionResult runMaintenanceAction(Vehicle& v, uint8_t action) {
             // シリアル 'r' と同じく非アーム/アーム問わず実行する。積分器を 0 に
             // 戻すだけで、モーターを止めたりしない。
             resetControllers(v);
-            Serial.println("\n>>> BLEからの指令: PID reset");
+            Quad::SafeLog::logf("\n>>> BLEからの指令: PID reset\n");
             return {S5T::ACK_OK, 0, 0};
 
         case S5C::ACT_IMU_CAL: {
             // ★ シリアル 'k' と違い、遠隔操作者は機体に触れていない。飛行中に
             //   誤って送られたら致命的なので「非アーム限定」ゲートを足す。
             if (isArmed(v)) {
-                Serial.println("\n!! BLEからの IMU_CAL を拒否: アーム中です");
+                Quad::SafeLog::logf("\n!! BLEからの IMU_CAL を拒否: アーム中です\n");
                 return {S5T::ACK_REFUSED_ARMED, 0, 0};
             }
             stopAllMotors(v);
@@ -212,7 +221,7 @@ inline ActionResult runMaintenanceAction(Vehicle& v, uint8_t action) {
             // i2cScan() は ACK の無い addr ごとに Wire のタイムアウト分ループが
             // 伸びうる。1000Hz ループを乱さないよう非アーム限定。
             if (isArmed(v)) {
-                Serial.println("\n!! BLEからの SELFTEST を拒否: アーム中です");
+                Quad::SafeLog::logf("\n!! BLEからの SELFTEST を拒否: アーム中です\n");
                 return {S5T::ACK_REFUSED_ARMED, 0, 0};
             }
             Serial.println("\n>>> BLEからの指令: SELFTEST (I2C再走査)");
@@ -236,16 +245,23 @@ inline void handleBleAction(Vehicle& v) {
     if (req.action_seq == last_seq) return;   // 重複排除
     last_seq = req.action_seq;
 
+    // 地上で USB に長く書く指令 (校正 / I2C 走査) はコア1 を退かせてから。
+    //  アーム中は拒否されて SafeLog にしか書かないので待たない。
+    const bool long_output = !isArmed(v) &&
+        (req.action == S5C::ACT_IMU_CAL || req.action == S5C::ACT_SELFTEST);
+    if (long_output) UsbOwner::acquire(2000);
     const ActionResult r = runMaintenanceAction(v, req.action);
+    if (long_output) UsbOwner::release();
     LogLink::sendAck(req.action, req.action_seq, r.result, r.imu_ok, r.i2c_found);
 }
 
 // ------------------------------------------------------------
 //  USB シリアルの 1 文字キー
 // ------------------------------------------------------------
-inline void handleSerial(Vehicle& v) {
-    if (!Serial.available()) return;
-    const char c = (char)tolower(Serial.read());
+//  raw: 受け取ったキーそのまま。大文字で意味を持つのは 'H' (ハング試験) だけで、
+//  それ以外は小文字にして扱う。
+inline void handleKey(Vehicle& v, char raw) {
+    const char c = (raw == 'H') ? 'H' : (char)tolower(raw);
 
     switch (c) {
         case 'p':
@@ -303,6 +319,11 @@ inline void handleSerial(Vehicle& v) {
             break;
         case 'w':
             StallLog::dump();
+            LoopProfile::print(Serial, LoopProfile::last(), "[ループ計測 直近1秒]");
+            if (LoopProfile::haveFlight())
+                LoopProfile::print(Serial, LoopProfile::lastFlight(), "[ループ計測 前回の飛行]");
+            Serial.printf("[SBUS] フレーム間隔の最大: 前回の飛行 %lu ms / 今のアーム中 %lu ms\n",
+                          (unsigned long)v.sbus_gap_last_ms, (unsigned long)v.sbus_gap_max_ms);
             break;
         case 'g': {
             // 高度ホールド (スロットルPID) の ON/OFF トグル。
@@ -355,9 +376,28 @@ inline void handleSerial(Vehicle& v) {
             Serial.setTimeout(old_to);
             break;
         }
+        case 'H': {
+            // ウォッチドッグの試験 (quad/FcWatchdog.h)。★ 必ずプロペラを外して。
+            //  アームしてスロットルを少し上げ、モーターが回っている状態で押す。
+            //  ループを 3 秒止める → WDT_TIMEOUT_MS でモーターが止まり、再起動して
+            //  「前回はループ停止で…区間『USB キー入力』」と出れば正常。
+            //  ディスアーム中はウォッチドッグが無効なので 3 秒止まって戻るだけ。
+            Serial.println("\n!! ハング試験: ループを 3 秒止めます (アーム中ならリセットされるはず)");
+            Serial.flush();
+            const uint32_t t0 = millis();
+            while (millis() - t0 < 3000) { }
+            Serial.println("!! ハング試験: 3 秒経過 (ここが出た = ウォッチドッグが効いていない / 非アーム)");
+            break;
+        }
         default:
             break;
     }
+}
+
+// Teensy (1 コア): ループの中で USB を読んでキーを処理する。
+inline void handleSerial(Vehicle& v) {
+    if (!Serial.available()) return;
+    handleKey(v, (char)Serial.read());
 }
 
 } // namespace Console

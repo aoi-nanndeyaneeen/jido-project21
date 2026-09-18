@@ -738,6 +738,10 @@ _DEFAULT_DETECTION = {
     "static_mask_learn_frames": 120,
     "static_mask_ratio": 0.9,
     "static_mask_dilate_px": 7,
+    "flicker_window_sec": 0.4,
+    "flicker_threshold": 50,
+    "flicker_bg_alpha": 0.1,
+    "flicker_bg_threshold": 20,
 }
 
 
@@ -839,13 +843,31 @@ BLINK_MIN_DEPTH      = 1.5     # ROI平均輝度の標準偏差の下限。静�
 #   平均すると変調が 5 階調・標準偏差 2.5 まで薄まり、min_depth=1.5 に
 #   対して余裕が無い。ROI を半径 3 (49px) に絞って変調を残す (実測 depth 35)。
 #   ホバリングの揺れは match_dist_px 側で追従するので ROI は小さくてよい。
-#   min_score は 0.5 -> 0.4。Camera1 は 16fps で 6Hz の 1 周期に 2.7 枚しか
-#   無く、取得時刻の揺らぎでスコアが 0.3〜0.9 を行き来する。0.5 だと
-#   録画で 1 秒ほど途切れる区間があった。静止した照明・反射のスコアは
-#   同じ録画で最大 0.29 (history 1.2s) なので 0.4 でも確定はしない。
+#   (2026-09-16 は min_score 0.5 -> 0.4 で合わせたが、時刻の揺らぎでスコアが
+#    0.3〜0.9 を行き来していた。翌日の長露出で破綻したので下のトグル判定へ移行)
 #   tools/replay_detect.py で再現できる。
+# ★ 2026-09-17 Camera1: α6400 が 1/15s の自動露出 (実効 10fps、間隔 33〜230ms) で
+#   ロックインのスコアが LED でも 0.28 しか出ず、検知 0%。点滅の判定を時刻に
+#   頼らない2値トグル判定 (core/blink.py 冒頭) に切り替える。toggle_min_hz を
+#   与えると min_score / min_depth は使われない。LED は毎秒 5〜12 回切り替わり、
+#   明暗差 58〜76。床の反射・照明は差 30 以下 (当初 contrast 35。下の調整で 28 に下げたが、
+#   止まっている物は「2値的」「切り替わり回数」でも落ちる)。
+#   tests/ の 2026-09-17 09:36:51 と 2026-09-16 16:48 の録画で確認。
+# ★ 2026-09-17 10:08 Camera1: 0.8m/s 以下で動き続ける機体 (30 秒) で点滅確定 0.4%。
+#   画面上 最大 ~500px/s で動き、候補が 30px 以上跳ぶとトラックが切れて、点滅の履歴
+#   (0.9 秒) が溜まらなかった。動く機体向けに次を足した (core/blink.py 冒頭):
+#     max_speed_px_s 400 : トラックが速度を持ち、予測位置から割り当て・輝度を測る
+#     roi_peak_px 8      : 予測のずれを吸収するため、半径 8px 内の roi_px 角平均の最大値で測る
+#     min_samples 6 / min_span_ratio 0.5 : 0.6 秒・6 枚から確定 (切れた後の復帰を早く)
+#     toggle_min_contrast 28 : 遠い所 (明暗差 30 前後) を拾う
+#     coast_sec 0.3      : 白飛びした窓の前を横切る間などは確定のまま予測位置を出す
+#   録画 3 本 (tests/test_camera1_replay.py) で: 動く 70% / 静止 81.5% / 10m 静止 91%。
+#   切り替わり 3.5Hz・coast 0.6s にすると動く録画は 78% まで上がるが、Camera2 の
+#   手を振る人の録画で人を確定する回数が 3 → 15 に増えたので控えめな値にした。
 BLINK_CAMERA_OVERRIDES = {
-    "Camera1": {"roi_px": 3, "min_score": 0.4},
+    "Camera1": {"roi_px": 2, "roi_peak_px": 8, "max_speed_px_s": 400,
+                "toggle_min_hz": 4.5, "toggle_min_contrast": 28.0,
+                "min_samples": 6, "min_span_ratio": 0.5, "coast_sec": 0.3},
 }
 
 

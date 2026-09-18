@@ -49,8 +49,9 @@ IM920」の段は `GROUND_LINK=IM920` に戻したときの経路。BLE のと�
  │    100Hz  測距ポーリング → AltHold    │ 目標高度 → 位置/速度PID → スロットル     │
  │    200Hz  s5rx.poll (上りコマンド)    │ (新サンプルの回だけ PID を進める)        │
  │    100Hz  Guided::update  要求 → 目標速度/高度 の翻訳 (制御はしない)            │
- │    200Hz  角度PID  目標リーン角 → 目標角速度                                    │
+ │  毎ループ  角度PID  目標リーン角 → 目標角速度  (2026-09-18〜。÷5 分周を廃止)    │
  │   1000Hz  レートPID → ミキサー → ESC   (HeadingHold: ヨーはジャイロ積分を保持)   │
+ │           ★ 1000Hz は目標。RP2040 は実効 630〜760Hz。制御・推定は全部実測 dt     │
  │    500Hz  FlightLog 1 行 → USB / RAM / SD / LogLink(RP2040 → BLE 125Hz)         │
  │      8Hz  TelemetryTx::tick  下りテレメトリ 1 パケット                          │
  │     10Hz  printStatus                                                           │
@@ -91,7 +92,7 @@ PC 側は「Step の列」を順に実行する。各 Step に制限時間があ
 | 周期 | 定数 | 場所 |
 |---|---|---|
 | 機体メイン 1000Hz | `RATE_LOOP_HZ` | `flight_controller/include/quad/QuadConfig.h` §6 |
-| 角度ループ 200Hz | `ANGLE_LOOP_HZ` | 同上 |
+| 角度ループ | (メインループごと。2026-09-18 に `ANGLE_LOOP_HZ` を廃止) | — |
 | フロー読み 100Hz / 制御 25Hz | `FLOW_LOOP_HZ` / `FLOW_CTRL_HZ` | 同上 §7 |
 | 測距 100Hz | `RANGE_LOOP_HZ` | 同上 §7-3 |
 | GUIDED 翻訳 100Hz | `S5::GUIDED_HZ` | `quad/S5Features.h` |

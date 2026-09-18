@@ -4,6 +4,8 @@
 //  drone_s5.cpp § 9 printStatus() をそのまま移したもの。読むだけで
 //  状態は変えない。FlightLog::Usb が動いている間は呼ばれない
 //  (同じ USB を奪い合うとログが落ちる)。
+//  ★ RP2040 ではコア1 から呼ぶ。Vehicle は読むだけにし、状態を書き換える関数
+//    (isArmed() など) は呼ばないこと。値はコア0 が書いている最中のものが混ざりうる。
 // ============================================================
 #pragma once
 #include <Arduino.h>
@@ -11,6 +13,9 @@
 #include "quad/SelfTest.h"
 #include "quad/SdLog.h"
 #include "quad/LogLink.h"
+#include "quad/LoopProfile.h"
+#include "quad/SafeLog.h"
+#include "quad/FcWatchdog.h"
 
 namespace S5 {
 
@@ -21,12 +26,36 @@ inline void printStatus(Vehicle& v, uint32_t dt_us) {
         Serial.println(">>> DRY-RUN: ESCへは0のみ (モーターは回らない)  ['m']で解除 <<<");
     Serial.printf("loop dt = %6lu us (%6.1f Hz)   %s   link=%s\n",
                   (unsigned long)dt_us, 1000000.0f / (float)dt_us,
-                  isArmed(v) ? "ARMED" : "DISARMED",
+                  v.armed_now ? "ARMED" : "DISARMED",
                   v.sbus.isSafe() ? "OK" : "LOST");
     Serial.printf("MODE = %s   (SW_HOVER: down=ANGLE / cen=POSHOLD / up=GUIDED%s)\n",
                   modeLabel(v.mode),
                   Quad::GUIDED_ENABLE ? " (資格切れ中はPOSHOLD)" : "");
     SelfTest::printCompact(Serial);   // 起動時に何がつながっていたか (画面に残す)
+    LoopProfile::print(Serial, LoopProfile::last(), "[ループ 直近1秒]");
+    if (LoopProfile::haveFlight())
+        LoopProfile::print(Serial, LoopProfile::lastFlight(), "[ループ 前回の飛行]");
+    if (v.fs != FS_NONE)
+        Serial.printf("!!!! フェイルセーフ: %s (%s) !!!!\n",
+                      v.fs == FS_LAND ? "自動着陸中" : "モーター停止", v.fs_why);
+    Serial.printf("SBUS 最終フレーム %lu ms 前 (間隔の最大: アーム中 %lu / 前回の飛行 %lu ms)  "
+                  "IMU 固まり %lu ms\n",
+                  (unsigned long)v.sbus.msSinceFrame(), (unsigned long)v.sbus_gap_max_ms,
+                  (unsigned long)v.sbus_gap_last_ms, (unsigned long)v.mpu.frozenMs());
+    Serial.printf("I2C: 読み失敗 %lu 回  バス復旧 %u 回  (失敗が増え続ける = IMU の電源/配線)\n",
+                  (unsigned long)v.mpu.ioFailTotal(), (unsigned)v.mpu.recoverCount());
+    if (v.wdt_rebooted) {
+        bool armed; uint8_t fs, mode, gp;
+        Serial.printf("!!!! 前回はループ停止でウォッチドッグがリセット: 区間「%s」 起動 %lu ms 後",
+                      FcWatchdog::sectionName(FcWatchdog::lastSection()),
+                      (unsigned long)FcWatchdog::lastMs());
+        if (FcWatchdog::lastState(armed, fs, mode, gp))
+            Serial.printf("  (mode=%s guided=%s fs=%u armed=%d)", modeLabel((Mode)mode),
+                          Quad::guidedPhaseName((Quad::GuidedPhase)gp), (unsigned)fs, armed ? 1 : 0);
+        Serial.println(" !!!!");
+    }
+    if (Quad::SafeLog::dropped() > 0)
+        Serial.printf("(SafeLog 取りこぼし %lu 件)\n", (unsigned long)Quad::SafeLog::dropped());
 
     if (USE_BLE_LINK) {
         // BLE 経路。テレメトリは LogLink のリングへ積むだけなので、drop が増えるなら
@@ -74,12 +103,25 @@ inline void printStatus(Vehicle& v, uint32_t dt_us) {
                           Quad::guidedPhaseName(g.phase()), g.vx(), g.vy(), g.altM(), g.slew(),
                           (!g.engaged() && g.why()[0]) ? "  直前の解除理由: " : "",
                           (!g.engaged() && g.why()[0]) ? g.why() : "");
-            if (g.inManeuver()) {
-                const Quad::Maneuver& m = g.maneuver();
-                Serial.printf("  機動 %s  進行 %5.1f / %.0f deg (脚 %d/%d)  ヨーレート %+.1f deg/s  "
-                              "高度目標 %.2f m\n",
-                              m.name(), m.doneDeg(), m.totalDeg(),
-                              m.leg() + 1, m.legs(), m.yawRate(), m.altTarget());
+            Serial.printf("  機首 (置いた向きから) %+.1f deg\n", v.heading.sinceArm());
+            if (g.phase() == Quad::GP_ALIGN) {
+                Serial.printf("  向き合わせ中: 方位 目標 %.1f 実測 %.1f -> %+.1f deg/s\n",
+                              g.lineDeg(), v.heading.est(), g.yawRate());
+            } else if (g.phase() == Quad::GP_STRAIGHT) {
+                const Quad::StraightTrack& st = g.straight();
+                Serial.printf("  直進: 目標 %.2f / %.1f m  実測 前 %.2f 横 %+.2f m (最大 %+.2f)  "
+                              "%.1f/%.1f s  速さ %.2f m/s  ヨー 目標 %.1f 実測 %.1f -> %+.1f deg/s\n",
+                              st.progressRef(), st.distance(), st.along(), st.cross(), st.crossMax(),
+                              st.elapsedS(), st.expectS(), st.speed(),
+                              st.headingDeg(), v.heading.est(), g.yawRate());
+            } else if (g.tracking()) {
+                const Quad::CircleTrack& ct = g.circle();
+                Serial.printf("  円 %d/%d (%d周, 実測 %.2f周, 高度目標 %.2f m) 進行 目標 %5.1f / 実測 %5.1f deg  "
+                              "%.1f/%.1f s  速さ %.2f m/s  "
+                              "半径 %.2f m  ヨー 目標 %.1f 実測 %.1f -> %+.1f deg/s\n",
+                              g.legIndex() + 1, g.legCount(), ct.laps(), ct.lapsMeas(), g.altM(),
+                              ct.progressRefDeg(), ct.progressMeasDeg(), ct.elapsedS(), ct.expectS(),
+                              ct.speed(), ct.radiusMeas(), ct.yawRefDeg(), v.heading.est(), g.yawRate());
             }
             Serial.printf("FENCE  %s  (N±%.1f E±%.1f m)%s\n",
                           v.poshold.fenceOn() ? "有効"
@@ -131,10 +173,13 @@ inline void printStatus(Vehicle& v, uint32_t dt_us) {
     // --- 距離センサ + 高度ホールド ---
     if (USE_RANGE) {
         const Quad::AltitudeHold& ah = v.althold;
-        Serial.printf("\n[距離:%s] %s  斜め=%.2fm  → 鉛直h=%.2fm  上昇=%+.2fm/s\n",
+        Serial.printf("\n[距離:%s] %s  斜め=%.2fm  → 鉛直h=%.2fm  上昇=%+.2fm/s  "
+                      "飛びで同期し直し %u 回\n",
                       (Quad::RANGE_BACKEND == Quad::RangeBackend::Sonar_EZ) ? "SONAR" : "ToF",
-                      !v.range.ok ? "FAIL " : (v.range.valid ? "OK   " : "失探 "),
-                      v.range.raw_m, v.range.h_m, v.range.climb_mps);
+                      !v.range.ok ? "FAIL " : (v.rangefinder.stepRejecting() ? "飛び?"
+                                              : (v.range.valid ? "OK   " : "失探 ")),
+                      v.range.raw_m, v.range.h_m, v.range.climb_mps,
+                      (unsigned)v.rangefinder.stepCount());
         Serial.printf("[高度ホールド] %s  %s  hold=%.2fm  vz_tar=%+.2fm/s  "
                       "base=%.2f corr=%+.3f → thr=%.2f\n",
                       v.alt_hold_enable ? "ENABLED" : "OFF(手動)",

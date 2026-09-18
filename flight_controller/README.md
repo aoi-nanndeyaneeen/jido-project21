@@ -68,7 +68,8 @@ git の記録では次の順です。
 | `drone_s2` | X配置ミキサーとセンサ軸の確認 | **外す** | ロール指令で正しいモーターが速くなるか、符号は合っているか |
 | `drone_s3` | レートPID（アクロ） | 付ける | **初飛行はここ**。内側ループのゲイン決め |
 | `drone_s4` | 角度PID + モード切替 + ヨー保持 + 自律 + ログ | 付ける | 実運用はここ。RATE / ANGLE / AUTO の3モード |
-| `drone_s5` | オプティカルフロー / 距離センサ / 自動ホバリング | 付ける | s4 の上に位置・高度保持を段階的に追加（下記） |
+| `drone_s5` | オプティカルフロー / 距離センサ / 自動ホバリング (Teensy版。**2026-09-17 Teensy故障につき現在未使用**) | 付ける | s4 の上に位置・高度保持を段階的に追加（下記） |
+| `drone_s5_rp2040` | `drone_s5` と同一の `src/drone_s5.cpp` を Seeed XIAO RP2040 でビルドする版。**現行の実機はこちら** | 付ける | 同上。board依存部分は `#ifdef ARDUINO_ARCH_RP2040` で分岐 |
 | `esc_calib` | ESCキャリブレーション専用 | **外す** | 起動後10秒間 2000us を出力 |
 
 `drone_s5` の内部段階（同一ファイルに順に足していく。現在 **s5b**）:
@@ -200,14 +201,14 @@ flight_controller/
 
 | 役割 | 部品 | 備考 |
 |---|---|---|
-| マイコン | Teensy 4.0 | `drone_s*` は 4.0。`Zunrocoptor` などは 4.1 |
-| IMU | MPU6050 | **6軸（磁気センサなし）**。I2C 400kHz、±2g / ±250dps、DLPF 42Hz |
+| マイコン | Teensy 4.0 (`drone_s1`〜`s4`)。`drone_s5` は **Seeed XIAO RP2040** (`drone_s5_rp2040`。2026-09-17 Teensy故障のため移行、Teensy版 `drone_s5` は現在未使用)。`Zunrocoptor` などは Teensy 4.1 | ピン配置は `include/quad/BoardPins.h` |
+| IMU | MPU6050（`drone_s1`〜`s4`、6軸・磁気センサなし。I2C 400kHz、±2g / ±250dps、DLPF 42Hz）。`drone_s5_rp2040` は秋月 AE-LSM6DSV16X に換装済み（`-D IMU_CHIP_LSM6DSV16X`、詳細は `include/sensor/IMU.h`） | |
 | 気圧 | BMP280 | オプション（`drone_s4` では未使用） |
-| 受信機 | SBUS | `drone_s4` は `Serial5` |
-| テレメトリ | IM920SL | `drone_s4` は `Serial3`（`drone.cpp` と同じ）。19200 baud、`GroundData` 42 byte |
+| 受信機 | SBUS | `drone_s4` は `Serial5`。`drone_s5_rp2040` は SerialPIO (D10) |
+| テレメトリ / ログ中継 | IM920SL（`drone_s4`、`Serial3`、19200 baud、`GroundData` 42 byte）。`drone_s5_rp2040` は既定で BLE（`log_recorder` 経由、`Serial1`）。詳細はリポジトリ直下 README の「地上局リンクの経路」節 | |
 | 出力 | ESC ×4 (PWM 1000-2000us) | ピンは `QuadConfig.h` の `MOTOR_PIN` |
 
-制御ループ: **レートPID 1000Hz / 角度PID 200Hz / シリアル表示 10Hz**
+制御ループ: **レートPID 1000Hz / 角度PID 200Hz / シリアル表示 10Hz** (`drone_s4`。`drone_s5` は 2026-09-18 から角度PID もメインループごと・すべて実測 dt。RP2040 では実効 630〜760Hz)
 
 ---
 

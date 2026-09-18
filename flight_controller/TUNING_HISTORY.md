@@ -12,7 +12,7 @@
 
 ---
 
-## 1. レートループ (内側) RATE_ROLL / RATE_PITCH / RATE_YAW / RATE_D_ALPHA
+## 1. レートループ (内側) RATE_ROLL / RATE_PITCH / RATE_YAW / RATE_D_ALPHA (2026-09-18 から RATE_D_TAU_S)
 
 `include/quad/S5Gains.h` の `Gain::RATE_*`。
 
@@ -428,3 +428,43 @@ s5 解析テレメトリの送信レート [Hz]。
 ## 7. 以降の追記欄
 
 (日付 / 変更 / 根拠ログ / 結果 を1件ずつ)
+
+### 2026-09-18  RP2040 移行後の見直し: 姿勢推定の dt と加速度補正 / D フィルタの時定数化
+
+**変更**
+
+| どこ | 前 | 後 |
+|---|---|---|
+| `sensor/IMU.h` / `lib/Madgwick` | Madgwick を固定 1ms で積分 | `update(dt_s)` で実測 dt |
+| `QuadConfig.h` `IMU_FUSION_BETA_*` | beta 0.10 固定 | 地上 0.10 / アーム中 0.03 (`drone_s5.cpp` のアームエッジで切替) |
+| `QuadPID.h` | D 項 LPF が呼び出しごとの固定 alpha | 時定数 [s] (`set_d_tau`)。`RATE_D_TAU_S=0.004` / `ANG_D_TAU_S=0.012` / `FLOW_VEL_D_TAU_S=0.06` / `ALT_RATE_D_TAU_S=0.045` = 旧 alpha を各ループの公称周期で換算した値 |
+| `drone_s5.cpp` 角度ループ | ÷5 分周 (1000Hz 前提で 200Hz) | 毎ループ (P 主体なので値は同じ) |
+| `drone_s5.cpp` GUIDED 翻訳 | ÷10 分周 | 100Hz Ticker、`Guided::Inputs::dt_s` で目標を進める |
+| `sensor/OpticalFlow.h` de-rotation | 100Hz 時点のジャイロ 1 サンプル × dt | メインループで積分した区間の回転角 (`S5Vehicle::FlowRot`) |
+| `Receiver.h` | 毎ループ 16ch を浮動小数で換算 | 新フレームの回だけ |
+
+**根拠ログ** LOG0056〜0064 (2026-09-17 23:40〜18 01:00, RP2040 の POSHOLD/GUIDED)。
+`scripts/analyze_attitude_est.py` で再現できる。
+
+- ループ周期: dt 平均 1.3〜1.6ms (実効 630〜760Hz), p99 3.4ms。Teensy は 1.01ms。
+  PID/積分は実測 dt だったので無事。**Madgwick だけが固定 1ms** で、
+  2〜6Hz の |推定角|/|∫ジャイロ| が 0.57〜0.70 (= 1ms/実 dt) に縮んでいた。
+- 位置ループの揺れ帯 (0.3〜0.7Hz) では |推定角|/|∫ジャイロ| = 0.34〜0.43, 位相 +37〜+41deg。
+  同じ IMU 生値を Python の Madgwick に食わせ直すと (dt 正):
+  beta 0.10 → 0.57 (+46deg), 0.03 → 0.92 (+17deg), 0.01 → 0.99 (+6deg)。
+  クアッドは横に動くと加速度計の読みが推力方向 (機体 z) のままなので、加速度から見た
+  傾きは 0 に近い嘘になる。beta 0.10 (11.5deg/s の定速スルー) はホバーの数度の傾きを
+  0.2〜0.3 秒で加速度側へ引き戻す強さ。
+  → **位置ループは「2度傾けろ」と言って本当は 4度傾き、46deg 遅れて見えていた。**
+  9/10〜9/15 に FLOW_VEL_KP / FLOW_POS_KP で追いかけた 0.31Hz リミットサイクルと、
+  同定で出ていた「リーン→加速度の遅れ 0.45〜0.50s」の説明のつかなかった分 (フロー経路は
+  0.1〜0.15s) はこれ。
+- 揺れそのもの: roll_ang と fh_leanr が相関 0.998 / 6 サンプル (48ms) 遅れで一致 = 姿勢
+  ループは目標に追従できている。揺れは速度ループ (リーン→フロー速度→リーン) のもので、
+  0.35〜0.45Hz。後半 (GUIDED 区間) で roll_ang std 0.8 → 1.6〜2.1deg に増えている。
+
+**結果** 未飛行。次便で `analyze_attitude_est.py` を掛けて
+2〜6Hz で 0.95〜1.0、0.3〜0.7Hz で 0.9 以上 / 位相 +20deg 以内 になっているかを見る。
+まだ 0.3〜0.7Hz が低ければ `IMU_FUSION_BETA_FLIGHT` を 0.02 → 0.01。
+推定角が真値に近づくぶん、速度ループの実効ゲインは下がる (真の傾き = 指令)。
+揺れが消えて追従が緩すぎるようなら、そのときに FLOW_VEL_KP を上げる (先に上げない)。

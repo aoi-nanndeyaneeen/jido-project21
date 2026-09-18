@@ -43,7 +43,9 @@ inline void fillRec(FlightLog::Rec& r, Vehicle& v, uint32_t dt_us, bool armed, f
 
     r.roll_ang  = S5T::q16(v.roll_axis.ang_meas,  S5T::SC_CDEG);
     r.pitch_ang = S5T::q16(v.pitch_axis.ang_meas, S5T::SC_CDEG);
-    r.yaw_est   = S5T::q16(v.heading.est(),       S5T::SC_CDEG);
+    // heading.est() は巻き戻さない連続値だが、cdeg の int16 は ±327deg で張り付く
+    // (周回 1 周で必ず超える)。ログは ±180 に畳み、解析側で unwrap する。
+    r.yaw_est   = S5T::q16(remainderf(v.heading.est(), 360.0f), S5T::SC_CDEG);
 
     r.roll_rate  = S5T::q16(v.roll_axis.rate_meas,  S5T::SC_DDEG);
     r.pitch_rate = S5T::q16(v.pitch_axis.rate_meas, S5T::SC_DDEG);

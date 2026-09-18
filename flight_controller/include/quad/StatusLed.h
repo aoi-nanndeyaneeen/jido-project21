@@ -38,7 +38,8 @@ constexpr uint8_t PIN_B = BOARD_LED_B;
 static uint8_t s_rgb = 0;
 inline void begin() {}
 inline void set(bool r, bool g, bool b) {
-    s_rgb = (uint8_t)((r ? 1u : 0u) | (g ? 2u : 0u) | (b ? 4u : 0u));
+    // 実機の LED 配線では赤/青が逆に繋がっているので、論理色の R/B を物理ピンへ再マッピングする。
+    s_rgb = (uint8_t)((b ? 1u : 0u) | (g ? 2u : 0u) | (r ? 4u : 0u));
 }
 inline uint8_t rgbBits() { return s_rgb; }
 #else
@@ -52,10 +53,11 @@ inline void begin() {
 }
 
 // r/g/b = true でその色を点ける (中で負論理に変換する)。
+// 実機の配線では R と B を入れ替える必要がある。
 inline void set(bool r, bool g, bool b) {
-    digitalWrite(PIN_R, r ? LOW : HIGH);
+    digitalWrite(PIN_R, b ? LOW : HIGH);
     digitalWrite(PIN_G, g ? LOW : HIGH);
-    digitalWrite(PIN_B, b ? LOW : HIGH);
+    digitalWrite(PIN_B, r ? LOW : HIGH);
 }
 inline uint8_t rgbBits() { return 0; }   // Teensy では未使用
 #endif

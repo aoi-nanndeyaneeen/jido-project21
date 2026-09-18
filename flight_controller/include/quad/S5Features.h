@@ -7,15 +7,18 @@
 //  ------------------------------------------------------------
 //  【drone_s5 の周期一覧】 ★ loop() の骨組みそのもの。変えるならここと loop() を一緒に見る
 //
-//      1000Hz  MAIN_HZ (= RATE_LOOP_HZ)   IMU 読み → 姿勢推定 → レートPID → ミキサー → ESC
-//       200Hz  ANGLE_LOOP_HZ (÷5)         角度PID (目標角 → 目標角速度)
-//       100Hz  FLOW_LOOP_HZ               PMW3901 読み + de-rotation サンプル
-//        25Hz  FLOW_CTRL_HZ (÷4)          ↳ 窓を締めて PosHold (速度/位置ループ)
+//      1000Hz  MAIN_HZ (= RATE_LOOP_HZ)   IMU 読み → 姿勢推定 → 角度PID → レートPID → ミキサー → ESC
+//              ★ 目標値。RP2040 の実効は 630〜700Hz (LoopProfile 'w' で見る)。
+//                制御・推定はすべて実測 dt で計算するので、遅くても値は狂わない。
+//                角度PID はここに同居 (2026-09-18〜。÷5 の分周をやめた)
+//       100Hz  FLOW_LOOP_HZ               PMW3901 読み + de-rotation サンプル (Ticker)
+//        25Hz  FLOW_CTRL_HZ (÷4 読み)     ↳ 窓を締めて PosHold (速度/位置ループ)
 //       100Hz  RANGE_LOOP_HZ              測距ポーリング → AltHold (新サンプルの回だけ PID)
 //       200Hz  TELEM_RX_HZ                IM920 上りコマンドの受信ポーリング (GROUND_LINK=IM920)
 //      毎ループ                           BLE 上りコマンドの取り出し (GROUND_LINK=BLE。LogLink の mailbox)
-//       100Hz  GUIDED_HZ (÷10)            地上局要求 → 目標速度/高度への翻訳 (制御はしない)
-//       500Hz  FlightLog::LOG_HZ (÷2)     125Hz ログ 1 行を作って USB/RAM/SD/LogLink へ
+//       100Hz  GUIDED_HZ                  地上局要求 → 目標速度/高度への翻訳 (制御はしない。Ticker)
+//       125Hz  FlightLog::LOG_HZ          ログ 1 行を作って USB/RAM/SD/LogLink へ
+//              (RP2040。Teensy は 500Hz。時間基準の Ticker)
 //         8Hz  TELEM_TX_HZ                下りテレメトリ 1 パケット (A,B,A,B,C,A,B,D 枠) (GROUND_LINK=IM920)
 //        20Hz  BLE_TELEM_HZ               下りテレメトリ A+B+(C|D) を 1 束 (GROUND_LINK=BLE)
 //        10Hz  DEBUG_HZ                   シリアル画面
@@ -115,12 +118,10 @@ static_assert(POSHOLD_THR_CAP >= Quad::ALT_HOVER_THR + 0.10f,
 constexpr int MAIN_HZ  = Quad::RATE_LOOP_HZ;   // 1000
 constexpr int DEBUG_HZ = Quad::DEBUG_HZ;       // 10
 
-// 地上局要求の翻訳 (Guided::update) を回すレート。1000Hz で回す必要は無く
-// (中身は millis 比較と代入)、上りコマンドは 200Hz でポーリングしているので
-// 100Hz で足りる。メインループの分周で回す。
+// 地上局要求の翻訳 (Guided::update) と周回/直進の目標を進めるレート。1000Hz で
+// 回す必要は無く、上りコマンドは 200Hz でポーリングしているので 100Hz で足りる。
+// 時間基準の Ticker で回す (メインループの実効周期に依らない)。
 constexpr int GUIDED_HZ  = 100;
-constexpr int GUIDED_DIV = MAIN_HZ / GUIDED_HZ;
-static_assert(MAIN_HZ % GUIDED_HZ == 0, "GUIDED_HZ は MAIN_HZ の約数にすること");
 
 // 下りテレメトリ [Hz]。IM920sL が持続できるのは 15Hz まで (2026-09-04 実測)。
 //  GUIDED では上り 8Hz と帯域を分け合うので 8Hz (UART 占有 下り30%+上り23%)。

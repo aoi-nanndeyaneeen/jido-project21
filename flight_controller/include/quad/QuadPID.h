@@ -9,6 +9,12 @@
 //  ここでは dt を呼び出し側から渡します。レートループと角度ループで
 //  同じクラスを使い回しても、それぞれ正しい dt になります。
 //
+//  ★ 2026-09-18: D 項の LPF も「呼び出しごとの固定 alpha」から「時定数 [s]」に
+//    変えた。固定 alpha は呼ばれる周期で遮断周波数が変わる (alpha=0.8 は
+//    1000Hz で τ=4ms だが、RP2040 の実効 650Hz では τ=6.9ms)。Teensy で
+//    決めたゲインを周期の違う板でそのまま使えるように、dt から毎回 alpha を出す。
+//      alpha = τ / (τ + dt)     (τ=0 なら D はフィルタなし)
+//
 //  ※ Control.h には手を付けていないので、他の .cpp は今まで通り動きます。
 // ============================================================
 #pragma once
@@ -22,17 +28,17 @@ private:
     float _i_term   = 0.0f;   // 積分項 (ゲインを掛けた後の値で持つ)
     float _prev_meas = 0.0f;  // 前回の測定値
     float _d_lpf    = 0.0f;   // ローパス後の微分値
-    float _d_alpha  = 0.7f;   // 0 = フィルタなし, 1 に近いほど強く効く
+    float _d_tau_s  = 0.0023f; // D 項 LPF の時定数 [s] (0 = フィルタなし)。既定は旧 alpha 0.7 @1kHz 相当
     float _i_limit  = 0.3f;   // 積分項の上限 (出力と同じ単位)
     bool  _first    = true;   // 初回は微分をスキップする
 
 public:
     Pid() = default;
-    Pid(float kp, float ki, float kd, float d_alpha = 0.7f, float i_limit = 0.3f)
-        : _kp(kp), _ki(ki), _kd(kd), _d_alpha(d_alpha), _i_limit(i_limit) {}
+    Pid(float kp, float ki, float kd, float d_tau_s = 0.0023f, float i_limit = 0.3f)
+        : _kp(kp), _ki(ki), _kd(kd), _d_tau_s(d_tau_s), _i_limit(i_limit) {}
 
     void set_gains(float kp, float ki, float kd) { _kp = kp; _ki = ki; _kd = kd; }
-    void set_d_alpha(float a)   { _d_alpha = a; }
+    void set_d_tau(float tau_s) { _d_tau_s = (tau_s > 0.0f) ? tau_s : 0.0f; }
     void set_i_limit(float lim) { _i_limit = lim; }
 
     float kp() const { return _kp; }
@@ -77,7 +83,8 @@ public:
         float d = 0.0f;
         if (!_first) {
             const float d_raw = -(measurement - _prev_meas) / dt_s;
-            _d_lpf = _d_alpha * _d_lpf + (1.0f - _d_alpha) * d_raw;
+            const float alpha = _d_tau_s / (_d_tau_s + dt_s);   // 実測 dt から毎回出す
+            _d_lpf = alpha * _d_lpf + (1.0f - alpha) * d_raw;
             d = _kd * _d_lpf;
         }
         _prev_meas = measurement;
