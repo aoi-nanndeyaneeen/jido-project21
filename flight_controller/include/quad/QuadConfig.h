@@ -579,8 +579,11 @@ constexpr bool  FLOW_REQUIRE_AIRBORNE = true;
 //   4. その場で傾ける → RANGE_TILT_LIMIT_DEG を超えると h が凍結するのを確認
 
 // 使う測距バックエンド。ハードを載せ替えたらここだけ変える。
-enum class RangeBackend { ToF_VL53L1X, Sonar_EZ };
-constexpr RangeBackend RANGE_BACKEND = RangeBackend::ToF_VL53L1X;
+//   ToF_VL53L1X : I2C 0x29。実用 ~2.9m (Medium) / ~4m (Long)。上昇旋回には足りない
+//   Sonar_EZ    : MaxBotix LV-MaxSonar-EZ。PW ピン 1 本。ドライバ実装済み・未配線
+//   Lidar_TSD20 : I2C 0x52。0.05〜20m / 200Hz。★2026-09-19 から本命
+enum class RangeBackend { ToF_VL53L1X, Sonar_EZ, Lidar_TSD20 };
+constexpr RangeBackend RANGE_BACKEND = RangeBackend::Lidar_TSD20;
 
 // --- Sonar_EZ (MaxBotix LV-MaxSonar-EZ) 専用 ---
 constexpr uint8_t  RANGE_SONAR_PW_PIN   = 23;     // PW 出力 → 空き割り込みピン
@@ -588,6 +591,27 @@ constexpr float    RANGE_SONAR_ALPHA    = 0.35f;  // 生距離(EZ2側)の軽い1
 constexpr float    RANGE_SONAR_MIN_M    = 0.16f;  // これ以下は測れない(仕様)
 constexpr float    RANGE_SONAR_MAX_M    = 4.00f;  // LV-EZ の実用上限あたり
 constexpr uint32_t RANGE_SONAR_STALE_MS = 300;    // 新パルスがこの時間来なければ失探
+
+// --- Lidar_TSD20 (PONO TSD20 単点 DTOF LiDAR。秋月) 専用 ---
+//  0.05〜20m (90%反射) / 200Hz / 精度 ±5cm(<5m) / 繰り返し ±10mm /
+//  環境光耐性 8m@100kLux / FOV 3° / 3.3V 40mA / 2g。I2C は最大 400kHz。
+//  ★ IMU (0x6A) と同じ Wire に相乗りする。プルアップは IMU 基板の J1 (10k) を使う。
+//
+//  ★★ 出荷時は UART モード。I2C で話すには先に UART で切替コマンドを送る必要がある。
+//     切替済みかどうかは src/tsd20_test.cpp (-e tsd20_test) の SCAN / ID で確認できる。
+//     戻し方も含めた手順はそのスケッチ冒頭のコメントに書いてある。
+constexpr uint8_t  RANGE_TSD20_ADDR      = 0x52;  // 7bit。既定値
+constexpr uint8_t  RANGE_TSD20_REG_DIST  = 0x00;  // 0x00-0x01 距離[mm] (上位 -> 下位)
+constexpr uint8_t  RANGE_TSD20_REG_LASER = 0x02;  // 1=ON。begin() で入れる
+constexpr uint8_t  RANGE_TSD20_REG_ID    = 0x03;  // 0x4A。疎通確認用
+constexpr uint8_t  RANGE_TSD20_ID        = 0x4A;
+constexpr float    RANGE_TSD20_MIN_M     = 0.06f; // 測定盲点 5cm + 余裕
+constexpr float    RANGE_TSD20_MAX_M     = 6.00f; // 素の上限は 20m。機体では使わないので蓋
+//  ★ 測距できていないときは 0、レンジ外のときは 50000 が返る。どちらも無効サンプル。
+constexpr uint16_t RANGE_TSD20_ZERO_MM   = 0;
+constexpr uint16_t RANGE_TSD20_OOR_MM    = 50000;
+//  センサ 200Hz / 読み出し RANGE_LOOP_HZ=100 なので、200ms は 20 サンプル分の余裕。
+constexpr uint32_t RANGE_TSD20_STALE_MS  = 200;
 
 // --- バックエンド共通の失探タイムアウト [ms] -------------------------------
 //  ★ 2026-09-09 追加。これまで stale 判定は Sonar_EZ だけに掛かっており、
@@ -603,7 +627,13 @@ constexpr uint32_t RANGE_STALE_MS = 400;
 // 測距の1回あたり積分時間 [us]。長いほど精度↑/レート↓。
 //  Medium モードは 33ms 前後が下限。
 // ★ 2026-09-07: 33000 -> 25000。理由は下の RANGE_CONTINUOUS_MS を参照。
-constexpr uint32_t RANGE_TIMING_BUDGET_US = 25000;
+//  ★ 2026-09-18: VL53L1X を Long にするか (RANGE_TOF_LONG)。Medium は実用 ~2.9m で
+//    上昇旋回 (ポール 3m 超) に届かない。Long は暗いほど伸びる (室内大会なので日光は無い)。
+//    Long は 1 回の測距に時間がかかるので budget/周期を伸ばす = 測距レートが落ちる
+//    (33Hz -> 25Hz)。高度ループの遅れが増える方向なので、伸ばしすぎないこと。
+//    ★ ベンチで 3.6m / 4.0m の Valid 率とばらつきを実測してから飛ばすこと。
+constexpr bool     RANGE_TOF_LONG = true;
+constexpr uint32_t RANGE_TIMING_BUDGET_US = RANGE_TOF_LONG ? 33000 : 25000;
 // 連続測距の周期 [ms]
 // ★ 2026-09-07: 33 -> 30。VL53L1X は「連続測距周期 > timing budget + 4ms」を
 //   要求する (データシート)。33 == 33 はこれを満たしておらず、センサは
@@ -612,7 +642,7 @@ constexpr uint32_t RANGE_TIMING_BUDGET_US = 25000;
 //   (設定上の想定は 30Hz)。scripts/analyze_alt_pid.py の遅延見積もりは
 //   30Hz 前提で書いてあるので、実際の遅れはあの計算の約2倍あった。
 //   25ms budget + 30ms 周期なら余裕 5ms で規格を満たし、33Hz が出る。
-constexpr uint16_t RANGE_CONTINUOUS_MS    = 30;
+constexpr uint16_t RANGE_CONTINUOUS_MS    = RANGE_TOF_LONG ? 40 : 30;
 
 // ★ 2026-09-15: begin() の init() はレジスタ I/O が通るかしか見ておらず、
 //   VIN が未接続でも SDA/SCL 経由の漏れ電流だけでレジスタ応答してしまい
@@ -635,7 +665,41 @@ static_assert(RATE_LOOP_HZ % RANGE_LOOP_HZ == 0,
 
 // 有効とみなす斜め距離のレンジ [m] (これ外は外れ値として捨てる)
 constexpr float RANGE_MIN_M = 0.03f;
-constexpr float RANGE_MAX_M = 3.5f;
+//  ★ 2026-09-18: 3.5 -> 4.2。上昇旋回はポール (3m) 以上で 2 周する必要があり、
+//    目標 3.6m に対して上限 3.5m だと constrain で張り付いて「まだ低い」と信じ、
+//    上昇し続ける (LOG0064 の天井張り付きと同じ形)。★ 目標高度は必ずここより下に。
+constexpr float RANGE_MAX_M = 4.2f;
+
+// --- バックエンドごとの違いを 1 か所に集める -------------------------------
+//  ★ 2026-09-19: 以前は「Sonar_EZ か否か」の二択が Rangefinder / S5Status /
+//    SelfTest / drone_s5 の 4 ファイルに散らばっていた。3 つ目 (Lidar_TSD20) を
+//    足すとその二択は全部「ToF 扱い」に落ちて嘘を表示する。バックエンドを
+//    足すときに触る場所をここ 1 か所にする。
+struct RangeBackendInfo {
+    const char* name;      // 画面表示の短い名前
+    const char* device;    // 型名 (起動ログ / セルフテスト)
+    const char* bus;       // セルフテストの bus 欄
+    const char* hint;      // 応答が無いときに出す確認事項
+    float       min_m;     // 有効とみなす斜め距離の下限 [m]
+    float       max_m;     //                       上限 [m]
+    uint32_t    stale_ms;  // 高度がこの時間更新されなければ失探
+    bool        on_i2c;    // 同じ Wire に載る = バス復旧のときに入れ直す対象
+};
+constexpr RangeBackendInfo rangeInfoOf(RangeBackend b) {
+    return b == RangeBackend::Sonar_EZ
+        ? RangeBackendInfo{"SONAR", "MaxBotix LV-MaxSonar-EZ", "PW pin",
+                           "PW ピン / 3V3給電",
+                           RANGE_SONAR_MIN_M, RANGE_SONAR_MAX_M, RANGE_SONAR_STALE_MS, false}
+    : b == RangeBackend::Lidar_TSD20
+        ? RangeBackendInfo{"LiDAR", "PONO TSD20", "I2C 0x52",
+                           "SDA/SCL/3V3/GND 配線。まだ UART モードの可能性 (-e tsd20_test で確認)",
+                           RANGE_TSD20_MIN_M, RANGE_TSD20_MAX_M, RANGE_TSD20_STALE_MS, true}
+        : RangeBackendInfo{"ToF", "VL53L1X", "I2C 0x29",
+                           "SDA/SCL/3V3/GND 配線",
+                           RANGE_MIN_M, RANGE_MAX_M, RANGE_STALE_MS, true};
+}
+constexpr RangeBackendInfo RANGE_INFO = rangeInfoOf(RANGE_BACKEND);
+static_assert(RANGE_INFO.min_m < RANGE_INFO.max_m, "測距レンジが逆");
 
 // 高度に足す平行移動オフセット [m] (センサレンズ → 基準高さ の差。上に付いていれば +)
 constexpr float RANGE_OFFSET_M = 0.00f;
@@ -681,7 +745,12 @@ constexpr uint32_t RANGE_FAULT_MS = 1000;
 //  前回採用した高度 + 上昇速度×経過 から しきい値以上ずれたサンプルは捨てる。
 //  捨てている間は valid()=false → 高度ホールドは RangeLost (基準スロットル保持)。
 //  RANGE_STEP_GIVEUP_MS 捨て続けたら失探にし、次の有効サンプルで取り直す。
-constexpr float    RANGE_STEP_M          = 0.15f;   // 0 で無効
+//  ★ 2026-09-18: 0.15 -> 0.10。大会のミニハードルが 15cm でしきい値と同値のため
+//    素通りする。実ログでは測距の飛びが機動を3回中断させている
+//    (LOG0042 0.48->0.14 / LOG0045 0.23->0.56 (8の字が死んだ直接原因) /
+//     LOG0060 0.47->0.23)。普段の 1 サンプル間の変化は最大 0.036m なので 0.10 でも
+//    正常サンプルは捨てない。
+constexpr float    RANGE_STEP_M          = 0.10f;   // 0 で無効
 //  しきい値に足す「上下に動いている分」[s]。上昇速度は LPF で遅れるので、速く上下する
 //  ほど予測が外れる。LOG0064 は見かけ 2.7m/s の降下中に誤判定して始まった。
 //  0.15 なら 2.7m/s のとき +0.40m 広がる。
@@ -1224,9 +1293,21 @@ constexpr float STRAIGHT_TIME_CAP   = 1.8f;
 //    2026-09-16: フィールド 6m x 9m (position_estimator config "large")。
 //    半幅 3.0/4.5 に対して余裕 0.3m で 2.7/4.2。半径1.5mの旋回 (直径3m+流れ)
 //    が中心から収まる。1.8m x 2.6m の部屋に戻すなら 0.6/1.0。
+//  ★★ 2026-09-19 (本番前日): 4.2 / 2.7 -> 10.0 / 10.0。
+//    旧値は 6m x 9m の練習場のもの。本番のミッションエリアは約22m四方で、
+//    (a) 旋回半径を 1.8m に上げたので 8の字が ±3.6m を使う。余裕 0.6m では
+//        フローのドリフト (5周で 0.4m) で **機動の途中で押し返されて円が崩れる**
+//        = 8の字 1400点 + 倍率が飛ぶ。
+//    (b) 離陸地点 (離着陸エリア②) はフィールド中心から離れているので、
+//        狭い矩形だと離陸直後から境界に張り付く。
+//    このフェンスは shiftFrame() の後 = 地上局がカメラ位置を送っているときしか
+//    効かない (fenceOn())。カメラ無しの便では最初から効かず、安全はパイロットの
+//    bail-out (SW_HOVER down) が受け持つ。
+//    練習場 (6x9m) に戻すときは 4.2 / 2.7 へ戻すこと。
+//    position_estimator の config.py COMP_FENCE_Y(=N) / COMP_FENCE_X(=E) と対。
 constexpr bool  FENCE_ENABLE  = true;
-constexpr float FENCE_N_LIM   = 4.2f;   // 前後 (フィールド奥行方向) ±[m]
-constexpr float FENCE_E_LIM   = 2.7f;   // 左右 (フィールド幅方向)   ±[m]
+constexpr float FENCE_N_LIM   = 10.0f;  // 前後 (フィールド奥行 = フィールド y) ±[m]
+constexpr float FENCE_E_LIM   = 10.0f;  // 左右 (フィールド幅   = フィールド x) ±[m]
 //  はみ出し量 [m] → 押し戻し速度 [m/s] の比例ゲインと、その上限。
 constexpr float FENCE_KP      = 1.0f;
 constexpr float FENCE_VEL_MAX = 0.4f;

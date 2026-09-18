@@ -186,9 +186,16 @@ class MissionRunner:
     FENCE_Z = MISSION_FENCE_Z
     FENCE_GRACE_S = MISSION_FENCE_GRACE_S
 
-    def __init__(self, link, program, home=None, verbose=True):
+    def __init__(self, link, program, home=None, verbose=True, use_camera=True):
         self.link = link
         self.program = list(program)
+        # カメラ (自己位置) を当てにしてよいか。False = fly_nocam.py から。
+        #  ★ False のとき変わるのは 2 つだけ:
+        #    - 「自己位置を見失った -> 着陸」の安全判定を行わない
+        #      (行うと離陸直後に必ず着陸してしまう。位置は最初から無い)
+        #    - GOTO は開ループ進入 (Step.dr_s) か、その場ホバー
+        #  高度・機動・着陸・締切は位置を使っていないのでそのまま動く。
+        self.use_camera = bool(use_camera)
         self.home = tuple(home) if home is not None else None
         # 呼び出し側が戻り先を固定したか。None なら毎フライト離陸地点から決め直す。
         self._home_fixed = self.home
@@ -215,6 +222,7 @@ class MissionRunner:
         self._t_mission = None       # GUIDED に入った時刻 = 競技時計の 0 秒
         self._t_send = 0.0
         self._t_pos_ok = 0.0
+        self._dr_said = None         # 開ループ進入の告知を段階ごとに1回だけ出す
         self._t_still = None         # 静止判定を始めた時刻
         self._still_ref = None       # 静止判定の基準位置
         # カメラ実測速度 (フィールド座標 m/s) と、その差分用の直前位置 (x, y, t)
@@ -251,6 +259,22 @@ class MissionRunner:
         self._pending_event = ""    # _say() したメッセージ (ログが1回読むと消える)
 
     # ---------------------------------------------------------------- 制御
+    def set_program(self, program):
+        """プログラムを差し替える (飛行前だけ)。[S]/[C] の切り替えから呼ぶ。
+
+        戻り値 False = 実行中なので差し替えなかった。
+        """
+        if self.phase not in (Phase.IDLE, Phase.DONE, Phase.ABORT):
+            return False
+        self.program = list(program)
+        self._idx_land = next((i for i, s in enumerate(self.program)
+                               if s.kind is StepKind.LAND), len(self.program) - 1)
+        self._idx_home = next((i for i, s in enumerate(self.program)
+                               if s.kind is StepKind.GOTO and s.target is None
+                               and s.entry_for is None), self._idx_land)
+        self.step_idx = 0
+        return True
+
     def start(self):
         """アームの立ち上がり (自動) か [M] キーで呼ぶ入口。以降は update() が全部やる。"""
         if self.phase not in (Phase.IDLE, Phase.DONE, Phase.ABORT):
@@ -409,6 +433,29 @@ class MissionRunner:
             where = f" -> ({tgt[0]:+.2f}, {tgt[1]:+.2f}, {tgt[2]:.2f})" if tgt else ""
             self._say(f"[{self.step_idx + 1}/{len(self.program)}] {s.label}"
                       f"{where}  制限 {s.budget_s:.0f}s / 経過 {self.elapsed():.0f}s")
+        self._say_call_cue()
+
+    def _say_call_cue(self):
+        """次のミッションの「コール」を操縦者に知らせる (ルール 6.4)。
+
+        ★ 各ミッションは **開始直前に操縦者がミッション名をコール** しないと
+          無効になる。機体は勝手に次へ進むので、PC 側から「今コールする」と
+          言ってやらないと間に合わない。移動・滞空の段階に入った時点で、
+          その次に来るミッション名を出す。
+        """
+        nxt = None
+        for s in self.program[self.step_idx:]:
+            if s.score:
+                nxt = s
+                break
+        cur = self.step
+        if nxt is None or cur is None:
+            return
+        if cur is nxt:
+            self._say(f"★★ いまコール中のミッション:「{nxt.name}」を実行しています")
+        else:
+            self._say(f"★★ 次のミッションは「{nxt.name}」です。"
+                      "始まる前に審判へコールしてください")
 
     def _resolve_goto_target(self, s):
         """GOTO の目標を決める。段階の頭で1回だけ計算し、以後は動かさない。
@@ -544,12 +591,16 @@ class MissionRunner:
             el = now - self._t_mission
             if el >= COMP_FORCE_LAND_BY_S and self.step_idx < self._idx_land:
                 self.reason = f"締切 {COMP_FORCE_LAND_BY_S:.0f}s: その場で着陸"
-                self._say(f"★ 経過 {el:.0f}s: 帰投を諦めて **その場で** 着陸します "
-                          f"(規定の締切 {COMP_RULE_DEADLINE_S:.0f}s まで残り {self.remaining():.0f}s)")
+                self._say(f"★ 経過 {el:.0f}s: 何があっても **その場で** 着陸します "
+                          f"(規定の締切 {COMP_RULE_DEADLINE_S:.0f}s まで残り {self.remaining():.0f}s)"
+                          "  ★ 審判へ「着陸」とコールしてください")
                 self._jump_to(self._idx_land, Phase.LAND)
             elif el >= COMP_LAND_BY_S and self.step_idx < self._idx_home:
-                self.reason = f"締切 {COMP_LAND_BY_S:.0f}s: 帰投して着陸"
-                self._say(f"★ 経過 {el:.0f}s: 残りのミッションを打ち切って帰投・着陸へ")
+                # 帰投 GOTO があればそこへ、無ければ着陸そのものへ跳ぶ
+                # (_idx_home は帰投が無いとき _idx_land に落ちる)。
+                self.reason = f"締切 {COMP_LAND_BY_S:.0f}s: 着陸へ"
+                self._say(f"★ 経過 {el:.0f}s: 残りを打ち切って着陸へ入ります"
+                          "  ★ 審判へ「着陸」とコールしてください")
                 self._jump_to(self._idx_home)
 
         # ---- 4) 段階ごとの制限時間 ------------------------------------
@@ -637,8 +688,11 @@ class MissionRunner:
             self._advance_step(t.now)
             return
         # ヘディングが分からないと「前」がどっちか分からない。
-        #  この状態で速度を出すと 90 度ずれた方向へ飛ぶので、必ず止める。
+        #  この状態で **フィールド座標の** 速度を出すと 90 度ずれた方向へ飛ぶので、
+        #  位置ループは必ず止める。
         if not t.yaw_valid or t.yaw_rad is None or not t.pos_valid or t.pos is None:
+            if self._dead_reckon(t, target):
+                return
             self._send(REQ_HOLD, alt_m=target[2], flags=t.flags, yaw_rad=t.yaw_rad)
             return
 
@@ -657,6 +711,37 @@ class MissionRunner:
         if inside:
             self._say(f"{s.name} 到達 (残り {dh:.2f} m)")
             self._goto(Phase.DWELL)
+
+    def _dead_reckon(self, t, target):
+        """自己位置が無いときの開ループ進入。処理したら True。
+
+        ★ なぜ要るか: ルール 6.7 の離陸は「離着陸エリア②から **ミッションエリアに
+          進入すること**」まで含む。カメラが無い/落ちた便でその場ホバーしていると、
+          離陸 120点 と、そのあとの倍率チェーンが丸ごとずれる。
+        ★ なぜ安全か: 送るのは **機体座標の前進速度** (vx = 前, vy = 右) で、
+          フィールド座標ではない。ヨーが分からなくても「機首の方向」は機体が
+          知っているので、90度ずれた方向へ飛ぶ心配がない。機首は置いたときの
+          向き (+x) のままなので、進む先も分かっている。
+        ★ 止まるのは時間だけ。位置を見ていないので距離は速度 x 秒の見積り。
+        """
+        s = self.step
+        if s is None or s.dr_s <= 0.0 or s.dr_speed <= 0.0:
+            return False
+        el = t.now - self._t_phase
+        if el < s.dr_s:
+            if self._dr_said is not s:
+                self._dr_said = s
+                self._say(f"自己位置が無いので開ループで進入します "
+                          f"(機首へ {s.dr_speed:.2f}m/s x {s.dr_s:.0f}s "
+                          f"= 約 {s.dr_speed * s.dr_s:.1f}m)")
+            self._send(REQ_GUIDED, vx_mps=s.dr_speed, vy_mps=0.0,
+                       alt_m=target[2], flags=t.flags, yaw_rad=t.yaw_rad)
+            return True
+        # 進みきった。止めて落ち着かせてから次の段階へ。
+        self._send(REQ_HOLD, alt_m=target[2], flags=t.flags, yaw_rad=t.yaw_rad)
+        self._say(f"開ループ進入 完了 (約 {s.dr_speed * s.dr_s:.1f}m)")
+        self._goto(Phase.DWELL)
+        return True
 
     def _phase_dwell(self, t):
         """到達点で静止して落ち着かせる (機動は静止から始めたい)。"""
@@ -968,7 +1053,9 @@ class MissionRunner:
             return f"飛行時間 {self.MISSION_TIMEOUT_S:.0f} 秒を超過"
 
         # 離陸前はまだカメラが機体を捉えていなくてよい
-        if self.phase in (Phase.CRUISE, Phase.DWELL):
+        #  ★ カメラを使わない便 (fly_nocam.py) では見ない。位置は最初から無いので、
+        #    ここを通すと離陸直後に必ず着陸する。
+        if self.use_camera and self.phase in (Phase.CRUISE, Phase.DWELL):
             if now - self._t_pos_ok > self.POS_LOST_LAND_S:
                 return f"自己位置を {self.POS_LOST_LAND_S:.1f} 秒見失った"
 
@@ -1024,6 +1111,10 @@ class MissionRunner:
                 out += f" ({self._step_note})"
         if self._t_mission is not None:
             out += f"  T+{self.elapsed():.0f}s 残{self.remaining():.0f}s"
+        # 次に来る得点ミッション (コール担当が見る)
+        nxt = next((x for x in self.program[self.step_idx:] if x.score), None)
+        if nxt is not None and nxt is not s:
+            out += f"  次コール「{nxt.name}」"
         if self._target_xyz is not None:
             t = self._target_xyz
             out += f" ({t[0]:+.2f}, {t[1]:+.2f}, {t[2]:.2f})"

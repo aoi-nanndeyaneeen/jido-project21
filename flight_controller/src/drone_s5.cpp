@@ -210,11 +210,15 @@ static void updateFlowHold(float dt_s) {
                      && (thr > Q::FLOW_ENABLE_THR) && airborne
                      && S5::USE_FLOW && v.flowobs.ok;
 
-    // GUIDED (周回) 中は円の目標点・接線速度・向心加速度を PosHold に渡す。スティックは
-    // 渡さない (Guided がスティック操作を検出したら GUIDED 自体を降りるので混ぜる必要がない)。
-    //  地上局ミッション (コメントアウト中) では v.poshold.setVelCommand(v.guided.vx(), v.guided.vy())。
+    // GUIDED 中は Guided の出力を PosHold に渡す。スティックは渡さない
+    // (Guided がスティック操作を検出したら GUIDED 自体を降りるので混ぜる必要がない)。
+    //   地上局ミッション  … 機体座標の目標速度 (setVelCommand)。定型機動もこの経路
+    //   機体単独パターン  … 円の目標点・接線速度・向心加速度 (setTrajectory)
     float sx = 0.0f, sy = 0.0f;
-    if (v.mode == S5::MODE_GUIDED && v.guided.tracking()) {
+    if (v.mode == S5::MODE_GUIDED && S5::GUIDED_MISSION) {
+        v.poshold.clearTrajectory();
+        v.poshold.setVelCommand(v.guided.vx(), v.guided.vy());
+    } else if (v.mode == S5::MODE_GUIDED && v.guided.tracking()) {
         const Q::Guided::Trajectory tr = v.guided.trajectory();   // 周回 / 直進
         v.poshold.clearVelCommand();
         v.poshold.setTrajectory(tr.ref_n, tr.ref_e, tr.vel_n, tr.vel_e, tr.acc_n, tr.acc_e);
@@ -283,8 +287,8 @@ static void updateGuided(float dt_s) {
     in.stick_yaw   = v.sbus.des[Ch::YAW];
     in.yaw_est_deg = v.heading.est();
     in.yaw_since_arm_deg = v.heading.sinceArm();
-    v.guided.update(in);
-    // 地上局ミッション (コメントアウト中): v.guided.update(in, v.s5rx, v.poshold, v.heading);
+    if (S5::GUIDED_MISSION) v.guided.update(in, v.s5rx, v.poshold, v.heading);
+    else                    v.guided.update(in);
 }
 
 // ============================================================
@@ -479,8 +483,33 @@ static void serviceLogFiles(bool armed_now) {
 // モード表示 LED (pin 5/6/9) と機体検出用 LED (pin 21/22/23)
 static void serviceLeds(bool armed_now) {
     const uint32_t now = millis();
-    //  黄(点灯)=DISARM  赤(点灯)=ARMED+ANGLE  青(2Hz点滅)=POSHOLD/ALTHOLD  緑(4Hz点滅)=GUIDED
-    if (!armed_now)                                                  StatusLed::yellow();
+    // ============================================================
+    //  ★ ルールブック 2.2.8 (機体審査の項目)
+    //    ・ハンズオフ飛行中      : 青または緑で **2Hz 程度の点滅**
+    //    ・それ以外              : **赤点灯**
+    //    ・操縦者の介入があったら : 赤点灯へ遷移
+    //    ・審判から視認できない場合は赤とみなされる
+    //
+    //  したがって「ハンズオフ = GUIDED のときだけ緑 2Hz 点滅、それ以外は全部
+    //  赤点灯」にする。POSHOLD/ALTHOLD は **操縦者がスイッチかスティックで
+    //  介入した結果** 入るモードなので、自動系ではあるが赤が正しい。
+    //  2Hz = 周期 500ms = 半周期 250ms。
+    //
+    //  ★ 2026-09-19 まではここが 黄(DISARM) / 緑4Hz(GUIDED) / 青2Hz(POSHOLD)
+    //    だった。デバッグには便利だがルールには合っていない。練習でモードを
+    //    色で見分けたいときだけ、下の COMP_LED_POLICY を false にする。
+    // ============================================================
+    constexpr bool COMP_LED_POLICY = true;   // true = 本番 (ルール 2.2.8)
+
+    if (COMP_LED_POLICY) {
+        if (armed_now && v.mode == S5::MODE_GUIDED) {
+            if (Q::blinkOn(now, 250)) StatusLed::green(); else StatusLed::off();
+        } else {
+            StatusLed::red();
+        }
+    }
+    //  練習用: 黄(点灯)=DISARM 赤(点灯)=ANGLE 青(2Hz)=POSHOLD/ALTHOLD 緑(4Hz)=GUIDED
+    else if (!armed_now)                                             StatusLed::yellow();
     else if (v.mode == S5::MODE_GUIDED)  { if (Q::blinkOn(now, 125)) StatusLed::green(); else StatusLed::off(); }
     else if (v.mode == S5::MODE_POSHOLD ||
              v.mode == S5::MODE_ALTHOLD) { if (Q::blinkOn(now, 250)) StatusLed::blue();  else StatusLed::off(); }
@@ -577,15 +606,16 @@ void setup() {
     }
     // FLOW_VIA_LINK のときは LogLink::begin の後で評価する (下)。
     if (S5::USE_RANGE) {
-        const bool sonar = (Q::RANGE_BACKEND == Q::RangeBackend::Sonar_EZ);
-        Serial.printf("Init Rangefinder (%s)...\n", sonar ? "SONAR MaxBotix LV-MaxSonar-EZ" : "ToF VL53L1X");
+        Serial.printf("Init Rangefinder (%s %s)...\n", Q::RANGE_INFO.name, Q::RANGE_INFO.device);
         v.range.ok = v.rangefinder.begin();
-        if (sonar) {
-            Serial.printf("  SONAR PW=pin %d / 3V3給電。数百ms後に [距離] に値が出れば配線OK\n",
-                          Q::RANGE_SONAR_PW_PIN);
+        if (!Q::RANGE_INFO.on_i2c) {
+            // ソナーは初期化応答が無いので begin() の戻り値では判定できない
+            Serial.printf("  %s PW=pin %d / 3V3給電。数百ms後に [距離] に値が出れば配線OK\n",
+                          Q::RANGE_INFO.device, Q::RANGE_SONAR_PW_PIN);
+        } else if (v.range.ok) {
+            Serial.printf("  %s OK (%s)\n", Q::RANGE_INFO.device, Q::RANGE_INFO.bus);
         } else {
-            Serial.println(v.range.ok ? "  VL53L1X OK"
-                                      : "  !! VL53L1X 応答なし (SDA=18/SCL=19/3V3/GND 配線を確認) !!");
+            Serial.printf("  !! %s 応答なし (%s) !!\n", Q::RANGE_INFO.device, Q::RANGE_INFO.hint);
         }
         Serial.printf("  高度ホールド: %s (POSHOLD で自動)。ホバースロットル=%s  目標高度=%s\n",
                       v.alt_hold_enable ? "有効" : "無効(POSHOLDでも手動)",

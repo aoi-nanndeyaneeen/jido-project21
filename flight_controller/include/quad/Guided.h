@@ -301,6 +301,10 @@ public:
     bool        tracking()    const { return inManeuver(); }
     // ヨーのレート指令 [deg/s]。追従中でなければ NAN (= HeadingHold の通常動作)
     float       yawRate()     const {
+        //  ★ 2026-09-18: 地上局ミッションの定型機動 (GP_MANEUVER) は Maneuver が
+        //    ヨーレートを持っている。ここで返さないと「前進するだけで回らない」=
+        //    円にならない (tracking() は GP_CIRCLE/ALIGN/STRAIGHT しか見ていない)。
+        if (_gp == GP_MANEUVER) return _maneuver.yawRate();
         if (!tracking()) return NAN;
         if (_gp == GP_CIRCLE) return _circle.yawRateCmd(_yaw_est_deg);
         if (_gp == GP_STRAIGHT) return _straight.yawRateCmd(_yaw_est_deg);
@@ -474,13 +478,11 @@ private:
     uint32_t _phase_start_ms = 0;         // GP_ALIGN に入った時刻
     bool    _yaw_corr_seq_init = false;
 
-#if 0
 // ============================================================
-//  ここから下: 地上局ミッション (2026-09-17 コメントアウト)
+//  ここから下: 地上局ミッション (2026-09-18 復活)
 //    離陸 / 巡航 / 着陸 / 定型機動 (CIRCLE/FIGURE8/CLIMB_TURN) / 位置・ヨー補正。
 //    position_estimator の core/program.py (本番プログラム) がこの経路で飛ぶ。
-//    戻すときは上の update()/disengage() とメンバをこちらに差し替え、
-//    drone_s5.cpp の updateGuided()/updateFlowHold()/updateControl() も戻すこと。
+//    どちらを使うかは S5Features.h の GUIDED_MISSION (drone_s5.cpp が分岐)。
 // ============================================================
 public:
     // ------------------------------------------------------------
@@ -495,14 +497,14 @@ public:
         _yaw_est_deg = in.yaw_est_deg;   // 機動の周回判定 (Maneuver::update) が使う
 
         // --- 0) 入る資格があるか (毎回全部見る) ----------------------
-        if (!in.armed) { disengage("ディスアーム"); _landed_latch = false; return; }
+        if (!in.armed) { disengageMission("ディスアーム"); _landed_latch = false; return; }
         if (_landed_latch && in.sw_hover_up && !_sw_hover_was_up) {
             _landed_latch = false;      // 下げてから上げ直した = 次の便
             Serial.println("\n>>> 着陸ラッチ解除 (SW_HOVER 上げ直し)");
         }
         _sw_hover_was_up = in.sw_hover_up;
         if (_landed_latch) {
-            // ★ 自動着陸完了のラッチ。GP_LANDED は disengage() で GP_OFF に消えるため、
+            // ★ 自動着陸完了のラッチ。GP_LANDED は disengageMission() で GP_OFF に消えるため、
             //   着陸後に地上でフローが「死んだ」判定になった瞬間に 解除→再エンゲージ→
             //   高度ホールド再起動→モーターが回って跳ねる事故があった (2026-09-16 00:33)。
             //   ディスアーム、または SW_HOVER を一度下げてから上げ直すまで解けない。
@@ -510,21 +512,21 @@ public:
             _vx = _vy = 0.0f;
             return;
         }
-        if (!in.sbus_ok)      { disengage("SBUS 無効");           return; }
-        if (!in.sw_hover_up)  { disengage("SW_HOVER が下");       return; }
-        if (!in.flow_alive)   { disengage("フローが死んでいる");   return; }
-        if (!in.range_ok)     { disengage("測距が無い");           return; }
+        if (!in.sbus_ok)      { disengageMission("SBUS 無効");           return; }
+        if (!in.sw_hover_up)  { disengageMission("SW_HOVER が下");       return; }
+        if (!in.flow_alive)   { disengageMission("フローが死んでいる");   return; }
+        if (!in.range_ok)     { disengageMission("測距が無い");           return; }
 
         // パイロットがスティックを触ったら自動を降りる (スイッチを探さずに戻せる)
         if (fabsf(in.stick_roll) > FLOW_STICK_DEAD || fabsf(in.stick_pitch) > FLOW_STICK_DEAD) {
-            disengage("スティック操作を検出");
+            disengageMission("スティック操作を検出");
             return;
         }
         // 通常の GUIDED はヨースティックを生かしたまま (機首だけ手動で振れる)。
         // 定型機動中はヨー経路をこちらが握っているので、触れたら「回しすぎ・変な方向」
         // への意思表示とみなして即座に降りる。
         if (_gp == GP_MANEUVER && fabsf(in.stick_yaw) > Gain::YAW_STICK_DEAD) {
-            disengage("機動中にヨースティック操作を検出");
+            disengageMission("機動中にヨースティック操作を検出");
             return;
         }
 
@@ -623,11 +625,9 @@ public:
         }
     }
 
-    // resetControllers() から。次に届いたパケットで即座にヨーを再基準する。
-    void resetYawCorrSeq() { _yaw_corr_seq_init = false; }
 
 private:
-    void disengage(const char* why) {
+    void disengageMission(const char* why) {
         if (_engaged) {
             _engaged = false;
             _why     = why;
@@ -754,10 +754,7 @@ private:
     uint32_t _land_start_ms  = 0;   // 降下を始めた時刻 (タイムアウト用)
     uint32_t _touch_since_ms = 0;   // 接地高度を下回り続けている開始時刻 (0=未満たず)
 
-    bool    _yaw_corr_seq_init = false;
     uint8_t _yaw_corr_last_seq = 0;
-    float   _yaw_est_deg = 0.0f;   // 直近の実測ヨー (update で control 側から受ける)
-#endif  // 地上局ミッション (コメントアウト)
 };
 
 } // namespace Quad

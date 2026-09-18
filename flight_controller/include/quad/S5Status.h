@@ -175,11 +175,19 @@ inline void printStatus(Vehicle& v, uint32_t dt_us) {
         const Quad::AltitudeHold& ah = v.althold;
         Serial.printf("\n[距離:%s] %s  斜め=%.2fm  → 鉛直h=%.2fm  上昇=%+.2fm/s  "
                       "飛びで同期し直し %u 回\n",
-                      (Quad::RANGE_BACKEND == Quad::RangeBackend::Sonar_EZ) ? "SONAR" : "ToF",
+                      Quad::RANGE_INFO.name,
                       !v.range.ok ? "FAIL " : (v.rangefinder.stepRejecting() ? "飛び?"
                                               : (v.range.valid ? "OK   " : "失探 ")),
                       v.range.raw_m, v.range.h_m, v.range.climb_mps,
                       (unsigned)v.rangefinder.stepCount());
+        // ★ 失探の理由。io が増えるなら I2C が通っていない (配線/接触不良/電源) で、
+        //   センサが 0mm や範囲外を返しているのとは原因が別物。
+        Serial.printf("  捨てた内訳: I2C失敗=%lu  0mm=%lu  範囲外=%lu  レンジ外=%lu  傾き=%lu\n",
+                      (unsigned long)v.rangefinder.ioFailCount(),
+                      (unsigned long)v.rangefinder.zeroCount(),
+                      (unsigned long)v.rangefinder.oorCount(),
+                      (unsigned long)v.rangefinder.rangeCount(),
+                      (unsigned long)v.rangefinder.tiltCount());
         Serial.printf("[高度ホールド] %s  %s  hold=%.2fm  vz_tar=%+.2fm/s  "
                       "base=%.2f corr=%+.3f → thr=%.2f\n",
                       v.alt_hold_enable ? "ENABLED" : "OFF(手動)",

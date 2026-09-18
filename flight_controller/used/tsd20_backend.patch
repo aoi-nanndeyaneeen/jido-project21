@@ -1,0 +1,197 @@
+diff --git a/flight_controller/include/quad/QuadConfig.h b/flight_controller/include/quad/QuadConfig.h
+index abdbb94..64f5035 100644
+--- a/flight_controller/include/quad/QuadConfig.h
++++ b/flight_controller/include/quad/QuadConfig.h
+@@ -579,10 +579,25 @@ constexpr bool  FLOW_REQUIRE_AIRBORNE = true;
+ //   4. その場で傾ける → RANGE_TILT_LIMIT_DEG を超えると h が凍結するのを確認
+ 
+ // 使う測距バックエンド。ハードを載せ替えたらここだけ変える。
+-enum class RangeBackend { ToF_VL53L1X, Sonar_EZ };
++//   C) Lidar_TSD20 : PONO TSD20 単点 DTOF LiDAR (I2C)。秋月。
++//        0.05〜20m (90%反射) / 200Hz / 精度 ±5cm(<5m) / 繰り返し ±10mm /
++//        環境光耐性 8m@100kLux / FOV 3° / 3.3V 40mA / 2g。
++//        I2C 既定アドレス 0x52 (IMU 0x6A/0x6B とも VL53L1X 0x29 とも衝突しない)。
++//        レジスタ: 0x00-0x01 距離[mm] (上位->下位) / 0x02 レーザ (1=ON) /
++//                  0x03 ID (0x4A。疎通確認用)
++//        ★ 上昇旋回 (ポール 3m 以上で 2 周) に対し VL53L1X は実用 ~2.9m で届かない。
++//          TSD20 は 20m まであるので高度側の余裕が桁違いになる。
++enum class RangeBackend { ToF_VL53L1X, Sonar_EZ, Lidar_TSD20 };
+ constexpr RangeBackend RANGE_BACKEND = RangeBackend::ToF_VL53L1X;
+ 
+ // --- Sonar_EZ (MaxBotix LV-MaxSonar-EZ) 専用 ---
++// --- Lidar_TSD20 (PONO TSD20) 専用 ---
++constexpr uint8_t  RANGE_TSD20_ADDR     = 0x52;   // 7bit。基板で変えていなければ既定
++constexpr float    RANGE_TSD20_MIN_M    = 0.06f;  // 測定盲点 5cm + 余裕
++constexpr float    RANGE_TSD20_MAX_M    = 6.00f;  // 素の上限は 20m。機体では使わないので蓋
++constexpr uint32_t RANGE_TSD20_STALE_MS = 200;    // 新しい値がこの時間来なければ失探
++//  0 が返ることがある (測距できていない)。0 は無効サンプルとして捨てる。
++
+ constexpr uint8_t  RANGE_SONAR_PW_PIN   = 23;     // PW 出力 → 空き割り込みピン
+ constexpr float    RANGE_SONAR_ALPHA    = 0.35f;  // 生距離(EZ2側)の軽い1次LPF
+ constexpr float    RANGE_SONAR_MIN_M    = 0.16f;  // これ以下は測れない(仕様)
+@@ -603,7 +618,13 @@ constexpr uint32_t RANGE_STALE_MS = 400;
+ // 測距の1回あたり積分時間 [us]。長いほど精度↑/レート↓。
+ //  Medium モードは 33ms 前後が下限。
+ // ★ 2026-09-07: 33000 -> 25000。理由は下の RANGE_CONTINUOUS_MS を参照。
+-constexpr uint32_t RANGE_TIMING_BUDGET_US = 25000;
++//  ★ 2026-09-18: VL53L1X を Long にするか (RANGE_TOF_LONG)。Medium は実用 ~2.9m で
++//    上昇旋回 (ポール 3m 超) に届かない。Long は暗いほど伸びる (室内大会なので日光は無い)。
++//    Long は 1 回の測距に時間がかかるので budget/周期を伸ばす = 測距レートが落ちる
++//    (33Hz -> 25Hz)。高度ループの遅れが増える方向なので、伸ばしすぎないこと。
++//    ★ ベンチで 3.6m / 4.0m の Valid 率とばらつきを実測してから飛ばすこと。
++constexpr bool     RANGE_TOF_LONG = true;
++constexpr uint32_t RANGE_TIMING_BUDGET_US = RANGE_TOF_LONG ? 33000 : 25000;
+ // 連続測距の周期 [ms]
+ // ★ 2026-09-07: 33 -> 30。VL53L1X は「連続測距周期 > timing budget + 4ms」を
+ //   要求する (データシート)。33 == 33 はこれを満たしておらず、センサは
+@@ -612,7 +633,7 @@ constexpr uint32_t RANGE_TIMING_BUDGET_US = 25000;
+ //   (設定上の想定は 30Hz)。scripts/analyze_alt_pid.py の遅延見積もりは
+ //   30Hz 前提で書いてあるので、実際の遅れはあの計算の約2倍あった。
+ //   25ms budget + 30ms 周期なら余裕 5ms で規格を満たし、33Hz が出る。
+-constexpr uint16_t RANGE_CONTINUOUS_MS    = 30;
++constexpr uint16_t RANGE_CONTINUOUS_MS    = RANGE_TOF_LONG ? 40 : 30;
+ 
+ // ★ 2026-09-15: begin() の init() はレジスタ I/O が通るかしか見ておらず、
+ //   VIN が未接続でも SDA/SCL 経由の漏れ電流だけでレジスタ応答してしまい
+@@ -635,7 +656,10 @@ static_assert(RATE_LOOP_HZ % RANGE_LOOP_HZ == 0,
+ 
+ // 有効とみなす斜め距離のレンジ [m] (これ外は外れ値として捨てる)
+ constexpr float RANGE_MIN_M = 0.03f;
+-constexpr float RANGE_MAX_M = 3.5f;
++//  ★ 2026-09-18: 3.5 -> 4.2。上昇旋回はポール (3m) 以上で 2 周する必要があり、
++//    目標 3.6m に対して上限 3.5m だと constrain で張り付いて「まだ低い」と信じ、
++//    上昇し続ける (LOG0064 の天井張り付きと同じ形)。★ 目標高度は必ずここより下に。
++constexpr float RANGE_MAX_M = 4.2f;
+ 
+ // 高度に足す平行移動オフセット [m] (センサレンズ → 基準高さ の差。上に付いていれば +)
+ constexpr float RANGE_OFFSET_M = 0.00f;
+@@ -681,7 +705,12 @@ constexpr uint32_t RANGE_FAULT_MS = 1000;
+ //  前回採用した高度 + 上昇速度×経過 から しきい値以上ずれたサンプルは捨てる。
+ //  捨てている間は valid()=false → 高度ホールドは RangeLost (基準スロットル保持)。
+ //  RANGE_STEP_GIVEUP_MS 捨て続けたら失探にし、次の有効サンプルで取り直す。
+-constexpr float    RANGE_STEP_M          = 0.15f;   // 0 で無効
++//  ★ 2026-09-18: 0.15 -> 0.10。大会のミニハードルが 15cm でしきい値と同値のため
++//    素通りする。実ログでは測距の飛びが機動を3回中断させている
++//    (LOG0042 0.48->0.14 / LOG0045 0.23->0.56 (8の字が死んだ直接原因) /
++//     LOG0060 0.47->0.23)。普段の 1 サンプル間の変化は最大 0.036m なので 0.10 でも
++//    正常サンプルは捨てない。
++constexpr float    RANGE_STEP_M          = 0.10f;   // 0 で無効
+ //  しきい値に足す「上下に動いている分」[s]。上昇速度は LPF で遅れるので、速く上下する
+ //  ほど予測が外れる。LOG0064 は見かけ 2.7m/s の降下中に誤判定して始まった。
+ //  0.15 なら 2.7m/s のとき +0.40m 広がる。
+diff --git a/flight_controller/include/sensor/Rangefinder.h b/flight_controller/include/sensor/Rangefinder.h
+index 915b7d5..85280dc 100644
+--- a/flight_controller/include/sensor/Rangefinder.h
++++ b/flight_controller/include/sensor/Rangefinder.h
+@@ -47,6 +47,29 @@ public:
+         _last_ms   = 0;
+         _last_h_ms = 0;
+ 
++        if (Quad::RANGE_BACKEND == Quad::RangeBackend::Lidar_TSD20) {
++            _min_m = Quad::RANGE_TSD20_MIN_M;
++            _max_m = Quad::RANGE_TSD20_MAX_M;
++            Wire.setClock(400000);
++            // ID (0x03) が 0x4A を返すかで疎通を見る。返らなければ配線か電源。
++            uint8_t id = 0;
++            if (!tsdRead(0x03, &id, 1) || id != 0x4A) { _ok_init = false; return false; }
++            tsdWrite(0x02, 1);            // レーザ ON
++            // 実サンプルが 1 回来るまで待つ (VL53L1X と同じ理由。電源未接続の空読み対策)
++            const uint32_t t0 = millis();
++            _ok_init = false;
++            while (millis() - t0 < Quad::RANGE_PROBE_TIMEOUT_MS) {
++                uint8_t b[2];
++                if (tsdRead(0x00, b, 2)) {
++                    const uint16_t mm = ((uint16_t)b[0] << 8) | b[1];
++                    if (mm != 0) { _ok_init = true; break; }
++                }
++                delay(2);
++            }
++            _last_new_ms = millis();
++            return _ok_init;
++        }
++
+         if (Quad::RANGE_BACKEND == Quad::RangeBackend::Sonar_EZ) {
+             _min_m = Quad::RANGE_SONAR_MIN_M;
+             _max_m = Quad::RANGE_SONAR_MAX_M;
+@@ -75,7 +98,7 @@ public:
+         _sensor.setTimeout(500);
+         if (!_sensor.init()) { _ok_init = false; return false; }
+ 
+-        _sensor.setDistanceMode(VL53L1X::Medium);
++        _sensor.setDistanceMode(Quad::RANGE_TOF_LONG ? VL53L1X::Long : VL53L1X::Medium);
+         _sensor.setMeasurementTimingBudget(Quad::RANGE_TIMING_BUDGET_US);
+         _sensor.startContinuous(Quad::RANGE_CONTINUOUS_MS);
+ 
+@@ -122,7 +145,9 @@ public:
+             //   起きると止まった値を信じて飛ぶので、両バックエンドで切る。
+             const uint32_t stale_ms =
+                 (Quad::RANGE_BACKEND == Quad::RangeBackend::Sonar_EZ)
+-                    ? Quad::RANGE_SONAR_STALE_MS : Quad::RANGE_STALE_MS;
++                    ? Quad::RANGE_SONAR_STALE_MS
++                : (Quad::RANGE_BACKEND == Quad::RangeBackend::Lidar_TSD20)
++                    ? Quad::RANGE_TSD20_STALE_MS : Quad::RANGE_STALE_MS;
+             if (_have_h && (millis() - _last_new_ms) > stale_ms) {
+                 _have_h = false;
+             }
+@@ -200,10 +225,18 @@ public:
+         _have_h = false;
+         _step_suspect = false;
+         if (Quad::RANGE_BACKEND == Quad::RangeBackend::Sonar_EZ) return;
++        if (Quad::RANGE_BACKEND == Quad::RangeBackend::Lidar_TSD20) {
++            // 同じ I2C バスなので電源が落ちていればレーザも切れている。入れ直す。
++            Wire.setClock(400000);
++            tsdWrite(0x02, 1);
++            _tsd_mm_prev = 0xFFFF;
++            _last_new_ms = millis();
++            return;
++        }
+         _sensor.setBus(&Wire);
+         _sensor.setTimeout(50);
+         if (_sensor.init()) {
+-            _sensor.setDistanceMode(VL53L1X::Medium);
++            _sensor.setDistanceMode(Quad::RANGE_TOF_LONG ? VL53L1X::Long : VL53L1X::Medium);
+             _sensor.setMeasurementTimingBudget(Quad::RANGE_TIMING_BUDGET_US);
+             _sensor.startContinuous(Quad::RANGE_CONTINUOUS_MS);
+         }
+@@ -264,6 +297,16 @@ private:
+     // バックエンドから「新しい斜め距離サンプル」を1個取り出す。
+     //  戻り値 true = slant_m / status_ok をセットした (レンジ判定は呼び出し側)
+     bool readSlant(float& slant_m, bool& status_ok) {
++        if (Quad::RANGE_BACKEND == Quad::RangeBackend::Lidar_TSD20) {
++            uint8_t b[2];
++            if (!tsdRead(0x00, b, 2)) return false;
++            const uint16_t mm = ((uint16_t)b[0] << 8) | b[1];
++            if (mm == _tsd_mm_prev) return false;   // 同じ値 = 新サンプルではない
++            _tsd_mm_prev = mm;
++            slant_m   = mm * 0.001f;
++            status_ok = (mm != 0);                  // 0 = 測れていない
++            return true;
++        }
+         if (Quad::RANGE_BACKEND == Quad::RangeBackend::Sonar_EZ) {
+             _sonar.update();
+             const uint32_t s = _sonar.seq();
+@@ -281,8 +324,24 @@ private:
+         return true;
+     }
+ 
++    // ---- TSD20 の I2C (レジスタアドレスを書いてから読む。単純なので直書き) ----
++    static bool tsdWrite(uint8_t reg, uint8_t val) {
++        Wire.beginTransmission(Quad::RANGE_TSD20_ADDR);
++        Wire.write(reg); Wire.write(val);
++        return Wire.endTransmission() == 0;
++    }
++    static bool tsdRead(uint8_t reg, uint8_t* buf, uint8_t n) {
++        Wire.beginTransmission(Quad::RANGE_TSD20_ADDR);
++        Wire.write(reg);
++        if (Wire.endTransmission(false) != 0) return false;   // repeated start
++        if (Wire.requestFrom((int)Quad::RANGE_TSD20_ADDR, (int)n) != n) return false;
++        for (uint8_t i = 0; i < n; ++i) buf[i] = (uint8_t)Wire.read();
++        return true;
++    }
++
+     VL53L1X   _sensor;
+     EZ2Sensor _sonar{Quad::RANGE_SONAR_PW_PIN, Quad::RANGE_SONAR_ALPHA};
++    uint16_t  _tsd_mm_prev = 0xFFFF;
+ 
+     bool     _ok_init  = false;
+     bool     _have_h   = false;

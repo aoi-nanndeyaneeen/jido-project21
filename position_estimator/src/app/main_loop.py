@@ -187,7 +187,7 @@ class FlightLoop:
                   "(MISSION_AUTOSTART=False のため)")
         print("   2. SW_HOVER を GUIDED (上) にして、スロットルを 15% 以上へ")
         print("      -> 機体が GUIDED に入った瞬間に競技時計が 0 から走り、離陸します")
-        print("   3. あとは全自動 (離陸 -> 各ミッション -> 帰投 -> 着陸 -> 静止判定)")
+        print("   3. あとは全自動 (離陸 -> 各ミッション -> 滞空 -> その場着陸 -> 静止判定)")
         print("   ★ 中断したくなったら [X] (その場から自動着陸)。")
         print("     緊急停止はプロポ (THR_CUT / SW_HOVER を下げる)。")
         print()
@@ -282,7 +282,34 @@ class FlightLoop:
                     msg, name, value = simple[key]
                     self.say(msg)
                     self.shared[name] = value
+                elif key == b's':
+                    self._toggle_scale()
+                elif key == b'c':
+                    self._toggle_climb()
             time.sleep(KEY_POLL_S)
+
+    # ---- 飛行前の切り替え (キー S / C) --------------------------------
+    #  本番と 1/10、上昇旋回の ON/OFF を、その場で組み直す。
+    #  ★ 飛行中は差し替えない (MissionRunner.set_program が False を返す)。
+    def _rebuild_program(self, what):
+        self.program = (build_competition_program(config) if COMP_ENABLED
+                        else build_waypoint_program(config))
+        if self.mission is not None and not self.mission.set_program(self.program):
+            self.say(f"[KEY] {what}: 飛行中なので変更しませんでした")
+            return False
+        self._print_program()
+        return True
+
+    def _toggle_scale(self):
+        config.COMP_SCALE = 0.1 if config.COMP_SCALE > 0.999 else 1.0
+        name = "本番スケール" if config.COMP_SCALE > 0.999 else "1/10 スケール (通し練習)"
+        self.say(f"[KEY] S → {name}")
+        self._rebuild_program("スケール切替")
+
+    def _toggle_climb(self):
+        config.COMP_ENABLE_CLIMB = not config.COMP_ENABLE_CLIMB
+        self.say("[KEY] C → 上昇旋回 " + ("ON" if config.COMP_ENABLE_CLIMB else "OFF (飛ばない)"))
+        self._rebuild_program("上昇旋回 ON/OFF")
 
     # ------------------------------------------------------------------ ループ
     def run(self):

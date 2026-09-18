@@ -88,6 +88,14 @@ static_assert(!USE_BLE_LINK || USE_LOGLINK,
               "USE_LOGLINK=true にするか、GROUND_LINK を IM920 に戻すこと。");
 
 // ---- 機能スイッチ ----------------------------------------------------
+// GUIDED で何を飛ぶか。
+//   true  : 地上局ミッション (離陸/巡航/着陸/定型機動)。position_estimator の
+//           core/program.py がステップを送る。本番はこちら。
+//   false : 機体単独のパターン (QuadConfig.h の GUIDED_PATTERN。周回/8の字/直進)。
+//           ゲイン調整用。地上局を見ない。
+// ★ 両方コンパイルされる。切り替えは再ビルドが要る (飛行中の切り替えではない)。
+constexpr bool GUIDED_MISSION = true;
+
 // 高度ホールド (スロットルPID)。false にすると POSHOLD でも高度は手動のまま。
 // シリアル 'g' でも実行時に切り替えられる (ベンチ用)。
 constexpr bool USE_ALT_HOLD = true;

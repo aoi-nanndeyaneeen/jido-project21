@@ -61,13 +61,16 @@ inline void probe(Vehicle& v) {
             strcpy(devs[D_IMU].note, "応答なし " BOARD_I2C_DESC);
     }
 
-    // --- 測距 (VL53L1X I2C 0x29 / MaxBotix PW) ---
+    // --- 測距 (バックエンドは QuadConfig の RANGE_INFO 参照) ---
     if (USE_RANGE) {
-        const bool sonar = (Quad::RANGE_BACKEND == Quad::RangeBackend::Sonar_EZ);
-        devs[D_RANGE].bus = sonar ? "PW pin" : "I2C 0x29";
+        devs[D_RANGE].bus = Quad::RANGE_INFO.bus;
         devs[D_RANGE].st  = v.range.ok ? ST_OK : ST_FAIL;
-        strcpy(devs[D_RANGE].note, sonar ? "MaxBotix EZ"
-                                          : (v.range.ok ? "VL53L1X" : "VL53L1X 応答なし/電源未接続"));
+        if (v.range.ok || !Quad::RANGE_INFO.on_i2c) {
+            strcpy(devs[D_RANGE].note, Quad::RANGE_INFO.device);
+        } else {
+            snprintf(devs[D_RANGE].note, sizeof(devs[D_RANGE].note),
+                     "%s 応答なし/電源未接続", Quad::RANGE_INFO.device);
+        }
     }
 
     // --- PMW3901 (SPI CS10) ---

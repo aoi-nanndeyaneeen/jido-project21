@@ -293,10 +293,37 @@ class FullFlightTest(_Base):
             self.assertIn(r, reqs, msg=f"{REQ_NAME[r]} を送っていない")
         # "fixed" のあいだ CF_YAW_VALID を立てない (機体のヨーを踏みつぶさない)
         self.assertTrue(all(not (s[5] & CF_YAW_VALID) for s in self.ac.sent))
-        # 離陸地点へ帰って降りている
-        self.assertLess(math.hypot(self.ac.x - 0.0, self.ac.y - (-3.5)), 0.6,
+        # ★ COMP_RETURN_HOME=False: 帰投せず、機動を終えた場所で降りている。
+        #   (離陸地点 (0,-3.5) へは戻らない。飛行競技エリア内 300点狙い)
+        cx, cy = config.COMP_FIELD_CENTER
+        self.assertLess(math.hypot(self.ac.x - cx, self.ac.y - cy), 1.5,
                         msg=f"着陸位置 ({self.ac.x:.2f}, {self.ac.y:.2f})")
         self.assertTrue(self.ac.landed)
+
+    def test_loiter_uses_the_time_up_to_the_landing_deadline(self):
+        """機動が早く終わっても、着陸の締切まで滞空して継続ボーナスを取ること。
+
+        ★ 飛行継続ボーナスは 飛行時間 x2 x 成功ミッション数 で倍率の対象外。
+          5ミッションなら 10点/秒 なので、早く降りた秒数がそのまま失点になる。
+        """
+        m = MissionRunner(self.ac, self.program, verbose=False)
+        m.start()
+        self._run(m)
+        # 接地は「着陸開始の締切」以降 = それより前に降りてしまっていない
+        self.assertGreater(m.elapsed(), config.COMP_LAND_BY_S,
+                           msg=f"締切 {config.COMP_LAND_BY_S:.0f}s より早く降りた: "
+                               f"T+{m.elapsed():.0f}s")
+        self.assertLess(m.elapsed(), config.COMP_RULE_DEADLINE_S)
+        self.assertTrue(self.ac.landed)
+
+    def test_loiter_is_not_counted_in_the_expected_total(self):
+        """滞空は「余った時間を使い切る」段階なので想定合計に入れない。"""
+        loiter = [s for s in self.program if s.loiter]
+        self.assertEqual(len(loiter), 1, msg="滞空の段階が無い/多い")
+        self.assertEqual(program_mod.expected_seconds(loiter[0], config), 0.0)
+        # 滞空は着陸の直前 (機動を全部終えてから粘る)
+        self.assertIs(self.program[self.program.index(loiter[0]) + 1].kind,
+                      StepKind.LAND)
 
     def test_mission_clock_starts_at_guided(self):
         """競技時計は「GUIDED に入った瞬間」から。待機で待たされた分は入らない。"""
@@ -350,22 +377,28 @@ class DeadlineTest(_Base):
         phases, steps = self._run(m, max_s=600.0)
         self.assertEqual(phases[-1], Phase.DONE, msg=f"reason={m.reason}")
         # 打ち切られても最後まで進み、着陸している
-        self.assertIn("着陸", steps)
+        self.assertTrue(any(s.startswith("着陸") for s in steps), msg=steps)
         self.assertTrue(self.ac.landed)
 
     def test_land_by_deadline_skips_remaining_missions(self):
-        """COMP_LAND_BY_S を過ぎたら、残りのミッションを捨てて帰投・着陸する。"""
+        """COMP_LAND_BY_S を過ぎたら、残りのミッションを捨てて着陸へ入ること。"""
         m = MissionRunner(self.ac, self.program, verbose=False)
         m.start()
         self._fly_until(m, lambda: m.phase is Phase.CRUISE)   # 離陸を終えて巡航へ
+        here = (self.ac.x, self.ac.y)
         # 競技時計だけを締切の向こう側へ飛ばす
         m._t_mission = self.clock.time() - (config.COMP_LAND_BY_S + 1.0)
         phases, steps = self._run(m, max_s=120.0)
         self.assertEqual(phases[-1], Phase.DONE, msg=f"reason={m.reason}")
         self.assertIn("締切", m.reason)
         self.assertTrue(self.ac.landed)
-        # 帰投してから降りている (その場着陸ではない)
-        self.assertLess(math.hypot(self.ac.x, self.ac.y - (-3.5)), 0.6)
+        # 残りの機動を飛ばして着陸段階まで来ている
+        self.assertIs(m.program[m.step_idx].kind, StepKind.LAND)
+        # 帰投しない設定ならその場で降りる
+        if not config.COMP_RETURN_HOME:
+            self.assertLess(math.hypot(self.ac.x - here[0], self.ac.y - here[1]), 1.5,
+                            msg=f"その場着陸のはずが移動した: {here} -> "
+                                f"({self.ac.x:.2f}, {self.ac.y:.2f})")
 
     def test_force_land_lands_in_place(self):
         """COMP_FORCE_LAND_BY_S を過ぎたら帰投せず、その場で降りる。"""
@@ -440,6 +473,74 @@ class SafetyTest(_Base):
         self.assertEqual(m.phase, Phase.DONE)
         self.assertGreaterEqual(self.clock.time() - t0,
                                 2.0 + config.COMP_LAND_STILL_S - 0.5)
+
+
+class NoCameraTest(_Base):
+    """カメラ無しで飛ばす便 (fly_nocam.py) の最低条件。
+
+    本番でカメラが立ち上がらなかった / 落ちたときの逃げ道なので、
+    「離陸して、ミッションエリアへ入って、機動して、降りる」まで
+    位置情報ゼロで通ることを確かめる。
+    """
+
+    def _run_nocam(self, m, max_s=400.0, dt=0.033):
+        t_end = self.clock.time() + max_s
+        while m.phase not in (Phase.DONE, Phase.ABORT) and self.clock.time() < t_end:
+            self.clock.advance(dt)
+            self.ac.step()
+            m.update(pos=None, yaw_rad=None, pos_valid=False,
+                     yaw_valid=False, yaw_src="fixed")
+
+    def test_no_camera_does_not_trigger_the_position_lost_landing(self):
+        """★ use_camera=False では「自己位置を見失った -> 着陸」を見ないこと。
+
+        見てしまうと、位置が最初から無いので離陸直後に必ず着陸する
+        (= カメラ無しの便が成立しない)。
+        """
+        m = MissionRunner(self.ac, self.program, verbose=False, use_camera=False)
+        m.start()
+        self._run_nocam(m, max_s=60.0)
+        self.assertNotIn("見失った", m.reason)
+        self.assertTrue(self.ac.airborne)
+
+    def test_no_camera_enters_the_mission_area_open_loop(self):
+        """★ ルール 6.7: 離陸は「ミッションエリアに進入すること」まで含む。
+
+        位置が無いときは機首方向へ開ループで進入する (Step.dr_s)。
+        ここが効かないと、離陸地点の真上で回るだけになる。
+        """
+        entry = self.program[1]
+        self.assertGreater(entry.dr_s, 0.0, msg="進入段階に開ループ指定が無い")
+        m = MissionRunner(self.ac, self.program, verbose=False, use_camera=False)
+        m.start()
+        x0 = self.ac.x
+        # 進入 -> 最初の機動に入るまで
+        t_end = self.clock.time() + 120.0
+        while m.phase is not Phase.MANEUVER and self.clock.time() < t_end:
+            self.clock.advance(0.033)
+            self.ac.step()
+            m.update(pos=None, yaw_rad=None, pos_valid=False,
+                     yaw_valid=False, yaw_src="fixed")
+        self.assertIs(m.phase, Phase.MANEUVER, msg="機動まで進まなかった")
+        # 機首 (+x) 方向へ、指定した距離ぶん進んでいる
+        want = entry.dr_s * entry.dr_speed
+        self.assertAlmostEqual(self.ac.x - x0, want, delta=0.8,
+                               msg=f"進入距離 {self.ac.x - x0:.2f}m (想定 {want:.2f}m)")
+        self.assertLess(abs(self.ac.y - (-3.5)), 0.5, msg="横へ流れている")
+
+    def test_no_camera_full_program_lands(self):
+        """カメラ無しでも最後まで通って着陸すること (締切が必ず降ろす)。"""
+        m = MissionRunner(self.ac, self.program, verbose=False, use_camera=False)
+        m.start()
+        self._run_nocam(m)
+        self.assertEqual(m.phase, Phase.DONE, msg=f"reason={m.reason}")
+        self.assertTrue(self.ac.landed)
+        self.assertLess(m.elapsed(), config.COMP_RULE_DEADLINE_S,
+                        msg=f"T+{m.elapsed():.0f}s")
+        # 3つの機動がすべて機体へ届いている (機動は位置を使わないので飛べる)
+        reqs = {s[1] for s in self.ac.sent}
+        for r in MANEUVER_REQS:
+            self.assertIn(r, reqs, msg=f"{REQ_NAME[r]} を送っていない")
 
 
 if __name__ == "__main__":

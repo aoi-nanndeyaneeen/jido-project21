@@ -93,13 +93,24 @@ class Step:
     settle_s: float = 0.0           # GOTO 到達後にこの秒数だけ静止してから次へ
     score: int = 0                  # ルールブックの素点 (表示用)
     entry_for: Maneuver = None      # GOTO: この機動の開始地点へ行く、という意味
+    dr_s: float = 0.0               # GOTO: 自己位置が無いときの開ループ進入 [s]。
+                                    # ★ 機首方向へ dr_speed で dr_s 秒だけ前進して
+                                    #   から次へ進む。カメラが無い/落ちたときに
+                                    #   「ミッションエリアへ進入する」(ルール 6.7)
+                                    #   を成立させるための最後の手段。
+                                    #   位置が出ているときは使わない (普通に飛ぶ)。
+    dr_speed: float = 0.0           # 上の前進速度 [m/s]
     entry_alt: float = None         # GOTO: そこへ行くときの高度 [m]。
                                     # ★ 機動の alt_m とは別物。ClimbTurn の alt_m は
                                     #   「到達高度 (2.2m)」なので、これを開始高度に使うと
                                     #   先に 2.2m まで上がってしまい、ルールの
                                     #   「低高度で2周 -> 上昇 -> 高高度で2周」が成立しない。
     hold_forever: bool = False      # GOTO: 到達しても次へ進まずその場に留まり続ける
-                                    #       (保持性能の測定用。本番では使わない)
+                                    #       (保持性能の測定 / 本番の「滞空」段階)
+    loiter: bool = False            # この段階は「時間を使うための滞空」。
+                                    # ★ 想定所要 (expected_seconds) は 0 として扱う。
+                                    #   締切 (COMP_LAND_BY_S) が来るまで居座るのが
+                                    #   仕事なので、想定合計に入れると意味が壊れる。
 
     @property
     def label(self) -> str:
@@ -160,10 +171,14 @@ def build_competition_program(cfg) -> list:
     cfg は utils.config モジュールをそのまま渡す (テストから差し替えられるよう
     module ではなく引数にしてある)。
     """
-    v      = cfg.COMP_MANEUVER_SPEED
-    r      = cfg.COMP_TURN_RADIUS_M
-    alt    = cfg.COMP_CRUISE_ALT_M
-    hi_alt = cfg.COMP_CLIMB_ALT_M
+    # スケール: 半径と速度を同じ率で縮めると omega = v/R が変わらないので、
+    # 1周の時間も時間配分もそのままで場所だけ小さくなる (通し練習用)。
+    scale  = float(getattr(cfg, "COMP_SCALE", 1.0))
+    small  = (scale < 0.999)
+    v      = cfg.COMP_MANEUVER_SPEED * scale
+    r      = cfg.COMP_TURN_RADIUS_M * scale
+    alt    = cfg.COMP_SMALL_CRUISE_ALT_M if small else cfg.COMP_CRUISE_ALT_M
+    hi_alt = cfg.COMP_SMALL_CLIMB_ALT_M  if small else cfg.COMP_CLIMB_ALT_M
     dir_s  = 1.0 if cfg.COMP_TURN_RIGHT else -1.0
     # 半径 R = v / omega  ->  omega[deg/s] = v / R * 180/pi
     omega = dir_s * math.degrees(v / r)
@@ -176,22 +191,52 @@ def build_competition_program(cfg) -> list:
 
     b = cfg.COMP_BUDGET_S      # 段階名 -> 制限時間 [s]
     center = cfg.COMP_FIELD_CENTER
+    with_climb = bool(getattr(cfg, "COMP_ENABLE_CLIMB", True))
 
-    return [
+    # 進入だけは「自己位置が無くても必ずミッションエリアへ入る」必要がある
+    # (ルール 6.7)。カメラが落ちていたら機首方向へ開ループで前進する。
+    entry_dr = float(getattr(cfg, "COMP_ENTRY_DR_S", 0.0)) * (scale if small else 1.0)
+
+    steps = [
         Step(StepKind.TAKEOFF, "滑走路内離陸", b["takeoff"], score=100),
         Step(StepKind.GOTO, "ミッションエリアへ進入", b["goto_first"],
-             entry_for=circle, entry_alt=alt, settle_s=cfg.COMP_SETTLE_S),
+             entry_for=circle, entry_alt=alt, settle_s=cfg.COMP_SETTLE_S,
+             dr_s=entry_dr, dr_speed=v),
         Step(StepKind.MANEUVER, "水平旋回", b["circle"], maneuver=circle, score=1000),
-        Step(StepKind.GOTO, "定位置へ戻る", b["goto"],
-             entry_for=climb, entry_alt=alt, settle_s=cfg.COMP_SETTLE_S),
-        Step(StepKind.MANEUVER, "上昇旋回", b["climb"], maneuver=climb, score=1200),
+    ]
+    if with_climb:
+        steps += [
+            Step(StepKind.GOTO, "定位置へ戻る", b["goto"],
+                 entry_for=climb, entry_alt=alt, settle_s=cfg.COMP_SETTLE_S),
+            Step(StepKind.MANEUVER, "上昇旋回", b["climb"], maneuver=climb, score=1200),
+        ]
+    steps += [
         Step(StepKind.GOTO, "定位置へ戻る", b["goto"],
              entry_for=fig8, entry_alt=alt, settle_s=cfg.COMP_SETTLE_S),
         Step(StepKind.MANEUVER, "8の字飛行", b["figure8"], maneuver=fig8, score=1400),
-        Step(StepKind.GOTO, "離着陸エリアへ帰投", b["goto_home"], target=None,
-             settle_s=cfg.COMP_LAND_SETTLE_S),
-        Step(StepKind.LAND, "着陸", b["land"], score=800),
     ]
+
+    # ---- 滞空 (飛行継続ボーナス) ----------------------------------------
+    # 飛行継続ボーナス = 飛行時間[s] x 2 x 成功ミッション数。5ミッションなら
+    # 10点/秒 で、これは倍率の対象外。つまり **早く降りた秒数はそのまま失点**。
+    # 機動が予定より早く終わっても、締切 (COMP_LAND_BY_S) までここで粘る。
+    #  ★ 目標は「8の字の開始地点」= 直前の機動が終わった場所そのもの。新しい所へ
+    #    移動させない (移動はドリフトと時間の無駄でしかない)。
+    #  ★ hold_forever なので自分からは終わらない。終わらせるのは締切だけ。
+    steps.append(Step(StepKind.GOTO, "滞空 (飛行継続ボーナス)", b["loiter"],
+                      entry_for=fig8, entry_alt=alt,
+                      hold_forever=True, loiter=True))
+
+    # ---- 着陸 ------------------------------------------------------------
+    # COMP_RETURN_HOME=False (既定) なら帰投せず、いまいる場所で降りる。
+    # 素点は 飛行競技エリア内 300 / 離着陸エリア内 400 (COMPETITION_OPEN_ISSUES G5)。
+    if bool(getattr(cfg, "COMP_RETURN_HOME", False)):
+        steps.append(Step(StepKind.GOTO, "離着陸エリアへ帰投", b["goto_home"],
+                          target=None, settle_s=cfg.COMP_LAND_SETTLE_S))
+        steps.append(Step(StepKind.LAND, "着陸", b["land"], score=400))
+    else:
+        steps.append(Step(StepKind.LAND, "着陸 (その場)", b["land"], score=300))
+    return steps
 
 
 def build_waypoint_program(cfg) -> list:
@@ -227,20 +272,30 @@ def program_summary(program, cfg, yaw_rad=0.0) -> list:
             m = s.maneuver
             note = (f"r={m.radius_m:.2f}m {m.n_legs}周 "
                     f"v={m.fwd_mps:.2f} w={m.yaw_rate_dps:+.1f}deg/s")
+        elif s.loiter:
+            note = f"締切 {cfg.COMP_LAND_BY_S:.0f}s まで居座る (継続ボーナス)"
         elif s.kind is StepKind.GOTO and s.entry_for is not None:
             note = "機動の開始地点 (機首から計算)"
+            if s.dr_s > 0.0:
+                note += f" / 位置が無ければ機首へ {s.dr_speed * s.dr_s:.1f}m 開ループ進入"
         elif s.kind is StepKind.GOTO:
             note = "離陸地点 (地上で見えていた位置)"
         lines.append(f"  {i + 1} {s.label:<22} {exp:5.0f}s {s.budget_s:5.0f}s "
                      f"{t:7.0f}s   {note}")
-    lines.append(f"  想定合計 {total_expected:.0f}s  "
+    lines.append(f"  想定合計 {total_expected:.0f}s (滞空を除く)  "
                  f"(目標 {cfg.COMP_TARGET_S}s / 着陸開始の締切 {cfg.COMP_LAND_BY_S}s / "
                  f"その場着陸 {cfg.COMP_FORCE_LAND_BY_S}s)")
+    lines.append(f"  着陸は {'離陸地点へ帰投 (400点)' if getattr(cfg, 'COMP_RETURN_HOME', False) else 'その場 (300点)'}"
+                 f" / 機動が早く終わったぶんは滞空で使い切る")
     return lines
 
 
 def expected_seconds(step: Step, cfg) -> float:
     """その段階の想定所要時間 [s] (制限時間ではなく、うまくいったときの値)。"""
+    # 滞空は「余った時間を使い切る」段階なので、想定所要は 0 として数える。
+    # (合計に入れると「想定合計 < 目標」という検算の意味が無くなる)
+    if step.loiter:
+        return 0.0
     if step.kind is StepKind.MANEUVER:
         return step.maneuver.expected_duration_s + cfg.COMP_MANEUVER_START_S
     if step.kind is StepKind.TAKEOFF:
