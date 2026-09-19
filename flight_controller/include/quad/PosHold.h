@@ -323,7 +323,13 @@ private:
     static constexpr float RAD2DEG = 57.2957795131f;
 
     // active を外れている間の出力クリア。積分もゼロに戻す。
+    // ★ 2026-09-19 LOG0101: 速度 LPF (_vx_ctl/_vy_ctl) もここで落とす。上の update() は
+    //   「active でなくても回す」ので、離陸前の地上で拾ったフロー速度が LPF に残ったまま
+    //   airborne latch の瞬間に active へ切り替わり、PosHold が最初のループからニセの
+    //   +0.66m/s を掴んでいた (地上は換算高度が狂うので値が信用できない)。ゼロから入れば
+    //   FLOW_VEL_MEAS_ALPHA=0.4 で 3 サンプル (~120ms) あれば実測へ追いつく。
     void reset_outputs() {
+        _vx_ctl = _vy_ctl = 0.0f;
         _pos_n = _pos_e = 0.0f;
         _hold_n = _hold_e = 0.0f;
         _holding = false;

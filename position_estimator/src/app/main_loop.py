@@ -66,6 +66,7 @@ from utils.screen import Screen
 MPL_RENDER_HZ   = 5.0    # Velocity / Graph / Link Status の描画。速くしても読めない
 STATUS_REDRAW_S = 0.5    # 端末の状態画面 (2Hz)
 KEY_POLL_S      = 0.05   # msvcrt キー入力のポーリング
+GO_CONFIRM_S    = 3.0    # [G] (離陸) の 2 回押しを受け付ける間隔
 MESSAGE_LINES   = 8      # 状態画面の下に残すイベント行数
 
 
@@ -123,6 +124,7 @@ class FlightLoop:
         self._last_n_tx = 0
         self._mission_aligned_logged = False
         self._prev_armed = False          # MISSION_AUTOSTART のエッジ検出用
+        self._go_pending = None           # [G] 1 回目を押した時刻 (2 回押し確認)
         self.ble_tap = None
         self.cam_thread = None
 
@@ -186,12 +188,14 @@ class FlightLoop:
             print("      -> [M] を押してミッション待機に入れてください "
                   "(MISSION_AUTOSTART=False のため)")
         print("   2. SW_HOVER を GUIDED (上) にして、スロットルを 15% 以上へ")
-        print("      -> 機体が GUIDED に入った瞬間に競技時計が 0 から走り、離陸します")
-        print("   3. あとは全自動 (離陸 -> 各ミッション -> 滞空 -> その場着陸 -> 静止判定)")
+        print("      -> 機体は GUIDED の待機へ (画面 READY)。★まだ離陸しません")
+        print("   3. 「離陸」とコールしてから [G] を 2 回 (3秒以内)")
+        print("      -> ここで競技時計が 0 から走り、離陸します")
+        print("   4. あとは全自動 (離陸 -> 各ミッション -> 滞空 -> その場着陸 -> 静止判定)")
         print("   ★ 中断したくなったら [X] (その場から自動着陸)。")
         print("     緊急停止はプロポ (THR_CUT / SW_HOVER を下げる)。")
         print()
-        print("  [X] ミッション中断   [B] 背景リセット   [Q] 終了")
+        print("  [G] ★離陸(2回押し)   [X] ミッション中断   [B] 背景リセット   [Q] 終了")
         print("  (手動で1つだけ機動を試したいときは console.py の c / 8 / u)")
         print()
 
@@ -259,7 +263,7 @@ class FlightLoop:
                     print("  [OK] 自動開始が有効です。アームすると待機に入り、"
                           "SW_HOVER を GUIDED にした瞬間に離陸します")
                 else:
-                    print("  [OK] ミッション準備完了。[M] で待機に入ります")
+                    print("  [OK] ミッション準備完了。[M] で待機、離陸は READY で [G] 2回")
             else:
                 print("  [SKIP] 地上局に接続できません。ミッション指令は停止し、"
                       "ダミー追跡を含む表示のみで続行します")
@@ -282,6 +286,18 @@ class FlightLoop:
                     msg, name, value = simple[key]
                     self.say(msg)
                     self.shared[name] = value
+                elif key == b'g':
+                    # ★ 離陸は押し間違いで始まってはいけないので 2 回押し
+                    now = time.time()
+                    if (self._go_pending is not None
+                            and now - self._go_pending <= GO_CONFIRM_S):
+                        self._go_pending = None
+                        self.say("[KEY] G → ★離陸")
+                        self.shared["mission_request"] = "go"
+                    else:
+                        self._go_pending = now
+                        self.say(f"[KEY] G → 離陸しますか? "
+                                 f"{GO_CONFIRM_S:.0f}秒以内にもう一度 [G]")
                 elif key == b's':
                     self._toggle_scale()
                 elif key == b'c':
@@ -395,7 +411,7 @@ class FlightLoop:
         if (MISSION_AUTOSTART and armed_now and not self._prev_armed
                 and mission.phase in (MissionPhase.IDLE, MissionPhase.DONE, MissionPhase.ABORT)):
             self.say("[Mission] アーム検出 -> 待機開始 "
-                     "(SW_HOVER を GUIDED にすると離陸します)")
+                     "(SW_HOVER を GUIDED にすると待機。離陸は [G] 2回)")
             mission.start()
         self._prev_armed = armed_now
 
@@ -405,6 +421,8 @@ class FlightLoop:
             self.shared["mission_request"] = None
             if req == "start":
                 mission.start()
+            elif req == "go":
+                mission.go()
             elif req == "abort":
                 mission.abort("キー操作")
 
@@ -520,7 +538,8 @@ class FlightLoop:
         lines.append(f" PERF   display {self._display_values['Display_ms']:.1f}ms   "
                      f"loop {ts.get('loop_ms', 0.0):.1f}ms")
         lines.append(thin)
-        lines.append(" [M]待機開始  [X]中断(その場から着陸)  [B]背景リセット  [Q]終了")
+        lines.append(" [G]★離陸(2回)  [M]待機開始  [X]中断(その場から着陸)  "
+                     "[B]背景リセット  [Q]終了")
         lines.append(thin)
         with self._msg_lock:
             lines += [" " + m[:70] for m in self.messages[-MESSAGE_LINES:]]

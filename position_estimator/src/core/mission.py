@@ -80,6 +80,7 @@ from core.s5_link import (REQ_ABORT, REQ_GUIDED, REQ_HOLD, REQ_LAND,
 class Phase(Enum):
     IDLE      = "IDLE"       # 待機。何も送らない
     ARMING    = "ARMING"     # 機体が GUIDED に入るのを待って REQ_HOLD を送り続ける
+    READY     = "READY"      # 機体は GUIDED 待機。[G] の離陸指示を待つ (時計はまだ 0)
     TAKEOFF   = "TAKEOFF"    # 離陸高度まで上昇中
     CRUISE    = "CRUISE"     # 目標地点へ移動中
     DWELL     = "DWELL"      # 目標地点で静止保持中 (機動の直前に落ち着かせる)
@@ -219,7 +220,8 @@ class MissionRunner:
 
         self._t_phase = 0.0
         self._t_step = 0.0
-        self._t_mission = None       # GUIDED に入った時刻 = 競技時計の 0 秒
+        self._t_mission = None       # [G] を押した時刻 = 競技時計の 0 秒
+        self._go_req = False         # [G] (go) が押された。READY で消費する
         self._t_send = 0.0
         self._t_pos_ok = 0.0
         self._dr_said = None         # 開ループ進入の告知を段階ごとに1回だけ出す
@@ -286,6 +288,7 @@ class MissionRunner:
         now = time.time()
         self.phase = Phase.ARMING
         self.step_idx = 0
+        self._go_req = False
         self.reason = ""
         self._step_note = ""
         self._runner = None
@@ -299,7 +302,7 @@ class MissionRunner:
         self._t_hold_first = None
         self._t_phase = now
         self._t_step = now
-        self._t_mission = None      # GUIDED に入った時点で 0 にする
+        self._t_mission = None      # [G] を押した時点で 0 にする
         self._t_pos_ok = now
         self._t_fly = None
         self._t_fence = None
@@ -317,9 +320,32 @@ class MissionRunner:
                   f"({len(self.program)} 段階 / 想定 {COMP_TARGET_S:.0f} 秒以内)")
         return True
 
+    def go(self):
+        """[G] の離陸指示。READY で待っているときだけ効く。
+
+        ★ 押した瞬間に飛ぶのではなく、次の送信回で REQ_TAKEOFF に変わる。
+          機体側はさらに「スロットル 15% 以上」を見てから上がる (Guided.h)。
+        """
+        if self.phase is not Phase.READY:
+            self._say(f"まだ離陸できません ({self.phase.value})。"
+                      "機体が GUIDED 待機に入るのを待ってください")
+            return False
+        self._go_req = True
+        return True
+
     def abort(self, reason="手動中断"):
         """即座に着陸させる。緊急停止ではない (それはプロポの仕事)。"""
         if self.phase in (Phase.IDLE, Phase.DONE):
+            return
+        # ★ まだ飛んでいない (地上で待っている) なら、降ろすものが無い。
+        #   着陸フェーズへ送ると REQ_LAND を 40 秒送り続けてから DONE になり、
+        #   その間もう一度飛ばせない。待機の取り消しとして即 ABORT にする。
+        if self.phase in (Phase.ARMING, Phase.READY):
+            self._go_req = False
+            self.reason = reason
+            self._goto(Phase.ABORT)
+            self._say(f"待機を取り消しました ({reason})。"
+                      "もう一度飛ばすには [M]、またはディスアーム -> 再アーム")
             return
         self.reason = reason
         self._jump_to(self._idx_land, Phase.LAND)
@@ -605,7 +631,8 @@ class MissionRunner:
 
         # ---- 4) 段階ごとの制限時間 ------------------------------------
         s = self.step
-        if (s is not None and self.phase not in (Phase.ARMING, Phase.DONE, Phase.ABORT)
+        if (s is not None and self.phase not in (Phase.ARMING, Phase.READY,
+                                                 Phase.DONE, Phase.ABORT)
                 and now - self._t_step > s.budget_s):
             self._say(f"★ {s.name} が制限 {s.budget_s:.0f}s を超えました -> 打ち切って次へ")
             self._advance_step(now, note="時間切れ")
@@ -630,18 +657,18 @@ class MissionRunner:
         now = t.now
         self._send(REQ_HOLD, flags=t.flags, yaw_rad=t.yaw_rad)
         if self.link.flag("guided"):
-            self._t_mission = now        # ここが競技時計の 0 秒
+            # ★ 2026-09-19: ここではまだ離陸しない。機体は GUIDED 待機 (GP_READY)
+            #   に入っただけで、高度指令を出していないので上がらない。
+            #   離陸は [G] -> go() -> REQ_TAKEOFF から。競技時計もそこで 0 になる。
+            self._goto(Phase.READY)
             dev_yaw = t.st.get("yaw")
             if self._yaw_src != "camera":
                 dev_str = f"{dev_yaw:+.1f}deg" if dev_yaw is not None else "不明"
-                self._say(f"機体が GUIDED に入りました -> 競技時計スタート "
+                self._say(f"機体が GUIDED 待機に入りました -> ★[G] 2回で離陸します "
                           f"(機首方位は{YAW_INITIAL_ALIGN_DEG:+.0f}deg決め打ち。"
                           f"機体自身のyaw={dev_str}。0から離れていたら機首がズレています)")
             else:
-                self._say("機体が GUIDED に入りました -> 競技時計スタート")
-            self._t_fly = now
-            self.step_idx = 0
-            self._begin_step(now)
+                self._say("機体が GUIDED 待機に入りました -> ★[G] 2回で離陸します")
         elif self.link.flag("landed") and now - self._t_phase > 2.0:
             self._say("機体が前回の着陸状態のままです。THR_CUT でディスアーム -> "
                       "再アームすると次の便に入れます")
@@ -651,6 +678,35 @@ class MissionRunner:
                       "SW_HOVER が上か、フロー/測距が生きているか、"
                       "スロットルが 15% 以上かを確認してください")
             self._t_phase = now      # 15 秒ごとに出し直す
+
+    def _phase_ready(self, t):
+        """機体は GUIDED 待機。[G] (go) が来るまで REQ_HOLD を送り続ける。
+
+        ★ この間、機体は高度指令を受け取っていない (Guided.h GP_READY) ので
+          スロットルはパイロットのスティックのまま = プロペラはアイドル。
+          競技時計はまだ走っていない。ここで「離陸」とコールしてから [G]。
+        """
+        now = t.now
+        self._send(REQ_HOLD, flags=t.flags, yaw_rad=t.yaw_rad)
+
+        # 操縦者がスイッチを戻した/機体が資格を失った -> 待機からやり直し
+        if not self.link.flag("guided"):
+            self._go_req = False
+            self._goto(Phase.ARMING)
+            self._say("機体が GUIDED を抜けました -> 待機へ戻ります "
+                      "(SW_HOVER を上げ直してください)")
+            return
+
+        if not self._go_req:
+            return
+
+        # ---- ここが競技時計の 0 秒 ----
+        self._go_req = False
+        self._t_mission = now
+        self._t_fly = now
+        self.step_idx = 0
+        self._say("★ 離陸指示 -> 競技時計スタート")
+        self._begin_step(now)
 
     def _phase_takeoff(self, t):
         """滑走路内離陸 (ルール 6.7)。目標高度まで上げるだけ。
@@ -823,6 +879,7 @@ class MissionRunner:
 
     _PHASE_HANDLERS = {
         Phase.ARMING:   _phase_arming,
+        Phase.READY:    _phase_ready,
         Phase.TAKEOFF:  _phase_takeoff,
         Phase.CRUISE:   _phase_cruise,
         Phase.DWELL:    _phase_dwell,
@@ -1043,7 +1100,7 @@ class MissionRunner:
           地上での待ち時間が数分になるので、時間切れ判定も同じ理由で外す。
           地上にいるあいだの安全はパイロットのプロポが受け持つ。
         """
-        if self.phase is Phase.ARMING:
+        if self.phase in (Phase.ARMING, Phase.READY):
             return None
 
         if not self.link.telemetry_ok(max_age_s=2.0):
@@ -1104,7 +1161,10 @@ class MissionRunner:
         mode_name = MODE_NAME.get(int(mode), "?") if mode is not None else "?"
 
         out = f"{self.phase.value}"
-        if s is not None and self.phase not in (Phase.IDLE, Phase.DONE, Phase.ABORT):
+        if self.phase is Phase.READY:
+            out += "  ★[G]2回で離陸"
+        if s is not None and self.phase not in (Phase.IDLE, Phase.READY,
+                                                Phase.DONE, Phase.ABORT):
             out += (f" [{self.step_idx + 1}/{len(self.program)}] {s.name}"
                     f" {time.time() - self._t_step:.0f}/{s.budget_s:.0f}s")
             if self._step_note:

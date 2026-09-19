@@ -39,16 +39,19 @@ main.py から「カメラによる自己位置推定」を丸ごと外したも
     python fly_nocam.py
 
   キー:
+    G … ★離陸 (2回押し)。READY のときだけ効く
     S … 本番スケール ⇄ 1/10 スケール (飛行前のみ)
     C … 上昇旋回 ON / OFF            (飛行前のみ)
     M … 待機に入る (MISSION_AUTOSTART=False のとき用。通常は自動)
     X … 中断 → その場から着陸
     Q … 終了
 
-  プロポ:
-    1. THR_CUT 解除 → アーム          (ここで待機に入る)
-    2. スロットルを 15% 以上へ
-    3. SW_HOVER を up (GUIDED)        (ここで競技時計が 0 から走る)
+  手順:
+    1. 操縦者 THR_CUT 解除 → アーム    (ここで待機 ARMING に入る)
+    2. 操縦者 スロットルを 15% 以上へ
+    3. 操縦者 SW_HOVER を up (GUIDED)  → 画面 READY。**まだ上がらない**
+    4. 「離陸」とコール
+    5. PC係  [G] を 2 回               (ここで競技時計が 0 から走る)
 
 ★ main.py とは同時に起動できない (同じ機体へ BLE 接続するため)。
 ★ ble_monitor.py とも同時に起動できない (同上)。
@@ -65,6 +68,7 @@ from core.mission import MissionRunner, Phase as MissionPhase
 from core.program import (build_competition_program, build_waypoint_program,
                           program_summary, check_geometry)
 from core.keyreader import KeyReader
+from core.s5_protocol import ALT_STATE_NAME
 from utils import config
 from utils.config import (COMP_ENABLED, GROUND_LINK_BACKEND, GROUND_LINK_PORT,
                           BLE_LOG_NAME, LOG_DIR, MISSION_AUTOSTART,
@@ -74,11 +78,14 @@ LOOP_HZ = 50.0
 
 
 class NoCamFlight:
+    CONFIRM_S = 3.0        # [G] の 2 回押しを受け付ける間隔 (ble_monitor.py と同じ)
+
     def __init__(self):
         self.link = None
         self.mission = None
         self.program = None
         self._prev_armed = False
+        self._go_pending = None           # [G] 1 回目を押した時刻 (2 回押し確認)
         self._quit = False
 
     # ------------------------------------------------------------ 表示
@@ -128,6 +135,17 @@ class NoCamFlight:
         elif ch == "m":
             print("[KEY] M → 待機開始")
             self.mission.start()
+        elif ch == "g":
+            # ★ 離陸は押し間違いで始まってはいけないので 2 回押し
+            #   (CONFIRM_S 秒以内にもう一度)。
+            now = time.time()
+            if self._go_pending is not None and now - self._go_pending <= self.CONFIRM_S:
+                self._go_pending = None
+                print("[KEY] G → ★離陸")
+                self.mission.go()
+            else:
+                self._go_pending = now
+                print(f"[KEY] G → 離陸しますか? {self.CONFIRM_S:.0f}秒以内にもう一度 [G]")
         elif ch == "x":
             print("[KEY] X → 中断 (その場から着陸)")
             self.mission.abort("キー操作")
@@ -154,11 +172,13 @@ class NoCamFlight:
         self.mission = MissionRunner(self.link, self.program, use_camera=False)
         self.mission.TAKEOFF_ALT_M = MISSION_TAKEOFF_ALT_M
         if MISSION_AUTOSTART:
-            print("  [OK] アームすると待機に入り、SW_HOVER を GUIDED にした瞬間に離陸します")
+            print("  [OK] アームすると待機に入ります。SW_HOVER を GUIDED にすると READY、"
+                  "★離陸は [G] 2回")
         else:
-            print("  [OK] [M] で待機に入ります")
+            print("  [OK] [M] で待機に入ります (離陸は READY になってから [G] 2回)")
         print()
-        print("  キー:  S=スケール切替   C=上昇旋回ON/OFF   X=中断して着陸   Q=終了")
+        print("  キー:  ★G=離陸(2回押し)   S=スケール切替   C=上昇旋回ON/OFF   "
+              "X=中断して着陸   Q=終了")
         print("  ※ カメラを使わないので GOTO はその場ホバー、機動は機体単独で回ります")
         print()
         return True
@@ -169,10 +189,20 @@ class NoCamFlight:
         s = m.step
         t = m.elapsed()
         mode = st.get("mode")
-        h = st.get("h_agl")
+        # ★ 2026-09-19 LOG0101: ここは st.get("h_agl") を読んでいたが、リンクの state に
+        #   そんなキーは無く (h_agl は core/mission.py の Telemetry のフィールド名)、
+        #   高度が常に None 表示だった。機体が離陸を拒否して 0m のまま 17.8 秒座っていても
+        #   画面からは分からず、原因の切り分けに丸一便かかった。正しいキーは range_h。
+        h = st.get("range_h")
+        # ★ 同上: alt_state を出す。離陸しないときの理由がここに出ている
+        #   (STANDBY = スロットルが ALT_ENABLE_THR 15% 未満 / NO_RANGE = 測距を掴めていない)。
+        alt_state = st.get("alt_state")
+        alt_s = (ALT_STATE_NAME.get(int(alt_state), str(alt_state))
+                 if alt_state is not None else "--")
         line = (f"\r  T+{t:6.1f}s  {m.phase.value:<8} "
                 f"[{m.step_idx + 1}/{len(m.program)}] {(s.label if s else '-'):<16} "
                 f"mode={mode} h={h if h is None else round(float(h), 2)} "
+                f"alt={alt_s:<12} "
                 f"armed={int(bool(self.link.flag('armed')))} "
                 f"guided={int(bool(self.link.flag('guided')))} "
                 f"tx={m.n_tx()}   ")
@@ -196,7 +226,7 @@ class NoCamFlight:
                                                    MissionPhase.DONE,
                                                    MissionPhase.ABORT)):
                     print("\n[Mission] アーム検出 -> 待機開始 "
-                          "(SW_HOVER を GUIDED にすると離陸します)")
+                          "(SW_HOVER を GUIDED にすると待機。離陸は [G] 2回)")
                     self.mission.start()
                 self._prev_armed = armed_now
 

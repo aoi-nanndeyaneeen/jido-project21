@@ -68,11 +68,14 @@ enum GuidedPhase : uint8_t {
     GP_DESCEND,     // 上昇旋回の後、その場で開始高度まで降下中 (水平はホールド)
     GP_ALIGN,       // 直進の前に、その場で進む方位へ向き直り中
     GP_STRAIGHT,    // 機体単独の直進 (StraightTrack)
+    GP_READY,       // 地上待機。GUIDED には入ったが高度指令を出していない
+                    //   (= AltHold は engage せず、スロットルはスティックのまま)
 };
 
 inline const char* guidedPhaseName(GuidedPhase p) {
     static const char* const N[] = { "OFF", "HOLD", "TAKEOFF", "CRUISE", "LAND", "LANDED",
-                                     "MANEUV", "CIRCLE", "DESCEND", "ALIGN", "STRAIGHT" };
+                                     "MANEUV", "CIRCLE", "DESCEND", "ALIGN", "STRAIGHT",
+                                     "READY" };
     return N[(int)p];
 }
 
@@ -91,6 +94,7 @@ public:
         float range_h_m;      // 鉛直対地高度 [m]
         bool  airborne;       // AltHold が離陸を検知済み (= 飛行中)
         bool  hold_ready;     // POSHOLD の水平ループが今効いている (スロットル十分)
+        float thr_stick;      // スロットルスティック 0..1 (地上待機からの離陸ゲート)
         float pos_n, pos_e;   // PosHold の推定位置 (地面固定) [m]
         float stick_roll;     // sbus.des 生値 (符号適用前)
         float stick_pitch;
@@ -292,6 +296,11 @@ public:
     // --- 出力 (drone_s5 が PosHold / AltHold / ヨー へ渡す) -----------
     bool        engaged()     const { return _engaged; }
     GuidedPhase phase()       const { return _gp; }
+    // ルール 2.2.8 の「ハンズオフ飛行中」= 機体が自分で飛んでいる間だけ true。
+    // 地上待機 (GP_READY) と着陸完了 (GP_LANDED) は赤点灯が正しい。
+    bool        handsOff()    const {
+        return _engaged && _gp != GP_OFF && _gp != GP_READY && _gp != GP_LANDED;
+    }
     bool        landed()      const { return _gp == GP_LANDED; }
     bool        inManeuver()  const {
         return (_gp == GP_CIRCLE && _circle.active()) || _gp == GP_ALIGN
@@ -483,6 +492,13 @@ private:
 //    離陸 / 巡航 / 着陸 / 定型機動 (CIRCLE/FIGURE8/CLIMB_TURN) / 位置・ヨー補正。
 //    position_estimator の core/program.py (本番プログラム) がこの経路で飛ぶ。
 //    どちらを使うかは S5Features.h の GUIDED_MISSION (drone_s5.cpp が分岐)。
+//
+//  ★ 2026-09-19 手順変更: 「スイッチを上げる = 離陸」をやめた。
+//      SW_HOVER=up      -> GP_READY (待機。スロットルはスティックのまま = 上がらない)
+//      地上局 REQ_TAKEOFF -> GP_TAKEOFF (ここが競技時計の 0 秒)
+//    離陸のゲートはスロットル 15% 以上 (ALT_ENABLE_THR) のまま。地上待機中は
+//    リンク断のフェイルセーフ (自動着陸) も走らない。LED も handsOff() が
+//    false の間は赤 (ルール 2.2.8)。
 // ============================================================
 public:
     // ------------------------------------------------------------
@@ -541,18 +557,59 @@ public:
         // --- 1) 初回エンゲージ -----------------------------------------
         //   「新鮮な、意味のある指令」が1つ届くまでは入らない。地上局が
         //   起動していないのに SW_HOVER を上げてしまっても何も起きない。
+        //   ★ 2026-09-19: 地上で入ったときは **待機 (GP_READY) で止まる**。
+        //     以前はここで _alt_m に「今の高度」を入れており、地上では測距が
+        //     近すぎて無効なため ALT_TARGET_M (0.5m) が入り、AltHold の
+        //     ground_start が走って「スイッチを上げた瞬間に離陸」していた。
+        //     離陸は地上局の REQ_TAKEOFF が来て初めて始まる。
         if (!_engaged) {
             if (!fresh_hold) return;
             if (c.req == S5C::REQ_IDLE || c.req == S5C::REQ_ABORT) return;
             _engaged = true;
             _why     = "";
-            // 入った瞬間は必ずホールドから。高度目標は「今の高度」。
-            _gp    = GP_HOLD;
-            _alt_m = (in.range_valid && in.range_h_m > 0.05f) ? in.range_h_m : ALT_TARGET_M;
-            _slew  = GUIDED_CRUISE_SLEW_MPS;
             _vx = _vy = 0.0f;
             _touch_since_ms = 0;
-            Serial.printf("\n>>> GUIDED 開始 (目標高度 %.2f m から保持)\n", _alt_m);
+            if (!in.airborne) {
+                _gp    = GP_READY;
+                _alt_m = 0.0f;              // = 高度指令なし。AltHold は engage しない
+                _slew  = GUIDED_TAKEOFF_SLEW_MPS;
+                _takeoff_refused_ms = 0;
+                Serial.println("\n>>> GUIDED 待機 (地上)。高度指令は出していないので上がりません。"
+                               "地上局の離陸指示 (REQ_TAKEOFF) を待ちます");
+            } else {
+                // 空中で入り直した (bail-out からの復帰など): 今の高度を保持。
+                _gp    = GP_HOLD;
+                _alt_m = (in.range_valid && in.range_h_m > 0.05f) ? in.range_h_m : ALT_TARGET_M;
+                _slew  = GUIDED_CRUISE_SLEW_MPS;
+                Serial.printf("\n>>> GUIDED 開始 (空中。目標高度 %.2f m から保持)\n", _alt_m);
+            }
+        }
+
+        // --- 1') 地上待機 ------------------------------------------------
+        //   スロットルはパイロットのスティックのまま (プロペラはアイドル)。
+        //   ・リンクが切れても着陸シーケンスには入らない (もう地上にいる)
+        //   ・位置/ヨーの補正だけは受け続ける (離陸前の原点合わせ)
+        //   ・REQ_TAKEOFF が届き、かつスロットルが 15% 以上のときだけ離陸する
+        if (_gp == GP_READY) {
+            _vx = _vy = 0.0f;
+            _alt_m = 0.0f;
+            if (!fresh_hold) return;
+            applyCorrections(c, poshold, heading);
+            if (c.req != S5C::REQ_TAKEOFF) return;
+            if (in.thr_stick < ALT_ENABLE_THR) {
+                if (_takeoff_refused_ms == 0 || now - _takeoff_refused_ms > 2000) {
+                    _takeoff_refused_ms = now;
+                    Serial.printf("\n!! 離陸指示は保留: スロットルが %.0f%% です "
+                                  "(%.0f%% 以上へ上げてください)\n",
+                                  in.thr_stick * 100.0f, ALT_ENABLE_THR * 100.0f);
+                }
+                return;
+            }
+            _gp    = GP_TAKEOFF;
+            _alt_m = (c.alt_cm > 0) ? (float)c.alt_cm / S5C::SC_CM : ALT_TARGET_M;
+            _slew  = GUIDED_TAKEOFF_SLEW_MPS;
+            Serial.printf("\n>>> 離陸開始: 地上局の指示で %.2f m へ\n", _alt_m);
+            return;
         }
 
         if (_gp == GP_MANEUVER) {
@@ -642,8 +699,9 @@ private:
         _touch_since_ms = 0;
     }
 
-    void applyCommand(const S5C::CmdFrame& c, uint32_t now, const Inputs& in,
-                      PositionHold& poshold, HeadingHold& heading) {
+    // 位置・ヨーの補正だけを適用する (req が何であっても効かせてよい部分)。
+    // 地上待機中 (GP_READY) の原点合わせもここを通る。
+    void applyCorrections(const S5C::CmdFrame& c, PositionHold& poshold, HeadingHold& heading) {
         if (c.flags & S5C::CF_POS_CORR) {
             const float n = (float)c.corr_n_mm / S5C::SC_MM;
             const float e = (float)c.corr_e_mm / S5C::SC_MM;
@@ -669,6 +727,11 @@ private:
             _yaw_corr_last_seq = c.seq;
             heading.rebase((float)c.yaw_abs_cdeg / S5C::SC_CDEG);
         }
+    }
+
+    void applyCommand(const S5C::CmdFrame& c, uint32_t now, const Inputs& in,
+                      PositionHold& poshold, HeadingHold& heading) {
+        applyCorrections(c, poshold, heading);
 
         const float cmd_alt = (c.alt_cm > 0) ? (float)c.alt_cm / S5C::SC_CM : 0.0f;
         switch (c.req) {
@@ -751,6 +814,7 @@ private:
     Maneuver _maneuver;
     uint8_t  _maneuver_done_req = 0xFF;   // 直前に完了/中断した REQ。0xFF = なし
 
+    uint32_t _takeoff_refused_ms = 0;  // 「スロットルが低い」を出した時刻 (連呼を抑える)
     uint32_t _land_start_ms  = 0;   // 降下を始めた時刻 (タイムアウト用)
     uint32_t _touch_since_ms = 0;   // 接地高度を下回り続けている開始時刻 (0=未満たず)
 

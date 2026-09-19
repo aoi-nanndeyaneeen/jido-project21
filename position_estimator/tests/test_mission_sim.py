@@ -173,21 +173,38 @@ class _Base(unittest.TestCase):
         mission_mod.POS_CORR_ENABLED = False     # 原点合わせは別テストの範囲
         self.ac = FakeAircraft(self.clock)
         self.program = build_competition_program(config)
+        # ★ 2026-09-19: 機体は GUIDED に入っても待機 (READY) で止まる。
+        #   離陸は PC の [G] = MissionRunner.go()。既定では「待機に入ったら
+        #   すぐ押す PC 係」を模擬する。押さない側を試すテストは False にする。
+        self.auto_go = True
 
     def tearDown(self):
         import time
         mission_mod.time = time
         maneuver_mod.time = time
 
-    def _fly_until(self, mission, cond, max_s=60.0, dt=0.033):
+    def _tick(self, mission, dt=0.033, **kw):
+        """模擬時計を dt 進め、機体を 1 回動かし、mission.update() を 1 回呼ぶ。
+
+        ★ 待機 (READY) に入っていたら、ここで [G] (go) を押す = 本番の PC 係。
+          押さずに待つ側を確かめるテストは self.auto_go = False にする。
+        カメラ無しなど、渡す材料が違うときだけ kw で上書きする。
+        """
+        self.clock.advance(dt)
+        self.ac.step()
+        if self.auto_go and mission.phase is Phase.READY:
+            mission.go()
+        args = dict(pos=self.ac.pos(),
+                    yaw_rad=math.radians(config.YAW_INITIAL_ALIGN_DEG),
+                    pos_valid=True, yaw_valid=True, yaw_src="fixed")
+        args.update(kw)
+        mission.update(**args)
+
+    def _fly_until(self, mission, cond, max_s=60.0, dt=0.033, **kw):
         """cond() が真になるまで模擬機体を進める。"""
         t_end = self.clock.time() + max_s
         while not cond() and self.clock.time() < t_end:
-            self.clock.advance(dt)
-            self.ac.step()
-            mission.update(pos=self.ac.pos(),
-                           yaw_rad=math.radians(config.YAW_INITIAL_ALIGN_DEG),
-                           pos_valid=True, yaw_valid=True, yaw_src="fixed")
+            self._tick(mission, dt, **kw)
         self.assertTrue(cond(), msg=f"条件を満たさないまま {max_s}s 経過 "
                                     f"(phase={mission.phase.value})")
 
@@ -197,11 +214,7 @@ class _Base(unittest.TestCase):
         steps = []
         t_end = self.clock.time() + max_s
         while mission.phase not in (Phase.DONE, Phase.ABORT) and self.clock.time() < t_end:
-            self.clock.advance(dt)
-            self.ac.step()
-            mission.update(pos=self.ac.pos(),
-                           yaw_rad=math.radians(config.YAW_INITIAL_ALIGN_DEG),
-                           pos_valid=True, yaw_valid=True, yaw_src="fixed")
+            self._tick(mission, dt)
             if mission.phase is not phases[-1]:
                 phases.append(mission.phase)
             s = mission.step
@@ -325,20 +338,46 @@ class FullFlightTest(_Base):
         self.assertIs(self.program[self.program.index(loiter[0]) + 1].kind,
                       StepKind.LAND)
 
-    def test_mission_clock_starts_at_guided(self):
-        """競技時計は「GUIDED に入った瞬間」から。待機で待たされた分は入らない。"""
+    def test_mission_clock_starts_at_go(self):
+        """競技時計は「[G] を押した瞬間」から。待機の時間は入らない。"""
         m = MissionRunner(self.ac, self.program, verbose=False)
         self.ac.guided_after_s = 8.0      # 8秒アームしたまま待たされる
         m.start()
-        for _ in range(400):              # 13秒ぶん回す
-            self.clock.advance(0.033)
-            self.ac.step()
-            m.update(pos=self.ac.pos(),
-                     yaw_rad=math.radians(config.YAW_INITIAL_ALIGN_DEG),
-                     pos_valid=True, yaw_valid=True, yaw_src="fixed")
+        for _ in range(400):              # 13秒ぶん回す ([G] は押す)
+            self._tick(m)
         self.assertTrue(self.ac.guided)
         self.assertLess(m.elapsed(), 6.0,
                         msg=f"待機の8秒が競技時計に入っている: T+{m.elapsed():.1f}s")
+
+    def test_guided_alone_does_not_take_off(self):
+        """★ 2026-09-19 の手順変更の本体。
+
+        SW_HOVER を上げて機体が GUIDED に入っても、[G] を押すまでは
+        ・フェーズは READY のまま
+        ・送るのは REQ_HOLD だけ (REQ_TAKEOFF を出さない)
+        ・競技時計は 0 のまま
+        でなければならない。機体側も高度指令を受け取らないので上がらない
+        (flight_controller/include/quad/Guided.h の GP_READY)。
+        """
+        self.auto_go = False
+        m = MissionRunner(self.ac, self.program, verbose=False)
+        self.ac.guided_after_s = 0.5
+        m.start()
+        for _ in range(600):              # 20 秒待ってみる ([G] は押さない)
+            self._tick(m)
+        self.assertTrue(self.ac.guided)
+        self.assertIs(m.phase, Phase.READY,
+                      msg=f"[G] を押していないのに進んだ: {m.phase.value}")
+        self.assertEqual(m.elapsed(), 0.0)
+        self.assertFalse(self.ac.airborne, msg="[G] なしで離陸した")
+        reqs = {s[1] for s in self.ac.sent}
+        self.assertEqual(reqs, {REQ_HOLD},
+                         msg=f"待機中に HOLD 以外を送った: "
+                             f"{ {REQ_NAME[r] for r in reqs} }")
+
+        # [G] を押したら離陸する (待機が単なる行き止まりでないことの確認)
+        m.go()
+        self._fly_until(m, lambda: m.phase is Phase.TAKEOFF, max_s=5.0)
 
     def test_arming_sends_hold_so_the_aircraft_can_enter_guided(self):
         """待機中に REQ_HOLD を送り続けること。
@@ -350,9 +389,7 @@ class FullFlightTest(_Base):
         m = MissionRunner(self.ac, self.program, verbose=False)
         m.start()
         for _ in range(100):
-            self.clock.advance(0.033)
-            self.ac.step()
-            m.update(pos=self.ac.pos(), yaw_rad=0.0, pos_valid=True, yaw_valid=True)
+            self._tick(m, yaw_rad=0.0)
         self.assertEqual(m.phase, Phase.ARMING)
         self.assertGreater(len(self.ac.sent), 5)
         self.assertTrue(all(s[1] == REQ_HOLD for s in self.ac.sent),
@@ -423,10 +460,7 @@ class SafetyTest(_Base):
         m = MissionRunner(self.ac, self.program, verbose=False)
         m.start()
         for _ in range(200):
-            self.clock.advance(0.033)
-            self.ac.step()
-            m.update(pos=self.ac.pos(), yaw_rad=math.radians(config.YAW_INITIAL_ALIGN_DEG),
-                     pos_valid=True, yaw_valid=True)
+            self._tick(m)
         self.assertNotIn(m.phase, (Phase.IDLE, Phase.DONE))
         m.abort("テスト")
         self.assertEqual(m.phase, Phase.LAND)
@@ -438,16 +472,9 @@ class SafetyTest(_Base):
         """移動中にカメラを見失ったら着陸する (機動中は機体単独で飛べるので別扱い)。"""
         m = MissionRunner(self.ac, self.program, verbose=False)
         m.start()
-        while m.phase is not Phase.CRUISE:
-            self.clock.advance(0.033)
-            self.ac.step()
-            m.update(pos=self.ac.pos(), yaw_rad=math.radians(config.YAW_INITIAL_ALIGN_DEG),
-                     pos_valid=True, yaw_valid=True)
+        self._fly_until(m, lambda: m.phase is Phase.CRUISE)
         for _ in range(int(m.POS_LOST_LAND_S / 0.033) + 10):
-            self.clock.advance(0.033)
-            self.ac.step()
-            m.update(pos=None, yaw_rad=math.radians(config.YAW_INITIAL_ALIGN_DEG),
-                     pos_valid=False, yaw_valid=True)
+            self._tick(m, pos=None, pos_valid=False)
         self.assertIn(m.phase, (Phase.LAND, Phase.STILL, Phase.DONE))
         self.assertIn("見失", m.reason)
 
@@ -463,13 +490,10 @@ class SafetyTest(_Base):
         # 2秒たったところで大きく動かす -> 数え直しになる
         moved = False
         while m.phase is Phase.STILL:
-            self.clock.advance(0.033)
-            self.ac.step()
             if not moved and self.clock.time() - t0 > 2.0:
                 moved = True
                 self.ac.x += 1.0
-            m.update(pos=self.ac.pos(), yaw_rad=math.radians(config.YAW_INITIAL_ALIGN_DEG),
-                     pos_valid=True, yaw_valid=True)
+            self._tick(m)
         self.assertEqual(m.phase, Phase.DONE)
         self.assertGreaterEqual(self.clock.time() - t0,
                                 2.0 + config.COMP_LAND_STILL_S - 0.5)
@@ -486,10 +510,7 @@ class NoCameraTest(_Base):
     def _run_nocam(self, m, max_s=400.0, dt=0.033):
         t_end = self.clock.time() + max_s
         while m.phase not in (Phase.DONE, Phase.ABORT) and self.clock.time() < t_end:
-            self.clock.advance(dt)
-            self.ac.step()
-            m.update(pos=None, yaw_rad=None, pos_valid=False,
-                     yaw_valid=False, yaw_src="fixed")
+            self._tick(m, dt, pos=None, yaw_rad=None, pos_valid=False, yaw_valid=False)
 
     def test_no_camera_does_not_trigger_the_position_lost_landing(self):
         """★ use_camera=False では「自己位置を見失った -> 着陸」を見ないこと。
@@ -517,10 +538,7 @@ class NoCameraTest(_Base):
         # 進入 -> 最初の機動に入るまで
         t_end = self.clock.time() + 120.0
         while m.phase is not Phase.MANEUVER and self.clock.time() < t_end:
-            self.clock.advance(0.033)
-            self.ac.step()
-            m.update(pos=None, yaw_rad=None, pos_valid=False,
-                     yaw_valid=False, yaw_src="fixed")
+            self._tick(m, pos=None, yaw_rad=None, pos_valid=False, yaw_valid=False)
         self.assertIs(m.phase, Phase.MANEUVER, msg="機動まで進まなかった")
         # 機首 (+x) 方向へ、指定した距離ぶん進んでいる
         want = entry.dr_s * entry.dr_speed

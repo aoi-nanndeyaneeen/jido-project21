@@ -280,6 +280,7 @@ static void updateGuided(float dt_s) {
     in.range_h_m   = v.range.h_m;
     in.airborne    = v.althold.airborne();
     in.hold_ready  = v.holdMode() && v.althold.active() && (v.thrStick() > Q::FLOW_ENABLE_THR);
+    in.thr_stick   = v.thrStick();   // 地上待機からの離陸ゲート (Guided.h GP_READY)
     in.pos_n       = v.poshold.posN();
     in.pos_e       = v.poshold.posE();
     in.stick_roll  = v.sbus.des[Ch::ROLL];
@@ -502,7 +503,9 @@ static void serviceLeds(bool armed_now) {
     constexpr bool COMP_LED_POLICY = true;   // true = 本番 (ルール 2.2.8)
 
     if (COMP_LED_POLICY) {
-        if (armed_now && v.mode == S5::MODE_GUIDED) {
+        //  ★ GUIDED でも「地上待機 (GP_READY)」と「着陸完了 (GP_LANDED)」は
+        //    ハンズオフではないので赤。緑が点滅していたら必ず飛んでいる。
+        if (armed_now && v.mode == S5::MODE_GUIDED && v.guided.handsOff()) {
             if (Q::blinkOn(now, 250)) StatusLed::green(); else StatusLed::off();
         } else {
             StatusLed::red();
@@ -764,7 +767,26 @@ void loop() {
     if (S5::USE_RANGE && v.range.ok && range_tick.ready()) {          // 100Hz  測距
         v.range.take(v.rangefinder, v.rangefinder.update(v.att.roll, v.att.pitch));
         // 失探しても flow の height は「最後に有効だった値」を保持する (急に 1.0m へ飛ぶより安全)
-        if (S5::USE_FLOW && v.range.valid) v.flow.setHeight(v.range.h_m);
+        // ★ 2026-09-19 LOG0101: 地面に置いている間は測距が RANGE_INFO.min_m 未満で invalid の
+        //   ため setHeight() が一度も呼ばれず、フローの換算高度が初期値
+        //   FLOW_ASSUMED_HEIGHT_M (1.0m) のまま固まっていた。自動離陸で地面を離れた瞬間、
+        //   実高度 0.05m の画素移動を 1.0m で換算して +1.7m/s (真値の約20倍) を報告し、
+        //   PosHold が離陸検知と同時にその値を掴んで機体が前へ飛び出した。
+        //   地上と分かっているとき (tooClose = 応答はあるが近すぎる。失探とは区別できる) は
+        //   測距の下限を渡して 1.0m 固着を断つ。
+        //   ★ 出るかどうかは「機体の脚が測距を 6cm の上に置くか下に置くか」で決まる:
+        //     LOG0100 は地上で raw=0.063 (>min) -> valid -> flow_h=0.070 で正常、
+        //     LOG0101 は raw<min -> invalid -> flow_h=1.000 のまま。数 mm で挙動が変わる。
+        //   ★ !airborne を条件に入れているのは、飛行中に測距が一瞬 min 未満を返したときに
+        //     換算高度を 0.06m へ落とさないため (速度を過小評価するだけで危険側ではないが、
+        //     地上限定の応急処置を空中へ持ち込む理由が無い)。
+        if (S5::USE_FLOW) {
+            if (v.range.valid) {
+                v.flow.setHeight(v.range.h_m);
+            } else if (v.rangefinder.tooClose() && !v.althold.airborne()) {
+                v.flow.setHeight(Q::RANGE_INFO.min_m);
+            }
+        }
         // 高度推定の correct。dt は「前回 correct からの経過」(呼び出し周期ではない)
         if (v.range.fresh && v.range.valid) {
             static uint32_t est_last_us = 0;
